@@ -1,0 +1,31 @@
+[package]
+name = "strait"
+version = "0.1.0"
+edition = "2021"
+description = "Policy proxy for AI agent sandboxing — Cedar policies, credential injection, audit logging"
+license = "MIT"
+repository = "https://github.com/ninthwave-sh/strait"
+readme = "README.md"
+
+[dependencies]
+hudsucker = { version = "0.22", features = ["rustls-client"] }
+cedar-policy = "4"
+rcgen = "0.13"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+rustls = "0.23"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+toml = "0.8"
+anyhow = "1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

@@ -7,22 +7,26 @@ All traffic flows through the strait. Cedar policies determine what gets through
 ## How it works
 
 ```
-Process (any workload)
-  │  HTTP_PROXY=127.0.0.1:<port>
+Client process
+  │  HTTPS_PROXY=127.0.0.1:<port>
   ▼
-strait
-  ├─ Configured hosts → selective MITM
-  │    Cedar policy eval → ALLOW / DENY
+strait (forward proxy)
+  │
+  ├─ Inspected hosts (MITM)
+  │    Decrypt TLS, see full request
+  │    Cedar policy eval on method + path + headers
   │    Credential injection on ALLOW
   │    Structured JSON audit log
   │
-  └─ Everything else → opaque tunnel (no MITM)
+  └─ All other hosts (CONNECT filtering)
+       Allow or deny by hostname
+       No decryption, no payload visibility
   │
   ▼
-Upstream API
+Internet
 ```
 
-**Default-deny.** Configured hosts get MITM'd and policy-evaluated. If no Cedar rule matches, the request is denied. Unconfigured hosts pass through as opaque TCP tunnels.
+Two layers of control. **Inspected hosts** get full MITM: strait terminates TLS, evaluates Cedar policies against the request, injects credentials on allow, and logs every decision. **All other hosts** get CONNECT-level filtering: strait sees the hostname from the CONNECT request and can allow or deny the connection, but never decrypts the traffic.
 
 ## Quick start
 

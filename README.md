@@ -2,7 +2,7 @@
 
 HTTPS proxy with Cedar policy evaluation, credential injection, and audit logging.
 
-All traffic flows through the strait. Cedar policies determine what gets through. Allowed requests get credentials injected automatically — the calling process never sees the real secrets.
+All traffic flows through the strait. Cedar policies determine what gets through. Allowed requests get credentials injected automatically. The calling process never sees the real secrets.
 
 ## How it works
 
@@ -36,7 +36,7 @@ HTTPS_PROXY=127.0.0.1:9443 curl https://api.github.com/user
 
 ## Cedar policies
 
-strait evaluates a `.cedar` policy file against every MITM'd request. The entity hierarchy is built from the URL path — policies match on method, path, and headers.
+strait evaluates a `.cedar` policy file against every MITM'd request. The entity hierarchy is built from the URL path. Policies match on method, path, and headers.
 
 ```cedar
 // Allow read access to org repos
@@ -63,7 +63,7 @@ forbid(
 
 ## Credential injection
 
-Credentials are configured in TOML. The calling process never sees the real secrets — strait injects them on allowed requests only.
+Credentials are configured in TOML. The calling process never sees the real secrets. strait injects them on allowed requests only.
 
 ```toml
 [github]
@@ -97,11 +97,11 @@ Use `--audit-log <path>` to write to a file.
 
 ## Use cases
 
-- **CI/CD pipelines** — govern what builds can fetch, with auditable records
-- **Developer sandboxes** — control and log network access from dev environments
-- **Contractor access** — policy-governed API access without sharing credentials
-- **Compliance** — immutable audit trail of every API call a process makes
-- **Agent sandboxing** — pair with a kernel sandbox for defense in depth
+- **CI/CD pipelines** - govern what builds can fetch, with auditable records
+- **Developer sandboxes** - control and log network access from dev environments
+- **Contractor access** - policy-governed API access without sharing credentials
+- **Compliance** - immutable audit trail of every API call a process makes
+- **Agent sandboxing** - pair with a kernel sandbox for defense in depth
 
 ## Install
 

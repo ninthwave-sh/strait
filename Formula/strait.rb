@@ -1,5 +1,5 @@
 class Strait < Formula
-  desc "Policy proxy for AI agent sandboxing — Cedar policies, credential injection, audit logging"
+  desc "HTTPS proxy with Cedar policy evaluation, credential injection, and audit logging"
   homepage "https://github.com/ninthwave-sh/strait"
   license "MIT"
 

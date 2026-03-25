@@ -6,7 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 #[derive(Parser)]
-#[command(name = "strait", version, about = "Policy proxy for AI agent sandboxing")]
+#[command(name = "strait", version, about = "HTTPS proxy with Cedar policy evaluation, credential injection, and audit logging")]
 struct Cli {
     /// Port to listen on (0 for ephemeral)
     #[arg(short, long, default_value = "0")]
@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
 /// Handle a single client connection.
 ///
 /// For now: read the CONNECT line, establish upstream TCP, tunnel bytes.
-/// Future TODOs (H-PRX-4+) will add MITM, Cedar policy eval, and credential injection.
+/// Future: selective MITM, Cedar policy evaluation, and credential injection.
 async fn handle_connection(mut client: TcpStream, peer: SocketAddr) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 

@@ -1,0 +1,36 @@
+// aws.cedarschema — Cedar schema for strait's AWS entity model.
+//
+// Extends the base entity model with AWS-specific context attributes.
+// Use this schema to validate AWS Cedar policies at startup.
+//
+// AWS context attributes are set automatically by strait when the target
+// host matches *.amazonaws.com. For non-AWS hosts, use the base schema
+// (e.g. github.cedarschema) instead.
+
+// The calling process. Only one principal identity exists today.
+entity Agent;
+
+// URL path segments forming a containment hierarchy.
+// Resource::"s3.us-east-1.amazonaws.com/bucket/key" is a child of
+// Resource::"s3.us-east-1.amazonaws.com/bucket", which is a child of
+// Resource::"s3.us-east-1.amazonaws.com", and so on up to the bare host.
+entity Resource in [Resource];
+
+// HTTP methods. strait creates action entities for each standard method.
+action "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
+    appliesTo {
+        principal: Agent,
+        resource: Resource,
+        context: {
+            // Base context attributes (set on every request)
+            "host": String,
+            "path": String,
+            "method": String,
+            // AWS-specific context attributes
+            // aws_service: extracted from hostname (e.g. "s3", "lambda", "iam")
+            "aws_service": String,
+            // aws_region: extracted from hostname (e.g. "us-east-1"),
+            //   defaults to "us-east-1" for global endpoints
+            "aws_region": String,
+        },
+    };

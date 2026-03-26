@@ -1,11 +1,18 @@
-# strait.toml — Example configuration for a GitHub API proxy.
+# strait.toml — Example configuration with GitHub API and AWS credential coexistence.
 #
-# Quick start:
+# Quick start (GitHub):
 #   1. Replace "our-org" in github.cedar with your GitHub org name.
 #   2. Export your token:  export GITHUB_TOKEN="ghp_..."
 #   3. Run:  strait --config examples/strait.toml
 #   4. Trust the CA cert:  export SSL_CERT_FILE=/tmp/strait-ca.pem
 #   5. Proxy requests:     HTTPS_PROXY=http://127.0.0.1:8080 curl https://api.github.com/repos/our-org/repo
+#
+# Quick start (AWS):
+#   1. Export AWS credentials:
+#        export AWS_ACCESS_KEY_ID="AKIA..."
+#        export AWS_SECRET_ACCESS_KEY="..."
+#   2. Proxy requests:
+#        HTTPS_PROXY=http://127.0.0.1:8080 aws s3 ls s3://my-bucket/ --ca-bundle /tmp/strait-ca.pem
 
 # Path to write the session CA certificate PEM.
 # Clients that make HTTPS requests through the proxy must trust this file.
@@ -25,12 +32,19 @@ port = 8080                # Fixed port; set to 0 for an OS-assigned ephemeral p
 # (no TLS termination, no policy evaluation, no credential injection).
 # ---------------------------------------------------------------------------
 [mitm]
-hosts = ["api.github.com"]
+hosts = [
+    "api.github.com",
+    "s3.us-east-1.amazonaws.com",
+    "lambda.us-east-1.amazonaws.com",
+]
 
 # ---------------------------------------------------------------------------
 # [policy] — Cedar policy for request authorization.
 # Every intercepted request is evaluated against this policy set.
 # If no permit policy matches, the request is denied (Cedar default-deny).
+#
+# For AWS-only setups, use examples/aws.cedar and examples/aws.cedarschema.
+# For GitHub-only setups, use examples/github.cedar and examples/github.cedarschema.
 # ---------------------------------------------------------------------------
 [policy]
 path = "examples/github.cedar"              # Path to the .cedar policy file
@@ -38,16 +52,28 @@ schema = "examples/github.cedarschema"      # Optional: validates policy at star
 
 # ---------------------------------------------------------------------------
 # [[credential]] — Secrets injected into authorized requests.
-# Each entry maps a host to an HTTP header and a secret source.
+# Each entry maps a host (or host pattern) to a credential type and source.
 # Credentials are injected ONLY when Cedar allows the request — the calling
 # process never sees the real token.
 # ---------------------------------------------------------------------------
+
+# GitHub API — bearer token injection
 [[credential]]
-host = "api.github.com"       # Hostname this credential applies to
+host = "api.github.com"       # Exact hostname match
 header = "Authorization"      # HTTP header to inject
 value_prefix = "token "       # Prepended to the resolved secret (note trailing space)
 source = "env"                # Source type: "env" reads from an environment variable
 env_var = "GITHUB_TOKEN"      # The environment variable containing the token
+
+# AWS — SigV4 request signing (covers all *.amazonaws.com hosts)
+[[credential]]
+host_pattern = "*.amazonaws.com"     # Wildcard matches all AWS endpoints
+type = "aws-sigv4"                   # Signs requests with AWS Signature Version 4
+source = "env"                       # Reads credentials from environment variables
+# Optional: override default env var names (defaults shown)
+# access_key_id_var = "AWS_ACCESS_KEY_ID"
+# secret_access_key_var = "AWS_SECRET_ACCESS_KEY"
+# session_token_var = "AWS_SESSION_TOKEN"
 
 # ---------------------------------------------------------------------------
 # [identity] — Agent identity for Cedar principal resolution.

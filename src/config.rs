@@ -561,13 +561,27 @@ ca_cert_path = "/tmp/ca.pem"
         );
         let config = config.unwrap();
         assert_eq!(config.listen.port, 8080);
-        assert_eq!(config.mitm.hosts, vec!["api.github.com"]);
+        assert_eq!(
+            config.mitm.hosts,
+            vec![
+                "api.github.com",
+                "s3.us-east-1.amazonaws.com",
+                "lambda.us-east-1.amazonaws.com",
+            ]
+        );
         assert!(config.policy.is_some());
-        assert_eq!(config.credential.len(), 1);
+        // Two credentials: GitHub bearer + AWS SigV4
+        assert_eq!(config.credential.len(), 2);
         assert_eq!(
             config.credential[0].host,
             Some("api.github.com".to_string())
         );
+        assert_eq!(config.credential[0].credential_type, "bearer");
+        assert_eq!(
+            config.credential[1].host_pattern,
+            Some("*.amazonaws.com".to_string())
+        );
+        assert_eq!(config.credential[1].credential_type, "aws-sigv4");
         assert_eq!(config.health.as_ref().unwrap().port, 9090);
     }
 }

@@ -1,0 +1,34 @@
+// github.cedarschema — Cedar schema for strait's entity model.
+//
+// Validates policies that use strait's three entity types:
+//   Agent       — the calling process (currently always Agent::"worker")
+//   Resource    — URL hierarchy: Resource::"host/path/segments"
+//   Action      — HTTP method: Action::"GET", Action::"POST", etc.
+//
+// Context attributes are set by strait on every request from the parsed
+// HTTP request line. Additional header attributes may be present at
+// runtime but are not declared here (they vary per request).
+
+// The calling process. Only one principal identity exists today.
+entity Agent;
+
+// URL path segments forming a containment hierarchy.
+// Resource::"api.github.com/repos/org/repo" is a child of
+// Resource::"api.github.com/repos/org", which is a child of
+// Resource::"api.github.com/repos", and so on up to the bare host.
+entity Resource in [Resource];
+
+// HTTP methods. strait creates action entities for each standard method.
+action "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
+    appliesTo {
+        principal: Agent,
+        resource: Resource,
+        context: {
+            // Target hostname (e.g. "api.github.com")
+            "host": String,
+            // URL path (e.g. "/repos/our-org/repo-name")
+            "path": String,
+            // HTTP method, same as the action name (e.g. "GET")
+            "method": String,
+        },
+    };

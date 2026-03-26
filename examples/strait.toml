@@ -1,0 +1,80 @@
+# strait.toml — Example configuration for a GitHub API proxy.
+#
+# Quick start:
+#   1. Replace "our-org" in github.cedar with your GitHub org name.
+#   2. Export your token:  export GITHUB_TOKEN="ghp_..."
+#   3. Run:  strait --config examples/strait.toml
+#   4. Trust the CA cert:  export SSL_CERT_FILE=/tmp/strait-ca.pem
+#   5. Proxy requests:     HTTPS_PROXY=http://127.0.0.1:8080 curl https://api.github.com/repos/our-org/repo
+
+# Path to write the session CA certificate PEM.
+# Clients that make HTTPS requests through the proxy must trust this file.
+# A new CA is generated on each startup; the file is overwritten.
+ca_cert_path = "/tmp/strait-ca.pem"
+
+# ---------------------------------------------------------------------------
+# [listen] — Proxy listener address and port.
+# ---------------------------------------------------------------------------
+[listen]
+address = "127.0.0.1"     # Bind to localhost only (use "0.0.0.0" for all interfaces)
+port = 8080                # Fixed port; set to 0 for an OS-assigned ephemeral port
+
+# ---------------------------------------------------------------------------
+# [mitm] — Hosts to intercept for policy evaluation and credential injection.
+# Traffic to hosts NOT listed here passes through as a plain CONNECT tunnel
+# (no TLS termination, no policy evaluation, no credential injection).
+# ---------------------------------------------------------------------------
+[mitm]
+hosts = ["api.github.com"]
+
+# ---------------------------------------------------------------------------
+# [policy] — Cedar policy for request authorization.
+# Every intercepted request is evaluated against this policy set.
+# If no permit policy matches, the request is denied (Cedar default-deny).
+# ---------------------------------------------------------------------------
+[policy]
+path = "examples/github.cedar"              # Path to the .cedar policy file
+schema = "examples/github.cedarschema"      # Optional: validates policy at startup
+
+# ---------------------------------------------------------------------------
+# [[credential]] — Secrets injected into authorized requests.
+# Each entry maps a host to an HTTP header and a secret source.
+# Credentials are injected ONLY when Cedar allows the request — the calling
+# process never sees the real token.
+# ---------------------------------------------------------------------------
+[[credential]]
+host = "api.github.com"       # Hostname this credential applies to
+header = "Authorization"      # HTTP header to inject
+value_prefix = "token "       # Prepended to the resolved secret (note trailing space)
+source = "env"                # Source type: "env" reads from an environment variable
+env_var = "GITHUB_TOKEN"      # The environment variable containing the token
+
+# ---------------------------------------------------------------------------
+# [identity] — Agent identity for Cedar principal resolution.
+# The proxy reads this HTTP header from incoming requests to determine
+# the Cedar principal (Agent::"<value>"). If the header is absent, the
+# default identity is used. This lets different callers get different
+# Cedar permissions.
+# Omit this section to use defaults (header: X-Strait-Agent, default: anonymous).
+# ---------------------------------------------------------------------------
+[identity]
+header = "X-Strait-Agent"   # HTTP header to extract the agent identity from
+default = "worker"           # Default agent identity when the header is absent
+
+# ---------------------------------------------------------------------------
+# [audit] — Structured JSON audit log.
+# Every request decision (allow/deny) is logged with timestamp, session ID,
+# latency, and the Cedar policy names that contributed to the decision.
+# Omit this section to log only to stderr via tracing.
+# ---------------------------------------------------------------------------
+[audit]
+log_path = "/tmp/strait-audit.jsonl"
+
+# ---------------------------------------------------------------------------
+# [health] — Health check HTTP endpoint.
+# Serves a JSON health response at http://127.0.0.1:{port}/healthz.
+# Useful for container orchestrators and monitoring.
+# Omit this section to disable the health endpoint.
+# ---------------------------------------------------------------------------
+[health]
+port = 9090

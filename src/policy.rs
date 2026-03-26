@@ -780,6 +780,19 @@ permit(
         );
     }
 
+    // --- Example file validation tests ---
+
+    #[test]
+    fn example_policy_loads_without_errors() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
+        let engine = PolicyEngine::load(&policy_path, None);
+        assert!(
+            engine.is_ok(),
+            "example policy failed to load: {:#}",
+            engine.unwrap_err()
+        );
+    }
+
     #[test]
     fn generic_denial_reason_when_no_annotation() {
         let f = write_policy(
@@ -802,6 +815,161 @@ forbid(
         assert!(
             result.policy_reasons.is_empty(),
             "policy without @reason should have empty reasons"
+        );
+    }
+
+    // --- Example file validation tests ---
+
+    #[test]
+    fn example_schema_validates_example_policy() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
+        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedarschema");
+        let engine = PolicyEngine::load(&policy_path, Some(&schema_path));
+        assert!(
+            engine.is_ok(),
+            "example policy failed schema validation: {:#}",
+            engine.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn example_policy_allows_get_org_repos() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
+        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedarschema");
+        let engine = PolicyEngine::load(&policy_path, Some(&schema_path)).unwrap();
+
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "GET",
+                "/repos/our-org/my-repo",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            result.allowed,
+            "GET /repos/our-org/my-repo should be allowed"
+        );
+    }
+
+    #[test]
+    fn example_policy_allows_create_pr() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
+        let engine = PolicyEngine::load(&policy_path, None).unwrap();
+
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "POST",
+                "/repos/our-org/my-repo/pulls",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            result.allowed,
+            "POST /repos/our-org/my-repo/pulls should be allowed"
+        );
+    }
+
+    #[test]
+    fn example_policy_denies_push_to_main() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
+        let engine = PolicyEngine::load(&policy_path, None).unwrap();
+
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "POST",
+                "/repos/our-org/my-repo/git/refs/heads/main",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "POST to git/refs/heads/main should be denied"
+        );
+    }
+
+    #[test]
+    fn example_policy_denies_push_to_release_branch() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
+        let engine = PolicyEngine::load(&policy_path, None).unwrap();
+
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "POST",
+                "/repos/our-org/my-repo/git/refs/heads/release/v1.0",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "POST to git/refs/heads/release/v1.0 should be denied"
+        );
+    }
+
+    #[test]
+    fn example_policy_denies_repo_deletion() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
+        let engine = PolicyEngine::load(&policy_path, None).unwrap();
+
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "DELETE",
+                "/repos/our-org/my-repo",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "DELETE /repos/our-org/my-repo should be denied"
+        );
+    }
+
+    #[test]
+    fn example_policy_denies_settings_access() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
+        let engine = PolicyEngine::load(&policy_path, None).unwrap();
+
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "PATCH",
+                "/repos/our-org/my-repo/settings",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "PATCH /repos/our-org/my-repo/settings should be denied"
+        );
+    }
+
+    #[test]
+    fn example_policy_denies_outside_org() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
+        let engine = PolicyEngine::load(&policy_path, None).unwrap();
+
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "GET",
+                "/repos/other-org/their-repo",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "GET /repos/other-org/their-repo should be denied"
         );
     }
 }

@@ -133,16 +133,7 @@ pub async fn handle_mitm(
             let body =
                 crate::policy::deny_response_body(host, &method, &path, &decision.policy_names);
             let body_bytes = serde_json::to_string(&body)?;
-            let response = format!(
-                "HTTP/1.1 403 Forbidden\r\n\
-                 Content-Type: application/json\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: close\r\n\
-                 \r\n\
-                 {}",
-                body_bytes.len(),
-                body_bytes
-            );
+            let response = build_deny_response(&body_bytes);
 
             let tls_client_inner = buf_reader.into_inner();
             tls_client_inner.write_all(response.as_bytes()).await?;
@@ -268,6 +259,23 @@ pub async fn handle_mitm(
     Ok(())
 }
 
+/// Build the HTTP 403 deny response string from a JSON body.
+///
+/// The response includes properly formatted HTTP/1.1 headers with no leading
+/// whitespace and a Content-Length that exactly matches the body byte length.
+fn build_deny_response(body_bytes: &str) -> String {
+    format!(
+        "HTTP/1.1 403 Forbidden\r\n\
+Content-Type: application/json\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\
+\r\n\
+{}",
+        body_bytes.len(),
+        body_bytes
+    )
+}
+
 /// Inject a credential header if one is configured for the target host.
 /// Returns true if a credential was injected.
 fn inject_credential(
@@ -388,6 +396,67 @@ env_var = "STRAIT_TEST_INJECT_2"
         let mut headers = vec![("Host".to_string(), "api.github.com".to_string())];
         let injected = inject_credential("api.github.com", &mut headers, None);
         assert!(!injected);
+    }
+
+    #[test]
+    fn deny_response_has_no_leading_whitespace_in_headers() {
+        let body = r#"{"error":"policy_denied"}"#;
+        let response = build_deny_response(body);
+
+        // Split into lines by \r\n
+        let lines: Vec<&str> = response.split("\r\n").collect();
+
+        // Status line
+        assert_eq!(lines[0], "HTTP/1.1 403 Forbidden");
+
+        // Header lines should not have leading whitespace
+        assert_eq!(lines[1], "Content-Type: application/json");
+        assert_eq!(lines[2], format!("Content-Length: {}", body.len()));
+        assert_eq!(lines[3], "Connection: close");
+
+        // Empty line separating headers from body
+        assert_eq!(lines[4], "");
+
+        // Body
+        assert_eq!(lines[5], body);
+    }
+
+    #[test]
+    fn deny_response_content_length_matches_body() {
+        let body_json = serde_json::json!({
+            "error": "policy_denied",
+            "message": "Request denied by Cedar policy: test-policy",
+            "host": "api.github.com",
+            "method": "DELETE",
+            "path": "/repos/org/repo",
+            "policy": "test-policy"
+        });
+        let body_bytes = serde_json::to_string(&body_json).unwrap();
+        let response = build_deny_response(&body_bytes);
+
+        // Extract Content-Length header value
+        let content_length_line = response
+            .split("\r\n")
+            .find(|line| line.starts_with("Content-Length:"))
+            .expect("Content-Length header must be present");
+        let claimed_length: usize = content_length_line
+            .strip_prefix("Content-Length: ")
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        // Extract actual body (everything after \r\n\r\n)
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let actual_body = &response[body_start..];
+
+        assert_eq!(
+            claimed_length,
+            actual_body.len(),
+            "Content-Length ({}) must match actual body length ({})",
+            claimed_length,
+            actual_body.len()
+        );
+        assert_eq!(actual_body, body_bytes);
     }
 
     #[test]

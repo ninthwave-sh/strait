@@ -1,0 +1,78 @@
+{
+  "runTimestamp": "2026-03-26T12:55:07.019Z",
+  "wallClockMs": 3543227,
+  "itemsAttempted": 5,
+  "itemsCompleted": 5,
+  "itemsFailed": 0,
+  "mergeStrategy": "asap",
+  "items": [
+    {
+      "id": "H-SV4-1",
+      "state": "done",
+      "ciRetryCount": 0,
+      "retryCount": 1,
+      "tool": "claude",
+      "prNumber": 15,
+      "tokensUsed": null,
+      "costUsd": null,
+      "detectionLatencyMs": 0,
+      "startedAt": "2026-03-26T12:56:09.173Z",
+      "endedAt": "2026-03-26T13:17:45.623Z"
+    },
+    {
+      "id": "H-SV4-2",
+      "state": "done",
+      "ciRetryCount": 0,
+      "retryCount": 0,
+      "tool": "claude",
+      "prNumber": 14,
+      "tokensUsed": null,
+      "costUsd": null,
+      "detectionLatencyMs": 0,
+      "startedAt": "2026-03-26T12:55:33.225Z",
+      "endedAt": "2026-03-26T13:02:31.208Z"
+    },
+    {
+      "id": "H-SV4-3",
+      "state": "done",
+      "ciRetryCount": 0,
+      "retryCount": 0,
+      "tool": "claude",
+      "prNumber": 16,
+      "tokensUsed": null,
+      "costUsd": null,
+      "detectionLatencyMs": 0,
+      "startedAt": "2026-03-26T13:18:08.754Z",
+      "endedAt": "2026-03-26T13:24:58.920Z"
+    },
+    {
+      "id": "H-SV4-5",
+      "state": "done",
+      "ciRetryCount": 0,
+      "retryCount": 0,
+      "tool": "claude",
+      "prNumber": 17,
+      "tokensUsed": null,
+      "costUsd": null,
+      "detectionLatencyMs": 0,
+      "startedAt": "2026-03-26T13:25:24.591Z",
+      "endedAt": "2026-03-26T13:38:44.308Z"
+    },
+    {
+      "id": "M-SV4-6",
+      "state": "done",
+      "ciRetryCount": 0,
+      "retryCount": 0,
+      "tool": "claude",
+      "prNumber": 18,
+      "tokensUsed": null,
+      "costUsd": null,
+      "detectionLatencyMs": 0,
+      "startedAt": "2026-03-26T13:39:07.397Z",
+      "endedAt": "2026-03-26T13:53:39.351Z"
+    }
+  ],
+  "totalTokensUsed": null,
+  "totalCostUsd": null,
+  "detectionLatency": null
+}

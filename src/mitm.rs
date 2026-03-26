@@ -3,10 +3,11 @@
 //! When the CONNECT target is an inspected host (e.g. api.github.com), the proxy
 //! generates a per-host certificate signed by the session CA, terminates TLS,
 //! reads the inner HTTP request, evaluates it against Cedar policies, and
-//! either returns a 403 or forwards it upstream. For all other hosts the
-//! connection is tunneled transparently without any decryption.
+//! either returns a 403 or forwards it upstream with credential injection.
+//! For all other hosts the connection is tunneled transparently without any decryption.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use rustls::ServerConfig;
@@ -15,7 +16,9 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
+use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
+use crate::credentials::CredentialStore;
 use crate::policy::PolicyEngine;
 
 /// Set of hostnames that should be MITM'd for policy inspection.
@@ -31,15 +34,18 @@ pub fn should_mitm(host: &str) -> bool {
 /// 1. Accept TLS from the client using a leaf cert for `host`.
 /// 2. Read the inner HTTP request (method, path, headers).
 /// 3. Evaluate against Cedar policies (if a policy engine is provided).
-/// 4. On DENY, return HTTP 403 with structured JSON body.
-/// 5. On ALLOW (or no policy engine), forward the request upstream.
+/// 4. On DENY, return HTTP 403 with structured JSON body. No credential injected.
+/// 5. On ALLOW (or no policy engine), inject credentials and forward upstream.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_mitm(
     client: TcpStream,
     host: &str,
     port: u16,
     ca: &SessionCa,
-    peer: &std::net::SocketAddr,
+    _peer: &std::net::SocketAddr,
     policy: Option<&PolicyEngine>,
+    credentials: Option<&CredentialStore>,
+    audit: &AuditLogger,
 ) -> anyhow::Result<()> {
     // Generate a leaf certificate for this host
     let (cert_chain, key) = ca
@@ -89,58 +95,32 @@ pub async fn handle_mitm(
         }
     }
 
-    // Log the inner HTTP request (this is the key MITM visibility)
-    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let header_map: serde_json::Value = headers
-        .iter()
-        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-        .collect::<serde_json::Map<String, serde_json::Value>>()
-        .into();
-
-    let event = serde_json::json!({
-        "ts": ts,
-        "type": "mitm_request",
-        "peer": peer.to_string(),
-        "host": host,
-        "method": method,
-        "path": path,
-        "headers": header_map,
-        "mitm": true
-    });
-    info!(
-        host = host,
-        method = method.as_str(),
-        path = path.as_str(),
-        "MITM: inner HTTP request visible"
-    );
-    eprintln!("{}", serde_json::to_string(&event)?);
+    // Start timing policy evaluation
+    let eval_start = Instant::now();
 
     // Evaluate Cedar policy (if configured)
     if let Some(engine) = policy {
         let decision = engine.evaluate(host, &method, &path, &headers)?;
 
-        let decision_ts =
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let policy_display = if decision.policy_names.is_empty() {
             "default-deny".to_string()
         } else {
             decision.policy_names.join(", ")
         };
 
-        let decision_str = if decision.allowed { "allow" } else { "deny" };
-        let decision_event = serde_json::json!({
-            "ts": decision_ts,
-            "type": "policy_decision",
-            "peer": peer.to_string(),
-            "host": host,
-            "method": method,
-            "path": path,
-            "decision": decision_str,
-            "policy": policy_display,
-        });
-        eprintln!("{}", serde_json::to_string(&decision_event)?);
-
         if !decision.allowed {
+            // Log DENY audit event -- no credential injected
+            audit.log_decision(
+                host,
+                port,
+                &method,
+                &path,
+                "deny",
+                &policy_display,
+                false,
+                eval_start,
+            );
+
             warn!(
                 host = host,
                 method = method.as_str(),
@@ -174,12 +154,50 @@ pub async fn handle_mitm(
             return Ok(());
         }
 
+        // ALLOW path -- check for credential injection
+        let credential_injected = inject_credential(host, &mut headers, credentials);
+
+        // Log ALLOW audit event
+        audit.log_decision(
+            host,
+            port,
+            &method,
+            &path,
+            "allow",
+            &policy_display,
+            credential_injected,
+            eval_start,
+        );
+
         info!(
             host = host,
             method = method.as_str(),
             path = path.as_str(),
             policy = policy_display.as_str(),
+            credential_injected = credential_injected,
             "ALLOW: request permitted by Cedar policy"
+        );
+    } else {
+        // No policy engine -- allow by default, still inject credentials
+        let credential_injected = inject_credential(host, &mut headers, credentials);
+
+        audit.log_decision(
+            host,
+            port,
+            &method,
+            &path,
+            "allow",
+            "no-policy",
+            credential_injected,
+            eval_start,
+        );
+
+        info!(
+            host = host,
+            method = method.as_str(),
+            path = path.as_str(),
+            credential_injected = credential_injected,
+            "ALLOW: no policy engine configured"
         );
     }
 
@@ -198,7 +216,7 @@ pub async fn handle_mitm(
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())?;
     let mut tls_upstream = connector.connect(server_name, upstream_tcp).await?;
 
-    // Reconstruct and forward the request
+    // Reconstruct and forward the request (headers now include injected credentials)
     let mut request_bytes = format!("{method} {path} HTTP/1.1\r\n");
     for (name, value) in &headers {
         request_bytes.push_str(&format!("{name}: {value}\r\n"));
@@ -254,6 +272,25 @@ pub async fn handle_mitm(
     Ok(())
 }
 
+/// Inject a credential header if one is configured for the target host.
+/// Returns true if a credential was injected.
+fn inject_credential(
+    host: &str,
+    headers: &mut Vec<(String, String)>,
+    credentials: Option<&CredentialStore>,
+) -> bool {
+    if let Some(store) = credentials {
+        if let Some(cred) = store.get(host) {
+            // Remove any existing header with the same name (case-insensitive)
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&cred.header));
+            // Inject the credential header
+            headers.push((cred.header.clone(), cred.value.clone()));
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +305,119 @@ mod tests {
         assert!(!should_mitm("example.com"));
         assert!(!should_mitm("google.com"));
         assert!(!should_mitm("github.com"));
+    }
+
+    #[test]
+    fn inject_credential_adds_header() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        std::env::set_var("STRAIT_TEST_INJECT_1", "ghp_inject_test");
+
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(
+            br#"
+[[credential]]
+host = "api.github.com"
+header = "Authorization"
+value_prefix = "token "
+source = "env"
+env_var = "STRAIT_TEST_INJECT_1"
+"#,
+        )
+        .unwrap();
+        f.flush().unwrap();
+
+        let store = CredentialStore::load(f.path()).unwrap();
+        let mut headers = vec![
+            ("Host".to_string(), "api.github.com".to_string()),
+            ("Accept".to_string(), "application/json".to_string()),
+        ];
+
+        let injected = inject_credential("api.github.com", &mut headers, Some(&store));
+        assert!(injected, "credential should be injected");
+
+        let auth = headers.iter().find(|(k, _)| k == "Authorization");
+        assert!(auth.is_some(), "Authorization header should be present");
+        assert_eq!(auth.unwrap().1, "token ghp_inject_test");
+
+        std::env::remove_var("STRAIT_TEST_INJECT_1");
+    }
+
+    #[test]
+    fn inject_credential_replaces_existing_header() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        std::env::set_var("STRAIT_TEST_INJECT_2", "ghp_new_token");
+
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(
+            br#"
+[[credential]]
+host = "api.github.com"
+header = "Authorization"
+value_prefix = "token "
+source = "env"
+env_var = "STRAIT_TEST_INJECT_2"
+"#,
+        )
+        .unwrap();
+        f.flush().unwrap();
+
+        let store = CredentialStore::load(f.path()).unwrap();
+        let mut headers = vec![
+            ("Host".to_string(), "api.github.com".to_string()),
+            ("Authorization".to_string(), "token old_value".to_string()),
+        ];
+
+        let injected = inject_credential("api.github.com", &mut headers, Some(&store));
+        assert!(injected);
+
+        // Should only have one Authorization header
+        let auth_count = headers.iter().filter(|(k, _)| k == "Authorization").count();
+        assert_eq!(auth_count, 1, "should have exactly one Authorization header");
+
+        let auth = headers.iter().find(|(k, _)| k == "Authorization").unwrap();
+        assert_eq!(auth.1, "token ghp_new_token");
+
+        std::env::remove_var("STRAIT_TEST_INJECT_2");
+    }
+
+    #[test]
+    fn inject_credential_no_store_returns_false() {
+        let mut headers = vec![("Host".to_string(), "api.github.com".to_string())];
+        let injected = inject_credential("api.github.com", &mut headers, None);
+        assert!(!injected);
+    }
+
+    #[test]
+    fn inject_credential_unknown_host_returns_false() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        std::env::set_var("STRAIT_TEST_INJECT_3", "test");
+
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(
+            br#"
+[[credential]]
+host = "api.github.com"
+header = "Authorization"
+value_prefix = "token "
+source = "env"
+env_var = "STRAIT_TEST_INJECT_3"
+"#,
+        )
+        .unwrap();
+        f.flush().unwrap();
+
+        let store = CredentialStore::load(f.path()).unwrap();
+        let mut headers = vec![("Host".to_string(), "example.com".to_string())];
+
+        let injected = inject_credential("example.com", &mut headers, Some(&store));
+        assert!(!injected, "no credential should be injected for unknown host");
+
+        std::env::remove_var("STRAIT_TEST_INJECT_3");
     }
 }

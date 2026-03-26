@@ -1,4 +1,6 @@
+mod audit;
 mod ca;
+mod credentials;
 mod mitm;
 pub mod policy;
 
@@ -11,7 +13,9 @@ use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
+use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
+use crate::credentials::CredentialStore;
 use crate::mitm::{handle_mitm, should_mitm};
 use crate::policy::PolicyEngine;
 
@@ -46,6 +50,16 @@ struct Cli {
     /// Requests that are not explicitly permitted are denied (403).
     #[arg(long, value_name = "FILE")]
     policy: Option<PathBuf>,
+
+    /// Path to a credentials.toml file for credential injection.
+    /// Credentials are resolved eagerly at startup (env vars must be set).
+    #[arg(long, value_name = "FILE")]
+    credentials: Option<PathBuf>,
+
+    /// Path to an audit log file. Events are always written to stderr;
+    /// this flag additionally appends them to a file.
+    #[arg(long, value_name = "FILE")]
+    audit_log: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -67,6 +81,20 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
+
+    // Load credentials (if specified)
+    let credential_store: Option<Arc<CredentialStore>> = match &cli.credentials {
+        Some(path) => {
+            let store = CredentialStore::load(path)?;
+            info!(path = %path.display(), "credentials loaded");
+            Some(Arc::new(store))
+        }
+        None => None,
+    };
+
+    // Initialize audit logger
+    let audit_logger = Arc::new(AuditLogger::new(cli.audit_log.as_deref())?);
+    info!(session_id = audit_logger.session_id(), "audit logger initialized");
 
     // Generate session CA
     let session_ca = SessionCa::generate()?;
@@ -92,8 +120,13 @@ async fn main() -> anyhow::Result<()> {
         let (client, peer) = listener.accept().await?;
         let ca = session_ca.clone();
         let policy = policy_engine.clone();
+        let creds = credential_store.clone();
+        let audit = audit_logger.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(client, peer, &ca, policy.as_deref()).await {
+            if let Err(e) =
+                handle_connection(client, peer, &ca, policy.as_deref(), creds.as_deref(), &audit)
+                    .await
+            {
                 warn!(error = %e, "connection error");
             }
         });
@@ -110,6 +143,8 @@ async fn handle_connection(
     peer: SocketAddr,
     ca: &SessionCa,
     policy: Option<&PolicyEngine>,
+    credentials: Option<&CredentialStore>,
+    audit: &AuditLogger,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -143,17 +178,12 @@ async fn handle_connection(
 
         if should_mitm(&host) {
             // MITM path: send 200, then terminate TLS with session CA
-            let ts =
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            let event = serde_json::json!({
-                "ts": ts,
-                "type": "connect",
-                "peer": peer.to_string(),
-                "host": host,
-                "port": port,
-                "mitm": true
-            });
-            eprintln!("{}", serde_json::to_string(&event)?);
+            info!(
+                host = host.as_str(),
+                port = port,
+                peer = %peer,
+                "CONNECT: MITM path"
+            );
 
             // Send 200 Connection Established before starting TLS handshake
             client
@@ -161,22 +191,20 @@ async fn handle_connection(
                 .await?;
 
             // Hand off to MITM handler
-            handle_mitm(client, &host, port, ca, &peer, policy).await?;
+            handle_mitm(client, &host, port, ca, &peer, policy, credentials, audit).await?;
         } else {
             // Passthrough path: transparent TCP tunnel
             let mut upstream = TcpStream::connect(format!("{host}:{port}")).await?;
 
-            let ts =
-                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            let event = serde_json::json!({
-                "ts": ts,
-                "type": "connect",
-                "peer": peer.to_string(),
-                "host": host,
-                "port": port,
-                "mitm": false
-            });
-            eprintln!("{}", serde_json::to_string(&event)?);
+            // Log passthrough event
+            audit.log_passthrough(&host, port);
+
+            info!(
+                host = host.as_str(),
+                port = port,
+                peer = %peer,
+                "CONNECT: passthrough (no MITM)"
+            );
 
             // Send 200 Connection Established
             client

@@ -2360,6 +2360,7 @@ dependencies = [
  "chrono",
  "clap",
  "http",
+ "http-body-util",
  "hudsucker",
  "hyper",
  "hyper-util",

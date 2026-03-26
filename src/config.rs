@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context as _;
 use serde::Deserialize;
@@ -119,11 +120,11 @@ pub struct AuditConfig {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct IdentityConfig {}
 
-/// `[health]` section — reserved for future use.
-#[derive(Debug, Deserialize, Clone, Default)]
+/// `[health]` section — health check endpoint configuration.
+#[derive(Debug, Deserialize, Clone)]
 pub struct HealthConfig {
-    /// Port for the health check endpoint.
-    pub port: Option<u16>,
+    /// Port for the health check endpoint (required when `[health]` is present).
+    pub port: u16,
 }
 
 impl StraitConfig {
@@ -156,6 +157,8 @@ pub struct ProxyContext {
     pub audit_logger: Arc<AuditLogger>,
     /// Hostnames that should be MITM'd for policy inspection.
     pub mitm_hosts: Vec<String>,
+    /// Instant when the proxy context was created (for uptime calculation).
+    pub startup_instant: Instant,
 }
 
 impl ProxyContext {
@@ -201,6 +204,7 @@ impl ProxyContext {
             credential_store,
             audit_logger,
             mitm_hosts: config.mitm.hosts.clone(),
+            startup_instant: Instant::now(),
         })
     }
 }
@@ -270,7 +274,7 @@ port = 9090
             config.audit.as_ref().unwrap().log_path,
             Some(PathBuf::from("/tmp/audit.jsonl"))
         );
-        assert_eq!(config.health.as_ref().unwrap().port, Some(9090));
+        assert_eq!(config.health.as_ref().unwrap().port, 9090);
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod audit;
 mod ca;
 pub mod config;
 mod credentials;
+mod health;
 mod mitm;
 pub mod policy;
 
@@ -71,6 +72,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Print port to stderr for programmatic consumption
     eprintln!("PORT={}", local_addr.port());
+
+    // Start health check server if configured
+    if let Some(ref health_config) = config.health {
+        let health_ctx = ctx.clone();
+        let health_port = health_config.port;
+        tokio::spawn(async move {
+            health::start_health_server(health_port, health_ctx).await;
+        });
+    }
 
     loop {
         let (client, peer) = listener.accept().await?;

@@ -11,6 +11,7 @@ readme = "README.md"
 hudsucker = { version = "0.22", features = ["rustls-client"] }
 cedar-policy = "4"
 rcgen = { version = "0.13", features = ["pem"] }
+http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 rustls = "0.23"

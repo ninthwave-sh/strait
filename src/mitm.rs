@@ -361,7 +361,8 @@ mod tests {
         std::env::set_var("STRAIT_TEST_INJECT_1", "ghp_inject_test");
 
         let entries = vec![CredentialEntryConfig {
-            host: "api.github.com".to_string(),
+            host: Some("api.github.com".to_string()),
+            host_pattern: None,
             header: "Authorization".to_string(),
             value_prefix: "token ".to_string(),
             source: "env".to_string(),
@@ -389,7 +390,8 @@ mod tests {
         std::env::set_var("STRAIT_TEST_INJECT_2", "ghp_new_token");
 
         let entries = vec![CredentialEntryConfig {
-            host: "api.github.com".to_string(),
+            host: Some("api.github.com".to_string()),
+            host_pattern: None,
             header: "Authorization".to_string(),
             value_prefix: "token ".to_string(),
             source: "env".to_string(),
@@ -491,7 +493,8 @@ mod tests {
         std::env::set_var("STRAIT_TEST_INJECT_3", "test");
 
         let entries = vec![CredentialEntryConfig {
-            host: "api.github.com".to_string(),
+            host: Some("api.github.com".to_string()),
+            host_pattern: None,
             header: "Authorization".to_string(),
             value_prefix: "token ".to_string(),
             source: "env".to_string(),

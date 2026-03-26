@@ -1,7 +1,7 @@
 mod audit;
 mod ca;
 pub mod config;
-mod credentials;
+pub mod credentials;
 mod health;
 mod mitm;
 pub mod policy;

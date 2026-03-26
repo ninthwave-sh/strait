@@ -96,10 +96,18 @@ pub struct PolicyConfig {
 }
 
 /// `[[credential]]` array entry — a single credential for header injection.
+///
+/// Exactly one of `host` or `host_pattern` must be set:
+/// - `host`: exact hostname match (e.g. `"api.github.com"`)
+/// - `host_pattern`: glob pattern with leading wildcard (e.g. `"*.amazonaws.com"`)
 #[derive(Debug, Deserialize, Clone)]
 pub struct CredentialEntryConfig {
-    /// Hostname this credential applies to (e.g. `"api.github.com"`).
-    pub host: String,
+    /// Exact hostname this credential applies to (e.g. `"api.github.com"`).
+    /// Mutually exclusive with `host_pattern`.
+    pub host: Option<String>,
+    /// Hostname glob pattern for pattern-based matching (e.g. `"*.amazonaws.com"`).
+    /// Mutually exclusive with `host`.
+    pub host_pattern: Option<String>,
     /// HTTP header name to inject (e.g. `"Authorization"`).
     pub header: String,
     /// Prefix prepended to the resolved secret value (e.g. `"token "`).
@@ -308,7 +316,10 @@ port = 9090
             PathBuf::from("policy.cedar")
         );
         assert_eq!(config.credential.len(), 1);
-        assert_eq!(config.credential[0].host, "api.github.com");
+        assert_eq!(
+            config.credential[0].host,
+            Some("api.github.com".to_string())
+        );
         assert_eq!(
             config.audit.as_ref().unwrap().log_path,
             Some(PathBuf::from("/tmp/audit.jsonl"))
@@ -501,7 +512,10 @@ ca_cert_path = "/tmp/ca.pem"
         assert_eq!(config.mitm.hosts, vec!["api.github.com"]);
         assert!(config.policy.is_some());
         assert_eq!(config.credential.len(), 1);
-        assert_eq!(config.credential[0].host, "api.github.com");
+        assert_eq!(
+            config.credential[0].host,
+            Some("api.github.com".to_string())
+        );
         assert_eq!(config.health.as_ref().unwrap().port, 9090);
     }
 }

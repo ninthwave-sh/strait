@@ -16,17 +16,12 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 
-use crate::audit::AuditLogger;
-use crate::ca::SessionCa;
+use crate::config::ProxyContext;
 use crate::credentials::CredentialStore;
-use crate::policy::PolicyEngine;
-
-/// Set of hostnames that should be MITM'd for policy inspection.
-const INSPECTED_HOSTS: &[&str] = &["api.github.com"];
 
 /// Returns true if the given host should be MITM'd.
-pub fn should_mitm(host: &str) -> bool {
-    INSPECTED_HOSTS.contains(&host)
+pub fn should_mitm(host: &str, mitm_hosts: &[String]) -> bool {
+    mitm_hosts.iter().any(|h| h == host)
 }
 
 /// Perform MITM on the client connection.
@@ -36,19 +31,15 @@ pub fn should_mitm(host: &str) -> bool {
 /// 3. Evaluate against Cedar policies (if a policy engine is provided).
 /// 4. On DENY, return HTTP 403 with structured JSON body. No credential injected.
 /// 5. On ALLOW (or no policy engine), inject credentials and forward upstream.
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_mitm(
     client: TcpStream,
     host: &str,
     port: u16,
-    ca: &SessionCa,
-    _peer: &std::net::SocketAddr,
-    policy: Option<&PolicyEngine>,
-    credentials: Option<&CredentialStore>,
-    audit: &AuditLogger,
+    ctx: &ProxyContext,
 ) -> anyhow::Result<()> {
     // Generate a leaf certificate for this host
-    let (cert_chain, key) = ca
+    let (cert_chain, key) = ctx
+        .session_ca
         .issue_leaf_cert(host)
         .context("failed to issue leaf cert")?;
 
@@ -97,6 +88,10 @@ pub async fn handle_mitm(
 
     // Start timing policy evaluation
     let eval_start = Instant::now();
+
+    let policy = ctx.policy_engine.as_deref();
+    let credentials = ctx.credential_store.as_deref();
+    let audit = &ctx.audit_logger;
 
     // Evaluate Cedar policy (if configured)
     if let Some(engine) = policy {
@@ -298,41 +293,42 @@ fn inject_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CredentialEntryConfig;
 
     #[test]
     fn github_api_is_inspected() {
-        assert!(should_mitm("api.github.com"));
+        let hosts = vec!["api.github.com".to_string()];
+        assert!(should_mitm("api.github.com", &hosts));
     }
 
     #[test]
     fn other_hosts_are_not_inspected() {
-        assert!(!should_mitm("example.com"));
-        assert!(!should_mitm("google.com"));
-        assert!(!should_mitm("github.com"));
+        let hosts = vec!["api.github.com".to_string()];
+        assert!(!should_mitm("example.com", &hosts));
+        assert!(!should_mitm("google.com", &hosts));
+        assert!(!should_mitm("github.com", &hosts));
+    }
+
+    #[test]
+    fn empty_mitm_hosts_means_no_inspection() {
+        let hosts: Vec<String> = vec![];
+        assert!(!should_mitm("api.github.com", &hosts));
+        assert!(!should_mitm("example.com", &hosts));
     }
 
     #[test]
     fn inject_credential_adds_header() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
         std::env::set_var("STRAIT_TEST_INJECT_1", "ghp_inject_test");
 
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(
-            br#"
-[[credential]]
-host = "api.github.com"
-header = "Authorization"
-value_prefix = "token "
-source = "env"
-env_var = "STRAIT_TEST_INJECT_1"
-"#,
-        )
-        .unwrap();
-        f.flush().unwrap();
+        let entries = vec![CredentialEntryConfig {
+            host: "api.github.com".to_string(),
+            header: "Authorization".to_string(),
+            value_prefix: "token ".to_string(),
+            source: "env".to_string(),
+            env_var: Some("STRAIT_TEST_INJECT_1".to_string()),
+        }];
 
-        let store = CredentialStore::load(f.path()).unwrap();
+        let store = CredentialStore::from_entries(&entries).unwrap();
         let mut headers = vec![
             ("Host".to_string(), "api.github.com".to_string()),
             ("Accept".to_string(), "application/json".to_string()),
@@ -350,26 +346,17 @@ env_var = "STRAIT_TEST_INJECT_1"
 
     #[test]
     fn inject_credential_replaces_existing_header() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
         std::env::set_var("STRAIT_TEST_INJECT_2", "ghp_new_token");
 
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(
-            br#"
-[[credential]]
-host = "api.github.com"
-header = "Authorization"
-value_prefix = "token "
-source = "env"
-env_var = "STRAIT_TEST_INJECT_2"
-"#,
-        )
-        .unwrap();
-        f.flush().unwrap();
+        let entries = vec![CredentialEntryConfig {
+            host: "api.github.com".to_string(),
+            header: "Authorization".to_string(),
+            value_prefix: "token ".to_string(),
+            source: "env".to_string(),
+            env_var: Some("STRAIT_TEST_INJECT_2".to_string()),
+        }];
 
-        let store = CredentialStore::load(f.path()).unwrap();
+        let store = CredentialStore::from_entries(&entries).unwrap();
         let mut headers = vec![
             ("Host".to_string(), "api.github.com".to_string()),
             ("Authorization".to_string(), "token old_value".to_string()),
@@ -461,26 +448,17 @@ env_var = "STRAIT_TEST_INJECT_2"
 
     #[test]
     fn inject_credential_unknown_host_returns_false() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
         std::env::set_var("STRAIT_TEST_INJECT_3", "test");
 
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(
-            br#"
-[[credential]]
-host = "api.github.com"
-header = "Authorization"
-value_prefix = "token "
-source = "env"
-env_var = "STRAIT_TEST_INJECT_3"
-"#,
-        )
-        .unwrap();
-        f.flush().unwrap();
+        let entries = vec![CredentialEntryConfig {
+            host: "api.github.com".to_string(),
+            header: "Authorization".to_string(),
+            value_prefix: "token ".to_string(),
+            source: "env".to_string(),
+            env_var: Some("STRAIT_TEST_INJECT_3".to_string()),
+        }];
 
-        let store = CredentialStore::load(f.path()).unwrap();
+        let store = CredentialStore::from_entries(&entries).unwrap();
         let mut headers = vec![("Host".to_string(), "example.com".to_string())];
 
         let injected = inject_credential("example.com", &mut headers, Some(&store));

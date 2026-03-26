@@ -62,11 +62,7 @@ impl AuditLogger {
                     .append(true)
                     .open(path)
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "failed to open audit log file '{}': {}",
-                            path.display(),
-                            e
-                        )
+                        anyhow::anyhow!("failed to open audit log file '{}': {}", path.display(), e)
                     })?;
                 Some(Arc::new(Mutex::new(std::io::BufWriter::new(file))))
             }
@@ -100,8 +96,7 @@ impl AuditLogger {
         let eval_latency_us = eval_start.elapsed().as_micros() as u64;
 
         let event = AuditEvent {
-            timestamp: chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             session_id: self.session_id.clone(),
             request: AuditRequest {
                 host: host.to_string(),
@@ -122,8 +117,7 @@ impl AuditLogger {
     /// Log a passthrough CONNECT event (no MITM, no policy evaluation).
     pub fn log_passthrough(&self, host: &str, port: u16) {
         let event = AuditEvent {
-            timestamp: chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             session_id: self.session_id.clone(),
             request: AuditRequest {
                 host: host.to_string(),
@@ -214,8 +208,14 @@ mod tests {
         };
 
         let json_str = serde_json::to_string(&event).unwrap();
-        assert!(!json_str.contains("\"method\""), "passthrough should not have method");
-        assert!(!json_str.contains("\"path\""), "passthrough should not have path");
+        assert!(
+            !json_str.contains("\"method\""),
+            "passthrough should not have method"
+        );
+        assert!(
+            !json_str.contains("\"path\""),
+            "passthrough should not have path"
+        );
 
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["request"]["mitm"], false);
@@ -276,10 +276,7 @@ mod tests {
         let result = AuditLogger::new(Some(Path::new("/nonexistent/dir/audit.jsonl")));
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("failed to open audit log file"),
-            "got: {err}"
-        );
+        assert!(err.contains("failed to open audit log file"), "got: {err}");
     }
 
     #[test]

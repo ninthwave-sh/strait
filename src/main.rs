@@ -94,7 +94,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize audit logger
     let audit_logger = Arc::new(AuditLogger::new(cli.audit_log.as_deref())?);
-    info!(session_id = audit_logger.session_id(), "audit logger initialized");
+    info!(
+        session_id = audit_logger.session_id(),
+        "audit logger initialized"
+    );
 
     // Generate session CA
     let session_ca = SessionCa::generate()?;
@@ -123,9 +126,15 @@ async fn main() -> anyhow::Result<()> {
         let creds = credential_store.clone();
         let audit = audit_logger.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(client, peer, &ca, policy.as_deref(), creds.as_deref(), &audit)
-                    .await
+            if let Err(e) = handle_connection(
+                client,
+                peer,
+                &ca,
+                policy.as_deref(),
+                creds.as_deref(),
+                &audit,
+            )
+            .await
             {
                 warn!(error = %e, "connection error");
             }

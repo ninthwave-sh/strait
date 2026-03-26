@@ -29,14 +29,16 @@ async fn start_tls_echo_server() -> (std::net::SocketAddr, String, CertificateDe
     leaf_params
         .distinguished_name
         .push(DnType::CommonName, "api.github.com");
-    leaf_params
-        .subject_alt_names
-        .push(rcgen::SanType::DnsName("api.github.com".try_into().unwrap()));
+    leaf_params.subject_alt_names.push(rcgen::SanType::DnsName(
+        "api.github.com".try_into().unwrap(),
+    ));
     // Also add localhost for direct connection
     leaf_params
         .subject_alt_names
         .push(rcgen::SanType::DnsName("localhost".try_into().unwrap()));
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &key_pair).unwrap();
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &ca_cert, &key_pair)
+        .unwrap();
 
     let server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -196,9 +198,11 @@ async fn mitm_terminates_tls_and_exposes_inner_request() {
     let mut tls = connector.connect(server_name, client_inner).await.unwrap();
 
     // Send an HTTP request through the TLS tunnel
-    tls.write_all(b"GET /repos/test/repo HTTP/1.1\r\nHost: api.github.com\r\nX-Test: hello\r\n\r\n")
-        .await
-        .unwrap();
+    tls.write_all(
+        b"GET /repos/test/repo HTTP/1.1\r\nHost: api.github.com\r\nX-Test: hello\r\n\r\n",
+    )
+    .await
+    .unwrap();
 
     // Read the response (the echo server returns the request as the body)
     let mut response = Vec::new();
@@ -329,18 +333,14 @@ mod strait_test_helpers {
         ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
             let leaf_key = KeyPair::generate().unwrap();
             let mut params = CertificateParams::default();
-            params
-                .distinguished_name
-                .push(DnType::CommonName, hostname);
+            params.distinguished_name.push(DnType::CommonName, hostname);
             params
                 .subject_alt_names
                 .push(rcgen::SanType::DnsName(hostname.try_into().unwrap()));
 
             let ca_cert_params =
                 CertificateParams::from_ca_cert_der(&self.inner.ca_cert_der).unwrap();
-            let ca_cert_for_signing = ca_cert_params
-                .self_signed(&self.inner.ca_key_pair)
-                .unwrap();
+            let ca_cert_for_signing = ca_cert_params.self_signed(&self.inner.ca_key_pair).unwrap();
 
             let leaf_cert = params
                 .signed_by(&leaf_key, &ca_cert_for_signing, &self.inner.ca_key_pair)

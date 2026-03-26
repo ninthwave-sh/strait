@@ -220,10 +220,7 @@ source = "keychain"
         let result = CredentialStore::load(f.path());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unsupported source type"),
-            "got: {err}"
-        );
+        assert!(err.contains("unsupported source type"), "got: {err}");
 
         std::env::remove_var("STRAIT_TEST_TOKEN_2");
     }

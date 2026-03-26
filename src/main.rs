@@ -5,6 +5,7 @@ pub mod credentials;
 mod health;
 mod mitm;
 pub mod policy;
+pub mod sigv4;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

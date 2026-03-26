@@ -122,6 +122,10 @@ pub struct PolicyConfig {
 /// Exactly one of `host` or `host_pattern` must be set:
 /// - `host`: exact hostname match (e.g. `"api.github.com"`)
 /// - `host_pattern`: glob pattern with leading wildcard (e.g. `"*.amazonaws.com"`)
+///
+/// Supported credential types:
+/// - `"bearer"` (default) — injects a single static header/value pair.
+/// - `"aws-sigv4"` — signs the request with AWS Signature Version 4.
 #[derive(Debug, Deserialize, Clone)]
 pub struct CredentialEntryConfig {
     /// Exact hostname this credential applies to (e.g. `"api.github.com"`).
@@ -131,18 +135,31 @@ pub struct CredentialEntryConfig {
     /// Mutually exclusive with `host`.
     pub host_pattern: Option<String>,
     /// HTTP header name to inject (e.g. `"Authorization"`).
+    /// Required for `"bearer"` type; ignored for `"aws-sigv4"`.
+    #[serde(default)]
     pub header: String,
     /// Prefix prepended to the resolved secret value (e.g. `"token "`).
+    /// Only used by `"bearer"` type.
     #[serde(default)]
     pub value_prefix: String,
     /// Source type. Currently only `"env"` is supported.
     pub source: String,
-    /// Environment variable name (required when `source = "env"`).
+    /// Environment variable name (required when `source = "env"` and type is `"bearer"`).
     pub env_var: Option<String>,
-    /// Credential type. Currently only `"bearer"` is supported.
-    /// Defaults to `"bearer"` for backward compatibility.
+    /// Credential type: `"bearer"` (default) or `"aws-sigv4"`.
     #[serde(rename = "type", default = "default_credential_type")]
     pub credential_type: String,
+
+    // --- AWS SigV4-specific fields (optional, type = "aws-sigv4" only) ---
+    /// Environment variable for the AWS access key ID.
+    /// Defaults to `"AWS_ACCESS_KEY_ID"`.
+    pub access_key_id_var: Option<String>,
+    /// Environment variable for the AWS secret access key.
+    /// Defaults to `"AWS_SECRET_ACCESS_KEY"`.
+    pub secret_access_key_var: Option<String>,
+    /// Environment variable for the optional AWS session token.
+    /// Defaults to `"AWS_SESSION_TOKEN"`.
+    pub session_token_var: Option<String>,
 }
 
 fn default_credential_type() -> String {

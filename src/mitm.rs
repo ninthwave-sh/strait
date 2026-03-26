@@ -436,6 +436,9 @@ mod tests {
             source: "env".to_string(),
             env_var: Some("STRAIT_TEST_INJECT_1".to_string()),
             credential_type: "bearer".to_string(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
         }];
 
         let store = CredentialStore::from_entries(&entries).unwrap();
@@ -473,6 +476,9 @@ mod tests {
             source: "env".to_string(),
             env_var: Some("STRAIT_TEST_INJECT_2".to_string()),
             credential_type: "bearer".to_string(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
         }];
 
         let store = CredentialStore::from_entries(&entries).unwrap();
@@ -584,6 +590,9 @@ mod tests {
             source: "env".to_string(),
             env_var: Some("STRAIT_TEST_INJECT_3".to_string()),
             credential_type: "bearer".to_string(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
         }];
 
         let store = CredentialStore::from_entries(&entries).unwrap();
@@ -724,6 +733,9 @@ mod tests {
             source: "env".to_string(),
             env_var: Some("STRAIT_TEST_BODY_1".to_string()),
             credential_type: "bearer".to_string(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
         }];
 
         let store = CredentialStore::from_entries(&entries).unwrap();
@@ -762,6 +774,9 @@ mod tests {
             source: "env".to_string(),
             env_var: Some("STRAIT_TEST_BODY_2".to_string()),
             credential_type: "bearer".to_string(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
         }];
 
         let store = CredentialStore::from_entries(&entries).unwrap();

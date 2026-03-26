@@ -2,8 +2,9 @@
 //!
 //! When the CONNECT target is an inspected host (e.g. api.github.com), the proxy
 //! generates a per-host certificate signed by the session CA, terminates TLS,
-//! reads the inner HTTP request, and forwards it upstream. For all other hosts
-//! the connection is tunneled transparently without any decryption.
+//! reads the inner HTTP request, evaluates it against Cedar policies, and
+//! either returns a 403 or forwards it upstream. For all other hosts the
+//! connection is tunneled transparently without any decryption.
 
 use std::sync::Arc;
 
@@ -12,9 +13,10 @@ use rustls::ServerConfig;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::ca::SessionCa;
+use crate::policy::PolicyEngine;
 
 /// Set of hostnames that should be MITM'd for policy inspection.
 const INSPECTED_HOSTS: &[&str] = &["api.github.com"];
@@ -28,14 +30,16 @@ pub fn should_mitm(host: &str) -> bool {
 ///
 /// 1. Accept TLS from the client using a leaf cert for `host`.
 /// 2. Read the inner HTTP request (method, path, headers).
-/// 3. Establish a real TLS connection to the upstream.
-/// 4. Forward the request and relay the response.
+/// 3. Evaluate against Cedar policies (if a policy engine is provided).
+/// 4. On DENY, return HTTP 403 with structured JSON body.
+/// 5. On ALLOW (or no policy engine), forward the request upstream.
 pub async fn handle_mitm(
     client: TcpStream,
     host: &str,
     port: u16,
     ca: &SessionCa,
     peer: &std::net::SocketAddr,
+    policy: Option<&PolicyEngine>,
 ) -> anyhow::Result<()> {
     // Generate a leaf certificate for this host
     let (cert_chain, key) = ca
@@ -110,6 +114,74 @@ pub async fn handle_mitm(
         "MITM: inner HTTP request visible"
     );
     eprintln!("{}", serde_json::to_string(&event)?);
+
+    // Evaluate Cedar policy (if configured)
+    if let Some(engine) = policy {
+        let decision = engine.evaluate(host, &method, &path, &headers)?;
+
+        let decision_ts =
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let policy_display = if decision.policy_names.is_empty() {
+            "default-deny".to_string()
+        } else {
+            decision.policy_names.join(", ")
+        };
+
+        let decision_str = if decision.allowed { "allow" } else { "deny" };
+        let decision_event = serde_json::json!({
+            "ts": decision_ts,
+            "type": "policy_decision",
+            "peer": peer.to_string(),
+            "host": host,
+            "method": method,
+            "path": path,
+            "decision": decision_str,
+            "policy": policy_display,
+        });
+        eprintln!("{}", serde_json::to_string(&decision_event)?);
+
+        if !decision.allowed {
+            warn!(
+                host = host,
+                method = method.as_str(),
+                path = path.as_str(),
+                policy = policy_display.as_str(),
+                "DENY: request blocked by Cedar policy"
+            );
+
+            // Return 403 with structured JSON body
+            let body = crate::policy::deny_response_body(
+                host,
+                &method,
+                &path,
+                &decision.policy_names,
+            );
+            let body_bytes = serde_json::to_string(&body)?;
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {}",
+                body_bytes.len(),
+                body_bytes
+            );
+
+            let tls_client_inner = buf_reader.into_inner();
+            tls_client_inner.write_all(response.as_bytes()).await?;
+            tls_client_inner.shutdown().await?;
+            return Ok(());
+        }
+
+        info!(
+            host = host,
+            method = method.as_str(),
+            path = path.as_str(),
+            policy = policy_display.as_str(),
+            "ALLOW: request permitted by Cedar policy"
+        );
+    }
 
     // Build the upstream request to forward
     // Connect to upstream with real TLS

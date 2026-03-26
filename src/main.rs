@@ -1,8 +1,10 @@
 mod ca;
 mod mitm;
+pub mod policy;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
 use tokio::io::copy_bidirectional;
@@ -11,6 +13,7 @@ use tracing::{info, warn};
 
 use crate::ca::SessionCa;
 use crate::mitm::{handle_mitm, should_mitm};
+use crate::policy::PolicyEngine;
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +40,12 @@ struct Cli {
     /// If not specified, the CA cert PEM is printed to stdout.
     #[arg(long, value_name = "PATH")]
     ca_cert_path: Option<PathBuf>,
+
+    /// Path to a Cedar policy file (.cedar) for request authorization.
+    /// If specified, every MITM'd request is evaluated against these policies.
+    /// Requests that are not explicitly permitted are denied (403).
+    #[arg(long, value_name = "FILE")]
+    policy: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -48,6 +57,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Load Cedar policy file (if specified)
+    let policy_engine: Option<Arc<PolicyEngine>> = match &cli.policy {
+        Some(path) => {
+            let engine = PolicyEngine::load(path)?;
+            info!(path = %path.display(), "Cedar policy loaded");
+            Some(Arc::new(engine))
+        }
+        None => None,
+    };
 
     // Generate session CA
     let session_ca = SessionCa::generate()?;
@@ -72,8 +91,9 @@ async fn main() -> anyhow::Result<()> {
     loop {
         let (client, peer) = listener.accept().await?;
         let ca = session_ca.clone();
+        let policy = policy_engine.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(client, peer, &ca).await {
+            if let Err(e) = handle_connection(client, peer, &ca, policy.as_deref()).await {
                 warn!(error = %e, "connection error");
             }
         });
@@ -83,12 +103,13 @@ async fn main() -> anyhow::Result<()> {
 /// Handle a single client connection.
 ///
 /// For CONNECT requests: check if the target host should be MITM'd.
-/// - Inspected hosts: terminate TLS, read inner HTTP, forward upstream.
+/// - Inspected hosts: terminate TLS, evaluate Cedar policies, forward or deny.
 /// - All other hosts: transparent TCP tunnel (no decryption).
 async fn handle_connection(
     mut client: TcpStream,
     peer: SocketAddr,
     ca: &SessionCa,
+    policy: Option<&PolicyEngine>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -96,7 +117,7 @@ async fn handle_connection(
     let mut request_line = String::new();
     buf_client.read_line(&mut request_line).await?;
 
-    let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 2 {
         return Ok(());
     }
@@ -140,7 +161,7 @@ async fn handle_connection(
                 .await?;
 
             // Hand off to MITM handler
-            handle_mitm(client, &host, port, ca, &peer).await?;
+            handle_mitm(client, &host, port, ca, &peer, policy).await?;
         } else {
             // Passthrough path: transparent TCP tunnel
             let mut upstream = TcpStream::connect(format!("{host}:{port}")).await?;

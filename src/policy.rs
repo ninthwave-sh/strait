@@ -14,6 +14,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+
+use crate::credentials::parse_aws_host;
 use cedar_policy::{
     Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid,
     PolicySet, Request, RestrictedExpression, Schema, ValidationMode, Validator,
@@ -146,6 +148,27 @@ impl PolicyEngine {
                     .unwrap(),
             ),
         ];
+
+        // Add AWS-specific context attributes when the host is an AWS endpoint.
+        // This enables Cedar policies to use `context.aws_service` and
+        // `context.aws_region` for fine-grained AWS access control.
+        if let Some(aws_info) = parse_aws_host(host) {
+            context_pairs.push((
+                "aws_service".to_string(),
+                RestrictedExpression::from_str(&format!(
+                    "\"{}\"",
+                    escape_cedar_string(&aws_info.service)
+                ))
+                .unwrap(),
+            ));
+            // Always provide aws_region — default to us-east-1 for global endpoints
+            let region = aws_info.region.as_deref().unwrap_or("us-east-1");
+            context_pairs.push((
+                "aws_region".to_string(),
+                RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(region)))
+                    .unwrap(),
+            ));
+        }
 
         // Add individual headers as context attributes
         context_pairs.extend(header_pairs);
@@ -950,6 +973,184 @@ forbid(
         assert!(
             !result.allowed,
             "PATCH /repos/our-org/my-repo/settings should be denied"
+        );
+    }
+
+    // --- AWS context attribute tests ---
+
+    #[test]
+    fn aws_context_attributes_set_for_aws_host() {
+        let f = write_policy(
+            r#"
+@id("allow-s3")
+permit(
+    principal == Agent::"worker",
+    action == Action::"GET",
+    resource
+) when { context.aws_service == "s3" && context.aws_region == "us-east-1" };
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // S3 regional request should match
+        let result = engine
+            .evaluate(
+                "s3.us-east-1.amazonaws.com",
+                "GET",
+                "/bucket/key",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(result.allowed, "S3 us-east-1 request should be allowed");
+
+        // Lambda request should NOT match (wrong service)
+        let result = engine
+            .evaluate(
+                "lambda.us-east-1.amazonaws.com",
+                "GET",
+                "/functions",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(!result.allowed, "Lambda request should not match S3 policy");
+
+        // Non-AWS request should NOT match (no aws_service in context)
+        let result = engine
+            .evaluate("api.github.com", "GET", "/repos", &[], "worker")
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "GitHub request should not match AWS policy"
+        );
+    }
+
+    #[test]
+    fn aws_context_region_defaults_to_us_east_1_for_global() {
+        let f = write_policy(
+            r#"
+@id("allow-iam-read")
+permit(
+    principal == Agent::"worker",
+    action == Action::"GET",
+    resource
+) when { context.aws_service == "iam" && context.aws_region == "us-east-1" };
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // Global endpoint (iam.amazonaws.com) should default to us-east-1
+        let result = engine
+            .evaluate("iam.amazonaws.com", "GET", "/", &[], "worker")
+            .unwrap();
+        assert!(
+            result.allowed,
+            "IAM global endpoint should default to us-east-1"
+        );
+    }
+
+    #[test]
+    fn aws_context_different_regions_distinguished() {
+        let f = write_policy(
+            r#"
+@id("allow-s3-us-east-1")
+permit(
+    principal == Agent::"worker",
+    action == Action::"GET",
+    resource
+) when { context.aws_service == "s3" && context.aws_region == "us-east-1" };
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // us-east-1 should be allowed
+        let result = engine
+            .evaluate(
+                "s3.us-east-1.amazonaws.com",
+                "GET",
+                "/bucket",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(result.allowed, "S3 us-east-1 should be allowed");
+
+        // eu-west-1 should be denied (different region)
+        let result = engine
+            .evaluate(
+                "s3.eu-west-1.amazonaws.com",
+                "GET",
+                "/bucket",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(!result.allowed, "S3 eu-west-1 should be denied");
+    }
+
+    // --- Example AWS file validation tests ---
+
+    #[test]
+    fn example_aws_policy_loads_without_errors() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aws.cedar");
+        let engine = PolicyEngine::load(&policy_path, None);
+        assert!(
+            engine.is_ok(),
+            "AWS example policy failed to load: {:#}",
+            engine.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn example_aws_schema_validates_example_aws_policy() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aws.cedar");
+        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aws.cedarschema");
+        let engine = PolicyEngine::load(&policy_path, Some(&schema_path));
+        assert!(
+            engine.is_ok(),
+            "AWS example policy failed schema validation: {:#}",
+            engine.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn example_aws_policy_allows_s3_us_east_1() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aws.cedar");
+        let engine = PolicyEngine::load(&policy_path, None).unwrap();
+
+        let result = engine
+            .evaluate(
+                "s3.us-east-1.amazonaws.com",
+                "PUT",
+                "/my-bucket/object.txt",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            result.allowed,
+            "S3 PUT in us-east-1 should be allowed by example AWS policy"
+        );
+    }
+
+    #[test]
+    fn example_aws_policy_denies_govcloud() {
+        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aws.cedar");
+        let engine = PolicyEngine::load(&policy_path, None).unwrap();
+
+        let result = engine
+            .evaluate(
+                "s3.us-gov-west-1.amazonaws.com",
+                "GET",
+                "/bucket",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "GovCloud access should be denied by example AWS policy"
         );
     }
 

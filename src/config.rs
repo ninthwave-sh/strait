@@ -86,11 +86,13 @@ pub struct MitmConfig {
     pub hosts: Vec<String>,
 }
 
-/// `[policy]` section — path to a Cedar policy file.
+/// `[policy]` section — path to a Cedar policy file and optional schema.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PolicyConfig {
     /// Path to a `.cedar` policy file.
     pub path: PathBuf,
+    /// Optional path to a `.cedarschema` file for policy validation at startup.
+    pub schema: Option<PathBuf>,
 }
 
 /// `[[credential]]` array entry — a single credential for header injection.
@@ -174,7 +176,8 @@ impl ProxyContext {
         // Load Cedar policy (if configured)
         let policy_engine = match &config.policy {
             Some(policy_config) => {
-                let engine = PolicyEngine::load(&policy_config.path)?;
+                let engine =
+                    PolicyEngine::load(&policy_config.path, policy_config.schema.as_deref())?;
                 info!(path = %policy_config.path.display(), "Cedar policy loaded");
                 Some(Arc::new(engine))
             }

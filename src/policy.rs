@@ -823,8 +823,7 @@ forbid(
     #[test]
     fn example_schema_validates_example_policy() {
         let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
-        let schema_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedarschema");
+        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedarschema");
         let engine = PolicyEngine::load(&policy_path, Some(&schema_path));
         assert!(
             engine.is_ok(),
@@ -836,8 +835,7 @@ forbid(
     #[test]
     fn example_policy_allows_get_org_repos() {
         let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
-        let schema_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedarschema");
+        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedarschema");
         let engine = PolicyEngine::load(&policy_path, Some(&schema_path)).unwrap();
 
         let result = engine

@@ -484,4 +484,24 @@ ca_cert_path = "/tmp/ca.pem"
         assert_eq!(identity.header, "X-Strait-Agent");
         assert_eq!(identity.default, "anonymous");
     }
+
+    // --- Example config file test ---
+
+    #[test]
+    fn example_config_parses_without_errors() {
+        let config_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/strait.toml");
+        let config = StraitConfig::load(&config_path);
+        assert!(
+            config.is_ok(),
+            "example config failed to parse: {:#}",
+            config.unwrap_err()
+        );
+        let config = config.unwrap();
+        assert_eq!(config.listen.port, 8080);
+        assert_eq!(config.mitm.hosts, vec!["api.github.com"]);
+        assert!(config.policy.is_some());
+        assert_eq!(config.credential.len(), 1);
+        assert_eq!(config.credential[0].host, "api.github.com");
+        assert_eq!(config.health.as_ref().unwrap().port, 9090);
+    }
 }

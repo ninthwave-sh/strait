@@ -23,12 +23,15 @@ pub struct AuditEvent {
     pub request: AuditRequest,
     /// Policy decision: "allow", "deny", or "passthrough".
     pub decision: String,
-    /// Name of the Cedar policy that matched (if any).
-    pub matched_policy: String,
+    /// Names of Cedar policies that contributed to the decision.
+    pub matched_policies: Vec<String>,
     /// Whether a credential was injected on this request.
     pub credential_injected: bool,
     /// Policy evaluation latency in microseconds.
     pub eval_latency_us: u64,
+    /// Human-readable reason for denial (present only on deny events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denial_reason: Option<String>,
 }
 
 /// Request metadata included in audit events.
@@ -40,6 +43,9 @@ pub struct AuditRequest {
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Identity of the requesting agent (extracted from the identity header).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     pub mitm: bool,
 }
 
@@ -88,9 +94,11 @@ impl AuditLogger {
         port: u16,
         method: &str,
         path: &str,
+        agent_id: &str,
         decision: &str,
-        matched_policy: &str,
+        matched_policies: &[String],
         credential_injected: bool,
+        denial_reason: Option<&str>,
         eval_start: Instant,
     ) {
         let eval_latency_us = eval_start.elapsed().as_micros() as u64;
@@ -103,12 +111,14 @@ impl AuditLogger {
                 port,
                 method: Some(method.to_string()),
                 path: Some(path.to_string()),
+                agent: Some(agent_id.to_string()),
                 mitm: true,
             },
             decision: decision.to_string(),
-            matched_policy: matched_policy.to_string(),
+            matched_policies: matched_policies.to_vec(),
             credential_injected,
             eval_latency_us,
+            denial_reason: denial_reason.map(|s| s.to_string()),
         };
 
         self.emit(&event);
@@ -124,12 +134,14 @@ impl AuditLogger {
                 port,
                 method: None,
                 path: None,
+                agent: None,
                 mitm: false,
             },
             decision: "passthrough".to_string(),
-            matched_policy: String::new(),
+            matched_policies: vec![],
             credential_injected: false,
             eval_latency_us: 0,
+            denial_reason: None,
         };
 
         self.emit(&event);
@@ -167,12 +179,14 @@ mod tests {
                 port: 443,
                 method: Some("GET".to_string()),
                 path: Some("/repos/org/repo".to_string()),
+                agent: Some("worker".to_string()),
                 mitm: true,
             },
             decision: "allow".to_string(),
-            matched_policy: "read-repos".to_string(),
+            matched_policies: vec!["read-repos".to_string()],
             credential_injected: true,
             eval_latency_us: 150,
+            denial_reason: None,
         };
 
         let json = serde_json::to_value(&event).unwrap();
@@ -182,11 +196,14 @@ mod tests {
         assert_eq!(json["request"]["port"], 443);
         assert_eq!(json["request"]["method"], "GET");
         assert_eq!(json["request"]["path"], "/repos/org/repo");
+        assert_eq!(json["request"]["agent"], "worker");
         assert_eq!(json["request"]["mitm"], true);
         assert_eq!(json["decision"], "allow");
-        assert_eq!(json["matched_policy"], "read-repos");
+        assert_eq!(json["matched_policies"], serde_json::json!(["read-repos"]));
         assert_eq!(json["credential_injected"], true);
         assert!(json["eval_latency_us"].as_u64().unwrap() > 0);
+        // denial_reason should be absent on allow events
+        assert!(json.get("denial_reason").is_none());
     }
 
     #[test]
@@ -199,12 +216,14 @@ mod tests {
                 port: 443,
                 method: None,
                 path: None,
+                agent: None,
                 mitm: false,
             },
             decision: "passthrough".to_string(),
-            matched_policy: String::new(),
+            matched_policies: vec![],
             credential_injected: false,
             eval_latency_us: 0,
+            denial_reason: None,
         };
 
         let json_str = serde_json::to_string(&event).unwrap();
@@ -215,6 +234,14 @@ mod tests {
         assert!(
             !json_str.contains("\"path\""),
             "passthrough should not have path"
+        );
+        assert!(
+            !json_str.contains("\"agent\""),
+            "passthrough should not have agent"
+        );
+        assert!(
+            !json_str.contains("\"denial_reason\""),
+            "passthrough should not have denial_reason"
         );
 
         let json = serde_json::to_value(&event).unwrap();
@@ -242,9 +269,11 @@ mod tests {
             443,
             "GET",
             "/repos/org/repo",
+            "worker",
             "allow",
-            "read-repos",
+            &["read-repos".to_string()],
             true,
+            None,
             start,
         );
 
@@ -253,7 +282,13 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(parsed["decision"], "allow");
         assert_eq!(parsed["request"]["host"], "api.github.com");
+        assert_eq!(parsed["request"]["agent"], "worker");
         assert_eq!(parsed["credential_injected"], true);
+        assert_eq!(
+            parsed["matched_policies"],
+            serde_json::json!(["read-repos"])
+        );
+        assert!(parsed.get("denial_reason").is_none());
     }
 
     #[test]
@@ -284,5 +319,92 @@ mod tests {
         let l1 = AuditLogger::new(None).unwrap();
         let l2 = AuditLogger::new(None).unwrap();
         assert_ne!(l1.session_id(), l2.session_id());
+    }
+
+    // --- Enriched audit event tests ---
+
+    #[test]
+    fn matched_policies_serializes_as_json_array() {
+        let event = AuditEvent {
+            timestamp: "2026-03-26T00:00:00.000Z".to_string(),
+            session_id: "test".to_string(),
+            request: AuditRequest {
+                host: "api.github.com".to_string(),
+                port: 443,
+                method: Some("GET".to_string()),
+                path: Some("/repos".to_string()),
+                agent: Some("worker".to_string()),
+                mitm: true,
+            },
+            decision: "allow".to_string(),
+            matched_policies: vec!["read-repos".to_string(), "fallback".to_string()],
+            credential_injected: false,
+            eval_latency_us: 50,
+            denial_reason: None,
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        let policies = json["matched_policies"].as_array().unwrap();
+        assert_eq!(policies.len(), 2);
+        assert_eq!(policies[0], "read-repos");
+        assert_eq!(policies[1], "fallback");
+    }
+
+    #[test]
+    fn denial_reason_present_on_deny_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.jsonl");
+        let logger = AuditLogger::new(Some(&log_path)).unwrap();
+
+        let start = Instant::now();
+        logger.log_decision(
+            "api.github.com",
+            443,
+            "DELETE",
+            "/repos/org/repo",
+            "worker",
+            "deny",
+            &["deny-destructive".to_string()],
+            false,
+            Some("Destructive operations are not allowed"),
+            start,
+        );
+
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(parsed["decision"], "deny");
+        assert_eq!(
+            parsed["denial_reason"],
+            "Destructive operations are not allowed"
+        );
+    }
+
+    #[test]
+    fn denial_reason_absent_on_allow_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.jsonl");
+        let logger = AuditLogger::new(Some(&log_path)).unwrap();
+
+        let start = Instant::now();
+        logger.log_decision(
+            "api.github.com",
+            443,
+            "GET",
+            "/repos/org/repo",
+            "worker",
+            "allow",
+            &["read-repos".to_string()],
+            true,
+            None,
+            start,
+        );
+
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(parsed["decision"], "allow");
+        assert!(
+            parsed.get("denial_reason").is_none(),
+            "allow events should not have denial_reason"
+        );
     }
 }

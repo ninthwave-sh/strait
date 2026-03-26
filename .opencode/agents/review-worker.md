@@ -1,1 +1,0 @@
-../../../ninthwave/agents/review-worker.md

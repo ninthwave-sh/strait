@@ -22,3 +22,9 @@ target
 
 # ninthwave worktrees
 .worktrees/
+
+# ninthwave symlinks (resolve to local ninthwave checkout, broken for other contributors)
+.claude/agents/
+.claude/skills/
+.opencode/agents/
+.github/agents/

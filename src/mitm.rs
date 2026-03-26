@@ -130,12 +130,8 @@ pub async fn handle_mitm(
             );
 
             // Return 403 with structured JSON body
-            let body = crate::policy::deny_response_body(
-                host,
-                &method,
-                &path,
-                &decision.policy_names,
-            );
+            let body =
+                crate::policy::deny_response_body(host, &method, &path, &decision.policy_names);
             let body_bytes = serde_json::to_string(&body)?;
             let response = format!(
                 "HTTP/1.1 403 Forbidden\r\n\
@@ -376,7 +372,10 @@ env_var = "STRAIT_TEST_INJECT_2"
 
         // Should only have one Authorization header
         let auth_count = headers.iter().filter(|(k, _)| k == "Authorization").count();
-        assert_eq!(auth_count, 1, "should have exactly one Authorization header");
+        assert_eq!(
+            auth_count, 1,
+            "should have exactly one Authorization header"
+        );
 
         let auth = headers.iter().find(|(k, _)| k == "Authorization").unwrap();
         assert_eq!(auth.1, "token ghp_new_token");
@@ -416,7 +415,10 @@ env_var = "STRAIT_TEST_INJECT_3"
         let mut headers = vec![("Host".to_string(), "example.com".to_string())];
 
         let injected = inject_credential("example.com", &mut headers, Some(&store));
-        assert!(!injected, "no credential should be injected for unknown host");
+        assert!(
+            !injected,
+            "no credential should be injected for unknown host"
+        );
 
         std::env::remove_var("STRAIT_TEST_INJECT_3");
     }

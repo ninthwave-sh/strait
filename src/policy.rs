@@ -120,13 +120,15 @@ impl PolicyEngine {
         // Add individual headers as context attributes
         context_pairs.extend(header_pairs);
 
-        let context = Context::from_pairs(context_pairs)
-            .context("failed to build Cedar context")?;
+        let context =
+            Context::from_pairs(context_pairs).context("failed to build Cedar context")?;
 
         let request = Request::new(principal, action, resource, context, None)
             .map_err(|e| anyhow::anyhow!("failed to build Cedar request: {e}"))?;
 
-        let response = self.authorizer.is_authorized(&request, &self.policy_set, &entities);
+        let response = self
+            .authorizer
+            .is_authorized(&request, &self.policy_set, &entities);
 
         // Resolve policy IDs: prefer @id annotation value over auto-generated name
         let policy_names: Vec<String> = response
@@ -264,8 +266,8 @@ pub fn deny_response_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     fn write_policy(content: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
@@ -343,10 +345,7 @@ forbid(
 
     #[test]
     fn build_resource_id_root_path() {
-        assert_eq!(
-            build_resource_id("api.github.com", "/"),
-            "api.github.com"
-        );
+        assert_eq!(build_resource_id("api.github.com", "/"), "api.github.com");
     }
 
     // --- 6 test cases from the TODO ---
@@ -371,12 +370,7 @@ forbid(
         let f = write_policy(GITHUB_POLICY);
         let engine = PolicyEngine::load(f.path()).unwrap();
         let result = engine
-            .evaluate(
-                "api.github.com",
-                "POST",
-                "/repos/our-org/repo/pulls",
-                &[],
-            )
+            .evaluate("api.github.com", "POST", "/repos/our-org/repo/pulls", &[])
             .unwrap();
         assert!(
             result.allowed,
@@ -452,7 +446,10 @@ forbid(
         );
 
         assert_eq!(body["error"], "policy_denied");
-        assert!(body["message"].as_str().unwrap().contains("deny-destructive"));
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("deny-destructive"));
         assert_eq!(body["host"], "api.github.com");
         assert_eq!(body["method"], "DELETE");
         assert_eq!(body["path"], "/repos/org/repo");

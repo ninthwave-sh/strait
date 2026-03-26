@@ -4,9 +4,7 @@
 //! as PEM so the caller can inject it into the sandbox's trust store. Per-host
 //! leaf certificates are signed by this CA on demand during MITM.
 
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
-};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
@@ -32,10 +30,7 @@ impl SessionCa {
             .distinguished_name
             .push(DnType::OrganizationName, "strait");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.key_usages = vec![
-            KeyUsagePurpose::KeyCertSign,
-            KeyUsagePurpose::CrlSign,
-        ];
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         params.not_before = OffsetDateTime::now_utc() - Duration::minutes(5);
         params.not_after = OffsetDateTime::now_utc() + Duration::hours(24);
 
@@ -58,9 +53,7 @@ impl SessionCa {
         let leaf_key = KeyPair::generate()?;
 
         let mut params = CertificateParams::default();
-        params
-            .distinguished_name
-            .push(DnType::CommonName, hostname);
+        params.distinguished_name.push(DnType::CommonName, hostname);
         params
             .subject_alt_names
             .push(rcgen::SanType::DnsName(hostname.try_into()?));
@@ -68,8 +61,7 @@ impl SessionCa {
         params.not_after = OffsetDateTime::now_utc() + Duration::hours(24);
 
         let ca_cert_params = CertificateParams::from_ca_cert_der(&self.ca_cert_der)?;
-        let ca_cert_for_signing =
-            ca_cert_params.self_signed(&self.ca_key_pair)?;
+        let ca_cert_for_signing = ca_cert_params.self_signed(&self.ca_key_pair)?;
 
         let leaf_cert = params.signed_by(&leaf_key, &ca_cert_for_signing, &self.ca_key_pair)?;
 
@@ -78,9 +70,7 @@ impl SessionCa {
             self.ca_cert_der.clone(),
         ];
 
-        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            leaf_key.serialize_der(),
-        ));
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
 
         Ok((chain, key_der))
     }

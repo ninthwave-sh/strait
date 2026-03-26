@@ -78,12 +78,34 @@ fn default_address() -> String {
     "127.0.0.1".to_string()
 }
 
+/// Default maximum body size for MITM buffering (10 MB).
+const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
 /// `[mitm]` section — which hosts to intercept.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct MitmConfig {
     /// Hostnames that should be MITM'd for policy inspection.
     #[serde(default)]
     pub hosts: Vec<String>,
+
+    /// Maximum request body size (in bytes) that the MITM pipeline will buffer.
+    /// Requests with `Content-Length` exceeding this limit are rejected with
+    /// HTTP 413. Defaults to 10 MB.
+    #[serde(default = "default_max_body_size")]
+    pub max_body_size: usize,
+}
+
+impl Default for MitmConfig {
+    fn default() -> Self {
+        Self {
+            hosts: Vec::new(),
+            max_body_size: DEFAULT_MAX_BODY_SIZE,
+        }
+    }
+}
+
+fn default_max_body_size() -> usize {
+    DEFAULT_MAX_BODY_SIZE
 }
 
 /// `[policy]` section — path to a Cedar policy file and optional schema.
@@ -200,6 +222,8 @@ pub struct ProxyContext {
     pub audit_logger: Arc<AuditLogger>,
     /// Hostnames that should be MITM'd for policy inspection.
     pub mitm_hosts: Vec<String>,
+    /// Maximum request body size (bytes) the MITM pipeline will buffer.
+    pub max_body_size: usize,
     /// Instant when the proxy context was created (for uptime calculation).
     pub startup_instant: Instant,
     /// HTTP header name to extract agent identity from.
@@ -255,6 +279,7 @@ impl ProxyContext {
             credential_store,
             audit_logger,
             mitm_hosts: config.mitm.hosts.clone(),
+            max_body_size: config.mitm.max_body_size,
             startup_instant: Instant::now(),
             identity_header: identity.header,
             identity_default: identity.default,

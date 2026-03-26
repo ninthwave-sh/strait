@@ -65,22 +65,41 @@ async fn start_tls_echo_server() -> (std::net::SocketAddr, String, CertificateDe
                     Err(_) => return,
                 };
 
-                // Read the HTTP request
+                // Read the HTTP request (headers + optional body)
                 let mut buf = BufReader::new(&mut tls);
                 let mut request_lines = Vec::new();
+                let mut content_length: Option<usize> = None;
                 loop {
                     let mut line = String::new();
                     if buf.read_line(&mut line).await.is_err() || line.trim().is_empty() {
                         break;
                     }
-                    request_lines.push(line.trim().to_string());
+                    let trimmed = line.trim().to_string();
+                    if let Some((k, v)) = trimmed.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            content_length = v.trim().parse().ok();
+                        }
+                    }
+                    request_lines.push(trimmed);
                 }
 
-                let body = request_lines.join("\n");
+                // Read request body if Content-Length present
+                let mut request_body = Vec::new();
+                if let Some(len) = content_length {
+                    request_body.resize(len, 0);
+                    let _ = buf.read_exact(&mut request_body).await;
+                }
+
+                // Echo back headers + body
+                let mut echo = request_lines.join("\n");
+                if !request_body.is_empty() {
+                    echo.push_str("\n\n");
+                    echo.push_str(&String::from_utf8_lossy(&request_body));
+                }
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
+                    echo.len(),
+                    echo
                 );
 
                 let tls_inner = buf.into_inner();
@@ -309,6 +328,105 @@ async fn passthrough_does_not_decrypt() {
     );
 }
 
+#[tokio::test]
+async fn mitm_preserves_request_body_through_pipeline() {
+    // Start the proxy's CA
+    let ca = strait_test_helpers::generate_ca();
+
+    // Start a TLS echo server that echoes headers + body
+    let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
+
+    // Start the proxy listener
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ca_clone = ca.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        strait_test_helpers::handle_mitm_connection(client, peer, &ca_clone, echo_addr).await;
+    });
+
+    // Connect to the proxy and send a CONNECT request
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
+        .await
+        .unwrap();
+
+    // Read the 200 response
+    let mut buf = BufReader::new(&mut client);
+    let mut response_line = String::new();
+    buf.read_line(&mut response_line).await.unwrap();
+    assert!(
+        response_line.contains("200"),
+        "Expected 200, got: {}",
+        response_line.trim()
+    );
+    // Drain response headers
+    loop {
+        let mut line = String::new();
+        buf.read_line(&mut line).await.unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+
+    // TLS handshake with the proxy (using the session CA as trust root)
+    let mut root_store = rustls::RootCertStore::empty();
+    let ca_pem_bytes = ca.ca_cert_pem.as_bytes();
+    let mut cursor = std::io::Cursor::new(ca_pem_bytes);
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let server_name = ServerName::try_from("api.github.com").unwrap();
+
+    let client_inner = buf.into_inner();
+    let mut tls = connector.connect(server_name, client_inner).await.unwrap();
+
+    // Send a POST request with a body
+    let body = r#"{"name":"test-repo","private":true}"#;
+    let request = format!(
+        "POST /repos HTTP/1.1\r\n\
+         Host: api.github.com\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    );
+    tls.write_all(request.as_bytes()).await.unwrap();
+
+    // Read the response
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    // The echo server should have echoed back our request including the body
+    assert!(
+        response_str.contains("200 OK"),
+        "Expected 200 OK in response, got: {}",
+        response_str
+    );
+    assert!(
+        response_str.contains("POST /repos"),
+        "Expected POST request line in echo body, got: {}",
+        response_str
+    );
+    assert!(
+        response_str.contains(body),
+        "Expected request body '{}' preserved in echo response, got: {}",
+        body,
+        response_str
+    );
+}
+
 /// Test helper module exposed for integration tests.
 mod strait_test_helpers {
     use super::*;
@@ -419,13 +537,27 @@ mod strait_test_helpers {
         let mut request_line = String::new();
         buf.read_line(&mut request_line).await.unwrap();
         let mut headers = Vec::new();
+        let mut content_length: Option<usize> = None;
         loop {
             let mut h = String::new();
             buf.read_line(&mut h).await.unwrap();
             if h.trim().is_empty() {
                 break;
             }
-            headers.push(h.trim().to_string());
+            let trimmed = h.trim().to_string();
+            if let Some((k, v)) = trimmed.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = v.trim().parse().ok();
+                }
+            }
+            headers.push(trimmed);
+        }
+
+        // Read request body if Content-Length present
+        let mut request_body = Vec::new();
+        if let Some(len) = content_length {
+            request_body.resize(len, 0);
+            buf.read_exact(&mut request_body).await.unwrap();
         }
 
         // Connect to upstream (echo server)
@@ -442,7 +574,7 @@ mod strait_test_helpers {
         let server_name = ServerName::try_from("localhost").unwrap();
         let mut tls_upstream = connector.connect(server_name, upstream_tcp).await.unwrap();
 
-        // Forward the request
+        // Forward the request (headers + body)
         let mut req = request_line.clone();
         for h in &headers {
             req.push_str(h);
@@ -450,6 +582,9 @@ mod strait_test_helpers {
         }
         req.push_str("\r\n");
         tls_upstream.write_all(req.as_bytes()).await.unwrap();
+        if !request_body.is_empty() {
+            tls_upstream.write_all(&request_body).await.unwrap();
+        }
 
         // Relay response back with proper shutdown propagation
         let tls_client_inner = buf.into_inner();

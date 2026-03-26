@@ -86,6 +86,30 @@ pub async fn handle_mitm(
         }
     }
 
+    // --- Body buffering ---
+    // Read the request body *before* credential injection so that signing
+    // schemes (e.g. SigV4) have access to the body hash. Requests without
+    // Content-Length pass None; oversized bodies are rejected with 413.
+    let content_length: Option<usize> = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, v)| v.parse().ok());
+
+    let body: Option<Vec<u8>> = if let Some(len) = content_length {
+        if len > ctx.max_body_size {
+            let response = build_payload_too_large_response(len, ctx.max_body_size);
+            let tls_client_inner = buf_reader.into_inner();
+            tls_client_inner.write_all(response.as_bytes()).await?;
+            tls_client_inner.shutdown().await?;
+            return Ok(());
+        }
+        let mut buf = vec![0u8; len];
+        tokio::io::AsyncReadExt::read_exact(&mut buf_reader, &mut buf).await?;
+        Some(buf)
+    } else {
+        None
+    };
+
     // --- Agent identity extraction ---
     // Extract the agent identity from the configured header. If absent, use the
     // configured default (e.g. "anonymous"). Always strip the identity header
@@ -165,8 +189,14 @@ pub async fn handle_mitm(
         }
 
         // ALLOW path -- check for credential injection
-        let credential_injected =
-            inject_credential(host, &method, &path, &mut headers, None, credentials);
+        let credential_injected = inject_credential(
+            host,
+            &method,
+            &path,
+            &mut headers,
+            body.as_deref(),
+            credentials,
+        );
 
         // Log ALLOW audit event
         audit.log_decision(
@@ -193,8 +223,14 @@ pub async fn handle_mitm(
         );
     } else {
         // No policy engine -- allow by default, still inject credentials
-        let credential_injected =
-            inject_credential(host, &method, &path, &mut headers, None, credentials);
+        let credential_injected = inject_credential(
+            host,
+            &method,
+            &path,
+            &mut headers,
+            body.as_deref(),
+            credentials,
+        );
 
         audit.log_decision(
             host,
@@ -248,16 +284,9 @@ pub async fn handle_mitm(
     request_bytes.push_str("\r\n");
     tls_upstream.write_all(request_bytes.as_bytes()).await?;
 
-    // Read content body if Content-Length present
-    let content_length: Option<usize> = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.parse().ok());
-
-    if let Some(len) = content_length {
-        let mut body = vec![0u8; len];
-        tokio::io::AsyncReadExt::read_exact(&mut buf_reader, &mut body).await?;
-        tls_upstream.write_all(&body).await?;
+    // Write the buffered body (already read before credential injection)
+    if let Some(ref body_bytes) = body {
+        tls_upstream.write_all(body_bytes).await?;
     }
 
     // Relay the response back: bidirectional copy
@@ -294,6 +323,32 @@ pub async fn handle_mitm(
     }
 
     Ok(())
+}
+
+/// Build the HTTP 413 Payload Too Large response string.
+///
+/// Returned when a request's Content-Length exceeds the configured maximum
+/// body size for MITM buffering.
+fn build_payload_too_large_response(content_length: usize, max_body_size: usize) -> String {
+    let body = serde_json::json!({
+        "error": "payload_too_large",
+        "message": format!(
+            "Request body size ({content_length} bytes) exceeds maximum allowed ({max_body_size} bytes)"
+        ),
+        "content_length": content_length,
+        "max_body_size": max_body_size,
+    });
+    let body_bytes = serde_json::to_string(&body).expect("JSON serialization cannot fail");
+    format!(
+        "HTTP/1.1 413 Payload Too Large\r\n\
+Content-Type: application/json\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\
+\r\n\
+{}",
+        body_bytes.len(),
+        body_bytes
+    )
 }
 
 /// Build the HTTP 403 deny response string from a JSON body.
@@ -653,5 +708,126 @@ mod tests {
             .find(|(k, _)| k.eq_ignore_ascii_case("connection"))
             .unwrap();
         assert_eq!(conn.1, "close");
+    }
+
+    // --- Body buffering tests ---
+
+    #[test]
+    fn inject_credential_receives_body_for_post() {
+        std::env::set_var("STRAIT_TEST_BODY_1", "ghp_body_test");
+
+        let entries = vec![CredentialEntryConfig {
+            host: Some("api.github.com".to_string()),
+            host_pattern: None,
+            header: "Authorization".to_string(),
+            value_prefix: "token ".to_string(),
+            source: "env".to_string(),
+            env_var: Some("STRAIT_TEST_BODY_1".to_string()),
+            credential_type: "bearer".to_string(),
+        }];
+
+        let store = CredentialStore::from_entries(&entries).unwrap();
+        let mut headers = vec![
+            ("Host".to_string(), "api.github.com".to_string()),
+            ("Content-Length".to_string(), "13".to_string()),
+        ];
+        let body = b"hello, world!";
+
+        let injected = inject_credential(
+            "api.github.com",
+            "POST",
+            "/repos",
+            &mut headers,
+            Some(body),
+            Some(&store),
+        );
+        assert!(injected, "credential should be injected with body present");
+
+        let auth = headers.iter().find(|(k, _)| k == "Authorization");
+        assert!(auth.is_some());
+        assert_eq!(auth.unwrap().1, "token ghp_body_test");
+
+        std::env::remove_var("STRAIT_TEST_BODY_1");
+    }
+
+    #[test]
+    fn inject_credential_receives_none_for_get() {
+        std::env::set_var("STRAIT_TEST_BODY_2", "ghp_get_test");
+
+        let entries = vec![CredentialEntryConfig {
+            host: Some("api.github.com".to_string()),
+            host_pattern: None,
+            header: "Authorization".to_string(),
+            value_prefix: "token ".to_string(),
+            source: "env".to_string(),
+            env_var: Some("STRAIT_TEST_BODY_2".to_string()),
+            credential_type: "bearer".to_string(),
+        }];
+
+        let store = CredentialStore::from_entries(&entries).unwrap();
+        let mut headers = vec![("Host".to_string(), "api.github.com".to_string())];
+
+        let injected = inject_credential(
+            "api.github.com",
+            "GET",
+            "/repos",
+            &mut headers,
+            None,
+            Some(&store),
+        );
+        assert!(injected, "credential should be injected even without body");
+
+        let auth = headers.iter().find(|(k, _)| k == "Authorization");
+        assert!(auth.is_some());
+        assert_eq!(auth.unwrap().1, "token ghp_get_test");
+
+        std::env::remove_var("STRAIT_TEST_BODY_2");
+    }
+
+    #[test]
+    fn payload_too_large_response_format() {
+        let response = build_payload_too_large_response(20_000_000, 10_485_760);
+
+        // Should be a proper HTTP 413 response
+        let lines: Vec<&str> = response.split("\r\n").collect();
+        assert_eq!(lines[0], "HTTP/1.1 413 Payload Too Large");
+        assert_eq!(lines[1], "Content-Type: application/json");
+        assert!(lines[2].starts_with("Content-Length: "));
+        assert_eq!(lines[3], "Connection: close");
+        assert_eq!(lines[4], "");
+
+        // Body should contain the error details
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let body = &response[body_start..];
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["error"], "payload_too_large");
+        assert_eq!(parsed["content_length"], 20_000_000);
+        assert_eq!(parsed["max_body_size"], 10_485_760);
+    }
+
+    #[test]
+    fn payload_too_large_content_length_matches_body() {
+        let response = build_payload_too_large_response(50_000_000, 10_000_000);
+
+        let content_length_line = response
+            .split("\r\n")
+            .find(|line| line.starts_with("Content-Length:"))
+            .expect("Content-Length header must be present");
+        let claimed_length: usize = content_length_line
+            .strip_prefix("Content-Length: ")
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let actual_body = &response[body_start..];
+
+        assert_eq!(
+            claimed_length,
+            actual_body.len(),
+            "Content-Length ({}) must match actual body length ({})",
+            claimed_length,
+            actual_body.len()
+        );
     }
 }

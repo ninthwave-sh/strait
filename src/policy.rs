@@ -25,6 +25,8 @@ pub struct PolicyDecision {
     pub allowed: bool,
     /// Names of policies that contributed to the decision.
     pub policy_names: Vec<String>,
+    /// `@reason` annotation values from matching policies (if any).
+    pub policy_reasons: Vec<String>,
 }
 
 /// Holds the parsed Cedar policy set and authorizer, ready for per-request evaluation.
@@ -82,22 +84,24 @@ impl PolicyEngine {
     /// - `method`: HTTP method (e.g. `GET`, `POST`)
     /// - `path`: URL path (e.g. `/repos/org/repo`)
     /// - `headers`: list of (name, value) header pairs
+    /// - `agent_id`: identity of the requesting agent (e.g. `"worker"`, `"ci-bot"`)
     pub fn evaluate(
         &self,
         host: &str,
         method: &str,
         path: &str,
         headers: &[(String, String)],
+        agent_id: &str,
     ) -> anyhow::Result<PolicyDecision> {
         // Build entity hierarchy from the path segments.
         // For path "/repos/org/repo", we create:
         //   Resource::"repos/org/repo" in Resource::"repos/org" in Resource::"repos"
-        let entities = build_entity_hierarchy(host, path)?;
+        let entities = build_entity_hierarchy(host, path, agent_id)?;
 
-        // Principal: always Agent::"worker" for now
+        // Principal: Agent::"<agent_id>"
         let principal = EntityUid::from_type_name_and_id(
             EntityTypeName::from_str("Agent").unwrap(),
-            EntityId::from_str("worker").unwrap(),
+            EntityId::from_str(agent_id).unwrap(),
         );
 
         // Action: Action::"<METHOD>"
@@ -156,21 +160,30 @@ impl PolicyEngine {
             .authorizer
             .is_authorized(&request, &self.policy_set, &entities);
 
-        // Resolve policy IDs: prefer @id annotation value over auto-generated name
-        let policy_names: Vec<String> = response
-            .diagnostics()
-            .reason()
-            .map(|pid| {
-                self.policy_set
-                    .annotation(pid, "id")
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| pid.to_string())
-            })
-            .collect();
+        // Resolve policy IDs: prefer @id annotation value over auto-generated name.
+        // Also collect @reason annotations for human-readable denial messages.
+        let mut policy_names = Vec::new();
+        let mut policy_reasons = Vec::new();
+
+        for pid in response.diagnostics().reason() {
+            let name = self
+                .policy_set
+                .annotation(pid, "id")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| pid.to_string());
+            policy_names.push(name);
+
+            // Collect @reason annotation if present (strait convention for
+            // human-readable denial messages in audit logs).
+            if let Some(reason) = self.policy_set.annotation(pid, "reason") {
+                policy_reasons.push(reason.to_string());
+            }
+        }
 
         Ok(PolicyDecision {
             allowed: response.decision() == Decision::Allow,
             policy_names,
+            policy_reasons,
         })
     }
 }
@@ -193,8 +206,8 @@ fn build_resource_id(host: &str, path: &str) -> String {
 /// - Resource::"api.github.com/repos/org" (parent: api.github.com/repos)
 /// - Resource::"api.github.com/repos" (parent: api.github.com)
 /// - Resource::"api.github.com" (no parent)
-/// - Agent::"worker" (no parent)
-fn build_entity_hierarchy(host: &str, path: &str) -> anyhow::Result<Entities> {
+/// - Agent::"<agent_id>" (no parent)
+fn build_entity_hierarchy(host: &str, path: &str, agent_id: &str) -> anyhow::Result<Entities> {
     let resource_type = EntityTypeName::from_str("Resource").unwrap();
     let mut entities = Vec::new();
 
@@ -241,7 +254,7 @@ fn build_entity_hierarchy(host: &str, path: &str) -> anyhow::Result<Entities> {
     // Add the principal entity
     let agent_uid = EntityUid::from_type_name_and_id(
         EntityTypeName::from_str("Agent").unwrap(),
-        EntityId::from_str("worker").unwrap(),
+        EntityId::from_str(agent_id).unwrap(),
     );
     entities.push(Entity::new_no_attrs(agent_uid, HashSet::new()));
 
@@ -303,6 +316,11 @@ mod tests {
     }
 
     /// Example GitHub Cedar policy from the design doc.
+    ///
+    /// Annotations used by strait:
+    /// - `@id("...")` — human-readable policy name (used in audit logs and deny responses)
+    /// - `@reason("...")` — human-readable denial reason (strait convention, included in
+    ///   audit `denial_reason` field when this policy causes a deny)
     const GITHUB_POLICY: &str = r#"
 // Allow read access to org repos
 @id("read-repos")
@@ -320,8 +338,11 @@ permit(
   resource in Resource::"api.github.com/repos/our-org"
 ) when { context.path like "*/pulls" };
 
-// Deny push to main (forbid overrides permit)
+// Deny push to main (forbid overrides permit).
+// @reason is a strait convention: its value appears in the audit log's
+// denial_reason field when this policy causes a deny.
 @id("deny-push-main")
+@reason("Direct pushes to main are not allowed; use a pull request")
 forbid(
   principal,
   action == Action::"POST",
@@ -355,7 +376,8 @@ forbid(
 
     #[test]
     fn entity_hierarchy_structure() {
-        let entities = build_entity_hierarchy("api.github.com", "/repos/org/repo").unwrap();
+        let entities =
+            build_entity_hierarchy("api.github.com", "/repos/org/repo", "worker").unwrap();
         // Should have: 4 resource entities + 1 agent + 7 action entities = 12
         let count = entities.iter().count();
         assert!(count >= 4, "expected at least 4 entities, got {count}");
@@ -381,7 +403,13 @@ forbid(
         let f = write_policy(GITHUB_POLICY);
         let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
-            .evaluate("api.github.com", "GET", "/repos/our-org/repo", &[])
+            .evaluate(
+                "api.github.com",
+                "GET",
+                "/repos/our-org/repo",
+                &[],
+                "worker",
+            )
             .unwrap();
         assert!(result.allowed, "GET /repos/our-org/repo should be allowed");
         assert!(
@@ -396,7 +424,13 @@ forbid(
         let f = write_policy(GITHUB_POLICY);
         let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
-            .evaluate("api.github.com", "POST", "/repos/our-org/repo/pulls", &[])
+            .evaluate(
+                "api.github.com",
+                "POST",
+                "/repos/our-org/repo/pulls",
+                &[],
+                "worker",
+            )
             .unwrap();
         assert!(
             result.allowed,
@@ -414,7 +448,13 @@ forbid(
         let f = write_policy(GITHUB_POLICY);
         let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
-            .evaluate("api.github.com", "DELETE", "/repos/our-org/repo", &[])
+            .evaluate(
+                "api.github.com",
+                "DELETE",
+                "/repos/our-org/repo",
+                &[],
+                "worker",
+            )
             .unwrap();
         assert!(
             !result.allowed,
@@ -432,6 +472,7 @@ forbid(
                 "POST",
                 "/repos/our-org/repo/git/refs/heads/main",
                 &[],
+                "worker",
             )
             .unwrap();
         assert!(
@@ -445,7 +486,7 @@ forbid(
         let f = write_policy(GITHUB_POLICY);
         let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
-            .evaluate("api.github.com", "PATCH", "/settings", &[])
+            .evaluate("api.github.com", "PATCH", "/settings", &[], "worker")
             .unwrap();
         assert!(!result.allowed, "PATCH /settings should be denied");
     }
@@ -455,7 +496,7 @@ forbid(
         let f = write_policy(GITHUB_POLICY);
         let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
-            .evaluate("api.github.com", "GET", "/unknown", &[])
+            .evaluate("api.github.com", "GET", "/unknown", &[], "worker")
             .unwrap();
         assert!(!result.allowed, "GET /unknown should be denied");
     }
@@ -508,7 +549,7 @@ permit(
 
         // a/b/c should be allowed because it's in Resource::"example.com/a"
         let result = engine
-            .evaluate("example.com", "GET", "/a/b/c", &[])
+            .evaluate("example.com", "GET", "/a/b/c", &[], "worker")
             .unwrap();
         assert!(
             result.allowed,
@@ -516,7 +557,9 @@ permit(
         );
 
         // /x should be denied (not in Resource::"example.com/a")
-        let result = engine.evaluate("example.com", "GET", "/x", &[]).unwrap();
+        let result = engine
+            .evaluate("example.com", "GET", "/x", &[], "worker")
+            .unwrap();
         assert!(!result.allowed, "GET /x should be denied (not in /a)");
     }
 
@@ -610,6 +653,155 @@ permit(
         assert!(
             err.contains("failed to read schema file"),
             "expected file-not-found error, got: {err}"
+        );
+    }
+
+    // --- Agent identity tests ---
+
+    #[test]
+    fn agent_identity_used_as_cedar_principal() {
+        // Policy allows only Agent::"ci-bot"
+        let f = write_policy(
+            r#"
+@id("ci-read")
+permit(
+    principal == Agent::"ci-bot",
+    action == Action::"GET",
+    resource in Resource::"api.github.com"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // ci-bot should be allowed
+        let result = engine
+            .evaluate("api.github.com", "GET", "/repos/org/repo", &[], "ci-bot")
+            .unwrap();
+        assert!(result.allowed, "ci-bot should be allowed");
+
+        // anonymous should be denied (different principal)
+        let result = engine
+            .evaluate("api.github.com", "GET", "/repos/org/repo", &[], "anonymous")
+            .unwrap();
+        assert!(!result.allowed, "anonymous should be denied");
+    }
+
+    #[test]
+    fn different_agents_get_different_cedar_results() {
+        // Policy allows worker to read, ci-bot to write, denies others
+        let f = write_policy(
+            r#"
+@id("worker-read")
+permit(
+    principal == Agent::"worker",
+    action == Action::"GET",
+    resource in Resource::"api.github.com"
+);
+
+@id("ci-bot-write")
+permit(
+    principal == Agent::"ci-bot",
+    action == Action::"POST",
+    resource in Resource::"api.github.com"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // worker can GET, cannot POST
+        let result = engine
+            .evaluate("api.github.com", "GET", "/repos/org/repo", &[], "worker")
+            .unwrap();
+        assert!(result.allowed, "worker GET should be allowed");
+        let result = engine
+            .evaluate("api.github.com", "POST", "/repos/org/repo", &[], "worker")
+            .unwrap();
+        assert!(!result.allowed, "worker POST should be denied");
+
+        // ci-bot can POST, cannot GET
+        let result = engine
+            .evaluate("api.github.com", "POST", "/repos/org/repo", &[], "ci-bot")
+            .unwrap();
+        assert!(result.allowed, "ci-bot POST should be allowed");
+        let result = engine
+            .evaluate("api.github.com", "GET", "/repos/org/repo", &[], "ci-bot")
+            .unwrap();
+        assert!(!result.allowed, "ci-bot GET should be denied");
+    }
+
+    // --- @reason annotation test ---
+
+    #[test]
+    fn reason_annotation_collected_from_matching_policies() {
+        let f = write_policy(
+            r#"
+// @reason is a strait convention for human-readable denial messages in audit logs.
+@id("deny-destructive")
+@reason("Destructive operations are not allowed on production repos")
+forbid(
+    principal,
+    action == Action::"DELETE",
+    resource in Resource::"api.github.com"
+);
+
+@id("allow-read")
+permit(
+    principal == Agent::"worker",
+    action == Action::"GET",
+    resource in Resource::"api.github.com"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // DELETE triggers the forbid with @reason
+        let result = engine
+            .evaluate("api.github.com", "DELETE", "/repos/org/repo", &[], "worker")
+            .unwrap();
+        assert!(!result.allowed);
+        assert!(
+            result
+                .policy_reasons
+                .iter()
+                .any(|r| r.contains("Destructive operations")),
+            "expected @reason annotation, got {:?}",
+            result.policy_reasons
+        );
+
+        // GET triggers the permit (no @reason annotation)
+        let result = engine
+            .evaluate("api.github.com", "GET", "/repos/org/repo", &[], "worker")
+            .unwrap();
+        assert!(result.allowed);
+        assert!(
+            result.policy_reasons.is_empty(),
+            "permit without @reason should have empty reasons, got {:?}",
+            result.policy_reasons
+        );
+    }
+
+    #[test]
+    fn generic_denial_reason_when_no_annotation() {
+        let f = write_policy(
+            r#"
+@id("deny-all")
+forbid(
+    principal,
+    action,
+    resource
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let result = engine
+            .evaluate("api.github.com", "GET", "/repos/org/repo", &[], "worker")
+            .unwrap();
+        assert!(!result.allowed);
+        // No @reason annotation → policy_reasons is empty
+        assert!(
+            result.policy_reasons.is_empty(),
+            "policy without @reason should have empty reasons"
         );
     }
 }

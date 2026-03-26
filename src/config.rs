@@ -118,9 +118,34 @@ pub struct AuditConfig {
     pub log_path: Option<PathBuf>,
 }
 
-/// `[identity]` section — reserved for future use.
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct IdentityConfig {}
+/// `[identity]` section — agent identity extraction from request headers.
+#[derive(Debug, Deserialize, Clone)]
+pub struct IdentityConfig {
+    /// HTTP header name to extract the agent identity from (default `"X-Strait-Agent"`).
+    #[serde(default = "default_identity_header")]
+    pub header: String,
+
+    /// Default agent identity when the header is absent (default `"anonymous"`).
+    #[serde(default = "default_identity_default")]
+    pub default: String,
+}
+
+impl Default for IdentityConfig {
+    fn default() -> Self {
+        Self {
+            header: default_identity_header(),
+            default: default_identity_default(),
+        }
+    }
+}
+
+fn default_identity_header() -> String {
+    "X-Strait-Agent".to_string()
+}
+
+fn default_identity_default() -> String {
+    "anonymous".to_string()
+}
 
 /// `[health]` section — health check endpoint configuration.
 #[derive(Debug, Deserialize, Clone)]
@@ -161,6 +186,10 @@ pub struct ProxyContext {
     pub mitm_hosts: Vec<String>,
     /// Instant when the proxy context was created (for uptime calculation).
     pub startup_instant: Instant,
+    /// HTTP header name to extract agent identity from.
+    pub identity_header: String,
+    /// Default agent identity when the identity header is absent.
+    pub identity_default: String,
 }
 
 impl ProxyContext {
@@ -201,6 +230,9 @@ impl ProxyContext {
             "audit logger initialized"
         );
 
+        // Resolve identity configuration
+        let identity = config.identity.clone().unwrap_or_default();
+
         Ok(Self {
             session_ca,
             policy_engine,
@@ -208,6 +240,8 @@ impl ProxyContext {
             audit_logger,
             mitm_hosts: config.mitm.hosts.clone(),
             startup_instant: Instant::now(),
+            identity_header: identity.header,
+            identity_default: identity.default,
         })
     }
 }
@@ -256,6 +290,8 @@ env_var = "GITHUB_TOKEN"
 log_path = "/tmp/audit.jsonl"
 
 [identity]
+header = "X-Custom-Agent"
+default = "system"
 
 [health]
 port = 9090
@@ -277,6 +313,9 @@ port = 9090
             config.audit.as_ref().unwrap().log_path,
             Some(PathBuf::from("/tmp/audit.jsonl"))
         );
+        let identity = config.identity.as_ref().unwrap();
+        assert_eq!(identity.header, "X-Custom-Agent");
+        assert_eq!(identity.default, "system");
         assert_eq!(config.health.as_ref().unwrap().port, 9090);
     }
 
@@ -364,6 +403,9 @@ ca_cert_path = "/tmp/ca.pem"
         assert!(ctx.mitm_hosts.is_empty());
         assert!(!ctx.session_ca.ca_cert_pem.is_empty());
         assert!(!ctx.audit_logger.session_id().is_empty());
+        // Identity defaults when [identity] section is absent
+        assert_eq!(ctx.identity_header, "X-Strait-Agent");
+        assert_eq!(ctx.identity_default, "anonymous");
     }
 
     #[test]
@@ -408,5 +450,38 @@ hosts = ["api.github.com", "api.stripe.com"]
         let ctx = ProxyContext::from_config(&config).unwrap();
 
         assert_eq!(ctx.mitm_hosts, vec!["api.github.com", "api.stripe.com"]);
+    }
+
+    #[test]
+    fn proxy_context_with_custom_identity() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+
+[identity]
+header = "X-My-Agent"
+default = "system"
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        assert_eq!(ctx.identity_header, "X-My-Agent");
+        assert_eq!(ctx.identity_default, "system");
+    }
+
+    #[test]
+    fn identity_section_empty_uses_defaults() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+
+[identity]
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        let identity = config.identity.unwrap();
+        assert_eq!(identity.header, "X-Strait-Agent");
+        assert_eq!(identity.default, "anonymous");
     }
 }

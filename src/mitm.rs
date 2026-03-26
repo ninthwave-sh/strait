@@ -86,6 +86,20 @@ pub async fn handle_mitm(
         }
     }
 
+    // --- Agent identity extraction ---
+    // Extract the agent identity from the configured header. If absent, use the
+    // configured default (e.g. "anonymous"). Always strip the identity header
+    // from outbound requests to prevent spoofing upstream.
+    let identity_header = &ctx.identity_header;
+    let agent_id = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(identity_header))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| ctx.identity_default.clone());
+
+    // Strip the identity header before forwarding upstream
+    headers.retain(|(k, _)| !k.eq_ignore_ascii_case(identity_header));
+
     // Start timing policy evaluation
     let eval_start = Instant::now();
 
@@ -95,7 +109,7 @@ pub async fn handle_mitm(
 
     // Evaluate Cedar policy (if configured)
     if let Some(engine) = policy {
-        let decision = engine.evaluate(host, &method, &path, &headers)?;
+        let decision = engine.evaluate(host, &method, &path, &headers, &agent_id)?;
 
         let policy_display = if decision.policy_names.is_empty() {
             "default-deny".to_string()
@@ -104,15 +118,28 @@ pub async fn handle_mitm(
         };
 
         if !decision.allowed {
+            // Build a human-readable denial reason. If the matching policy has
+            // a @reason("...") annotation, use that; otherwise use a generic format.
+            let denial_reason = if !decision.policy_reasons.is_empty() {
+                decision.policy_reasons.join("; ")
+            } else {
+                format!(
+                    "Request denied by policy '{}': {} {} on {}",
+                    policy_display, method, path, host
+                )
+            };
+
             // Log DENY audit event -- no credential injected
             audit.log_decision(
                 host,
                 port,
                 &method,
                 &path,
+                &agent_id,
                 "deny",
-                &policy_display,
+                &decision.policy_names,
                 false,
+                Some(&denial_reason),
                 eval_start,
             );
 
@@ -120,6 +147,7 @@ pub async fn handle_mitm(
                 host = host,
                 method = method.as_str(),
                 path = path.as_str(),
+                agent = agent_id.as_str(),
                 policy = policy_display.as_str(),
                 "DENY: request blocked by Cedar policy"
             );
@@ -145,9 +173,11 @@ pub async fn handle_mitm(
             port,
             &method,
             &path,
+            &agent_id,
             "allow",
-            &policy_display,
+            &decision.policy_names,
             credential_injected,
+            None,
             eval_start,
         );
 
@@ -155,6 +185,7 @@ pub async fn handle_mitm(
             host = host,
             method = method.as_str(),
             path = path.as_str(),
+            agent = agent_id.as_str(),
             policy = policy_display.as_str(),
             credential_injected = credential_injected,
             "ALLOW: request permitted by Cedar policy"
@@ -168,9 +199,11 @@ pub async fn handle_mitm(
             port,
             &method,
             &path,
+            &agent_id,
             "allow",
-            "no-policy",
+            &["no-policy".to_string()],
             credential_injected,
+            None,
             eval_start,
         );
 
@@ -178,10 +211,17 @@ pub async fn handle_mitm(
             host = host,
             method = method.as_str(),
             path = path.as_str(),
+            agent = agent_id.as_str(),
             credential_injected = credential_injected,
             "ALLOW: no policy engine configured"
         );
     }
+
+    // --- Connection: close ---
+    // Inject or replace Connection header with "close" on all forwarded requests
+    // to force one-request-per-connection semantics (v0.1 keep-alive mitigation).
+    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("connection"));
+    headers.push(("Connection".to_string(), "close".to_string()));
 
     // Build the upstream request to forward
     // Connect to upstream with real TLS
@@ -468,5 +508,116 @@ mod tests {
         );
 
         std::env::remove_var("STRAIT_TEST_INJECT_3");
+    }
+
+    // --- Agent identity extraction tests ---
+
+    /// Helper: extract agent_id from headers using the same logic as handle_mitm.
+    fn extract_agent_id(
+        headers: &[(String, String)],
+        identity_header: &str,
+        identity_default: &str,
+    ) -> String {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(identity_header))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| identity_default.to_string())
+    }
+
+    /// Helper: strip identity header from headers.
+    fn strip_identity_header(headers: &mut Vec<(String, String)>, identity_header: &str) {
+        headers.retain(|(k, _)| !k.eq_ignore_ascii_case(identity_header));
+    }
+
+    #[test]
+    fn agent_identity_extracted_from_header() {
+        let headers = vec![
+            ("Host".to_string(), "api.github.com".to_string()),
+            ("X-Strait-Agent".to_string(), "ci-bot".to_string()),
+        ];
+
+        let agent = extract_agent_id(&headers, "X-Strait-Agent", "anonymous");
+        assert_eq!(agent, "ci-bot");
+    }
+
+    #[test]
+    fn missing_identity_header_uses_default() {
+        let headers = vec![("Host".to_string(), "api.github.com".to_string())];
+
+        let agent = extract_agent_id(&headers, "X-Strait-Agent", "anonymous");
+        assert_eq!(agent, "anonymous");
+    }
+
+    #[test]
+    fn identity_header_stripped_from_forwarded_request() {
+        let mut headers = vec![
+            ("Host".to_string(), "api.github.com".to_string()),
+            ("X-Strait-Agent".to_string(), "ci-bot".to_string()),
+            ("Accept".to_string(), "application/json".to_string()),
+        ];
+
+        strip_identity_header(&mut headers, "X-Strait-Agent");
+
+        assert!(
+            !headers.iter().any(|(k, _)| k == "X-Strait-Agent"),
+            "identity header should be stripped"
+        );
+        assert_eq!(headers.len(), 2, "only non-identity headers should remain");
+    }
+
+    #[test]
+    fn identity_header_case_insensitive() {
+        let headers = vec![
+            ("Host".to_string(), "api.github.com".to_string()),
+            ("x-strait-agent".to_string(), "ci-bot".to_string()),
+        ];
+
+        let agent = extract_agent_id(&headers, "X-Strait-Agent", "anonymous");
+        assert_eq!(agent, "ci-bot", "case-insensitive header match");
+    }
+
+    // --- Connection: close tests ---
+
+    #[test]
+    fn connection_close_injected_into_headers() {
+        let mut headers = vec![
+            ("Host".to_string(), "api.github.com".to_string()),
+            ("Accept".to_string(), "application/json".to_string()),
+        ];
+
+        // Simulate the Connection: close injection logic from handle_mitm
+        headers.retain(|(k, _)| !k.eq_ignore_ascii_case("connection"));
+        headers.push(("Connection".to_string(), "close".to_string()));
+
+        let conn = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("connection"));
+        assert!(conn.is_some(), "Connection header should be present");
+        assert_eq!(conn.unwrap().1, "close");
+    }
+
+    #[test]
+    fn connection_close_replaces_existing_keepalive() {
+        let mut headers = vec![
+            ("Host".to_string(), "api.github.com".to_string()),
+            ("Connection".to_string(), "keep-alive".to_string()),
+        ];
+
+        // Simulate the Connection: close injection logic
+        headers.retain(|(k, _)| !k.eq_ignore_ascii_case("connection"));
+        headers.push(("Connection".to_string(), "close".to_string()));
+
+        let conn_count = headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+            .count();
+        assert_eq!(conn_count, 1, "should have exactly one Connection header");
+
+        let conn = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("connection"))
+            .unwrap();
+        assert_eq!(conn.1, "close");
     }
 }

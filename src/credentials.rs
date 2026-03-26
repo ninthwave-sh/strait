@@ -1,9 +1,15 @@
-//! Credential store: runtime types, secret resolution, and AWS host parsing.
+//! Credential store: runtime types, trait abstraction, secret resolution, and AWS host parsing.
 //!
 //! The TOML parsing for credential entries lives in [`crate::config`]. This
-//! module keeps only the runtime types ([`CredentialStore`],
-//! [`ResolvedCredential`]) and the [`resolve_entry`] logic that reads secrets
+//! module keeps the runtime types ([`CredentialStore`], [`BearerCredential`]),
+//! the [`Credential`] trait, and the [`resolve_entry`] logic that reads secrets
 //! from their sources (currently only environment variables).
+//!
+//! The [`Credential`] trait abstracts over different authentication methods.
+//! Each implementation knows how to produce the HTTP headers needed for its
+//! auth scheme. `BearerCredential` injects a single static header/value pair.
+//! Future implementations (e.g. SigV4) can inspect method, path, headers, and
+//! body to compute a signature.
 //!
 //! ## Lookup priority
 //!
@@ -38,6 +44,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 
 use anyhow::Context as _;
 
@@ -74,9 +81,7 @@ pub fn parse_aws_host(host: &str) -> Option<AwsHostInfo> {
 
     let prefix = &host[..host.len() - suffix.len()];
     if prefix.is_empty() {
-        // Bare "amazonaws.com" (after stripping the dot-prefix, this catches
-        // hosts that are exactly ".amazonaws.com" which can't happen, but also
-        // guards the split below).
+        // Bare "amazonaws.com" — no service prefix
         return None;
     }
 
@@ -107,27 +112,63 @@ pub fn parse_aws_host(host: &str) -> Option<AwsHostInfo> {
 }
 
 // ---------------------------------------------------------------------------
-// Credential types
+// Credential trait and implementations
 // ---------------------------------------------------------------------------
 
-/// A resolved credential ready for injection.
+/// Trait for credential injection into HTTP requests.
+///
+/// Each implementation produces the HTTP headers needed to authenticate a
+/// request. The caller is responsible for removing any existing headers with
+/// the same names before injecting the returned headers.
+pub trait Credential: Debug + Send + Sync {
+    /// Returns the headers to inject for this credential, or `None` if the
+    /// credential does not apply to this request.
+    fn inject(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: Option<&[u8]>,
+    ) -> Option<Vec<(String, String)>>;
+}
+
+/// A bearer-token credential that injects a single header with a static value.
+///
+/// This is the simplest credential type: it always returns the same
+/// header/value pair regardless of the request contents.
 #[derive(Debug, Clone)]
-pub struct ResolvedCredential {
+pub struct BearerCredential {
     /// HTTP header name (e.g. "Authorization").
     pub header: String,
     /// Full header value including prefix (e.g. "token ghp_abc123").
     pub value: String,
 }
 
+impl Credential for BearerCredential {
+    fn inject(
+        &self,
+        _method: &str,
+        _path: &str,
+        _headers: &[(String, String)],
+        _body: Option<&[u8]>,
+    ) -> Option<Vec<(String, String)>> {
+        Some(vec![(self.header.clone(), self.value.clone())])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Credential store
+// ---------------------------------------------------------------------------
+
 /// Holds all resolved credentials, keyed by hostname or hostname pattern.
 ///
 /// Lookup priority: exact hostname match first, then pattern-based fallback.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CredentialStore {
     /// Map from exact hostname to resolved credential.
-    exact: HashMap<String, ResolvedCredential>,
+    exact: HashMap<String, Box<dyn Credential>>,
     /// Pattern-based credentials: `(glob_pattern, credential)`.
-    patterns: Vec<(String, ResolvedCredential)>,
+    patterns: Vec<(String, Box<dyn Credential>)>,
 }
 
 impl CredentialStore {
@@ -137,8 +178,8 @@ impl CredentialStore {
     /// Returns an error if any env var is not set, a source type is
     /// unsupported, or a credential entry has invalid host/host_pattern fields.
     pub fn from_entries(entries: &[CredentialEntryConfig]) -> anyhow::Result<Self> {
-        let mut exact = HashMap::new();
-        let mut patterns = Vec::new();
+        let mut exact: HashMap<String, Box<dyn Credential>> = HashMap::new();
+        let mut patterns: Vec<(String, Box<dyn Credential>)> = Vec::new();
 
         for entry in entries {
             // Validate host/host_pattern before resolving secrets
@@ -175,16 +216,16 @@ impl CredentialStore {
     ///
     /// Returns the exact-match credential if one exists, otherwise falls back
     /// to the first matching pattern entry.
-    pub fn get(&self, host: &str) -> Option<&ResolvedCredential> {
+    pub fn get(&self, host: &str) -> Option<&dyn Credential> {
         // Exact match takes priority
         if let Some(cred) = self.exact.get(host) {
-            return Some(cred);
+            return Some(cred.as_ref());
         }
 
         // Pattern match fallback
         for (pattern, cred) in &self.patterns {
             if host_matches_pattern(host, pattern) {
-                return Some(cred);
+                return Some(cred.as_ref());
             }
         }
 
@@ -223,7 +264,19 @@ fn host_matches_pattern(host: &str, pattern: &str) -> bool {
 }
 
 /// Resolve a single credential entry, reading the secret from its source.
-fn resolve_entry(entry: &CredentialEntryConfig) -> anyhow::Result<ResolvedCredential> {
+fn resolve_entry(entry: &CredentialEntryConfig) -> anyhow::Result<Box<dyn Credential>> {
+    match entry.credential_type.as_str() {
+        "bearer" => resolve_bearer(entry),
+        other => anyhow::bail!(
+            "credential for '{}': unsupported credential type '{}' (only 'bearer' is supported)",
+            entry_identifier(entry),
+            other
+        ),
+    }
+}
+
+/// Resolve a bearer-token credential entry.
+fn resolve_bearer(entry: &CredentialEntryConfig) -> anyhow::Result<Box<dyn Credential>> {
     let id = entry_identifier(entry);
 
     match entry.source.as_str() {
@@ -244,10 +297,10 @@ fn resolve_entry(entry: &CredentialEntryConfig) -> anyhow::Result<ResolvedCreden
 
             let value = format!("{}{}", entry.value_prefix, secret);
 
-            Ok(ResolvedCredential {
+            Ok(Box::new(BearerCredential {
                 header: entry.header.clone(),
                 value,
-            })
+            }))
         }
         other => anyhow::bail!(
             "credential for '{}': unsupported source type '{}' (only 'env' is supported)",
@@ -265,7 +318,7 @@ fn resolve_entry(entry: &CredentialEntryConfig) -> anyhow::Result<ResolvedCreden
 mod tests {
     use super::*;
 
-    // --- Helper ---
+    // --- Helpers ---
 
     fn entry(
         host: &str,
@@ -281,6 +334,7 @@ mod tests {
             value_prefix: prefix.to_string(),
             source: source.to_string(),
             env_var: env_var.map(|s| s.to_string()),
+            credential_type: "bearer".to_string(),
         }
     }
 
@@ -298,6 +352,7 @@ mod tests {
             value_prefix: prefix.to_string(),
             source: source.to_string(),
             env_var: env_var.map(|s| s.to_string()),
+            credential_type: "bearer".to_string(),
         }
     }
 
@@ -349,7 +404,6 @@ mod tests {
 
     #[test]
     fn parse_aws_host_virtual_hosted_s3() {
-        // bucket.s3.us-east-1.amazonaws.com — virtual-hosted S3
         let info = parse_aws_host("bucket.s3.us-east-1.amazonaws.com").unwrap();
         assert_eq!(info.service, "s3");
         assert_eq!(info.region, Some("us-east-1".to_string()));
@@ -364,26 +418,62 @@ mod tests {
 
     #[test]
     fn parse_aws_host_notamazonaws_returns_none() {
-        // "notamazonaws.com" does NOT end with ".amazonaws.com"
         assert!(parse_aws_host("notamazonaws.com").is_none());
     }
 
     #[test]
     fn parse_aws_host_bare_amazonaws_returns_none() {
-        // bare "amazonaws.com" — no service prefix
         assert!(parse_aws_host("amazonaws.com").is_none());
     }
 
     #[test]
     fn parse_aws_host_deep_subdomain() {
-        // deep.nested.s3.us-east-1.amazonaws.com
         let info = parse_aws_host("deep.nested.s3.us-east-1.amazonaws.com").unwrap();
         assert_eq!(info.service, "s3");
         assert_eq!(info.region, Some("us-east-1".to_string()));
     }
 
     // -----------------------------------------------------------------------
-    // Existing credential store tests (updated for Option<String> host)
+    // Credential trait tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bearer_credential_inject_returns_header() {
+        let cred = BearerCredential {
+            header: "Authorization".to_string(),
+            value: "token abc123".to_string(),
+        };
+
+        let result = cred.inject("POST", "/api/v1", &[], Some(b"body"));
+        assert!(result.is_some());
+        let headers = result.unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "Authorization");
+        assert_eq!(headers[0].1, "token abc123");
+    }
+
+    #[test]
+    fn bearer_credential_ignores_request_details() {
+        let cred = BearerCredential {
+            header: "X-Api-Key".to_string(),
+            value: "key_123".to_string(),
+        };
+
+        // Same result regardless of method, path, headers, or body
+        let existing_headers = vec![("Host".to_string(), "example.com".to_string())];
+
+        let r1 = cred.inject("GET", "/foo", &[], None).unwrap();
+        let r2 = cred
+            .inject("POST", "/bar", &existing_headers, Some(b"body"))
+            .unwrap();
+
+        assert_eq!(r1, r2);
+        assert_eq!(r1[0].0, "X-Api-Key");
+        assert_eq!(r1[0].1, "key_123");
+    }
+
+    // -----------------------------------------------------------------------
+    // Credential store tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -400,8 +490,10 @@ mod tests {
 
         let store = CredentialStore::from_entries(&entries).unwrap();
         let cred = store.get("api.github.com").unwrap();
-        assert_eq!(cred.header, "Authorization");
-        assert_eq!(cred.value, "token ghp_test123");
+        let injected = cred.inject("GET", "/", &[], None).unwrap();
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].0, "Authorization");
+        assert_eq!(injected[0].1, "token ghp_test123");
 
         std::env::remove_var("STRAIT_TEST_TOKEN_1");
     }
@@ -476,6 +568,69 @@ mod tests {
             err.contains("env_var"),
             "error should mention missing env_var, got: {err}"
         );
+    }
+
+    #[test]
+    fn unsupported_credential_type() {
+        let entries = vec![CredentialEntryConfig {
+            host: Some("example.com".to_string()),
+            host_pattern: None,
+            header: "Authorization".to_string(),
+            value_prefix: String::new(),
+            source: "env".to_string(),
+            env_var: Some("SOME_VAR".to_string()),
+            credential_type: "sigv4".to_string(),
+        }];
+
+        let result = CredentialStore::from_entries(&entries);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unsupported credential type"), "got: {err}");
+    }
+
+    #[test]
+    fn trait_dispatch_returns_correct_impl_per_host() {
+        std::env::set_var("STRAIT_TEST_DISPATCH_1", "github_token");
+        std::env::set_var("STRAIT_TEST_DISPATCH_2", "stripe_key");
+
+        let entries = vec![
+            CredentialEntryConfig {
+                host: Some("api.github.com".to_string()),
+                host_pattern: None,
+                header: "Authorization".to_string(),
+                value_prefix: "token ".to_string(),
+                source: "env".to_string(),
+                env_var: Some("STRAIT_TEST_DISPATCH_1".to_string()),
+                credential_type: "bearer".to_string(),
+            },
+            CredentialEntryConfig {
+                host: Some("api.stripe.com".to_string()),
+                host_pattern: None,
+                header: "Authorization".to_string(),
+                value_prefix: "Bearer ".to_string(),
+                source: "env".to_string(),
+                env_var: Some("STRAIT_TEST_DISPATCH_2".to_string()),
+                credential_type: "bearer".to_string(),
+            },
+        ];
+
+        let store = CredentialStore::from_entries(&entries).unwrap();
+
+        // GitHub credential
+        let gh = store.get("api.github.com").unwrap();
+        let gh_headers = gh.inject("GET", "/repos", &[], None).unwrap();
+        assert_eq!(gh_headers[0].1, "token github_token");
+
+        // Stripe credential
+        let stripe = store.get("api.stripe.com").unwrap();
+        let stripe_headers = stripe.inject("POST", "/charges", &[], None).unwrap();
+        assert_eq!(stripe_headers[0].1, "Bearer stripe_key");
+
+        // Unknown host
+        assert!(store.get("unknown.com").is_none());
+
+        std::env::remove_var("STRAIT_TEST_DISPATCH_1");
+        std::env::remove_var("STRAIT_TEST_DISPATCH_2");
     }
 
     // -----------------------------------------------------------------------
@@ -561,11 +716,13 @@ mod tests {
 
         // Exact match should win for s3.us-east-1
         let cred = store.get("s3.us-east-1.amazonaws.com").unwrap();
-        assert_eq!(cred.value, "exact:exact_secret");
+        let headers = cred.inject("GET", "/", &[], None).unwrap();
+        assert_eq!(headers[0].1, "exact:exact_secret");
 
         // Other AWS hosts fall back to pattern
         let cred = store.get("lambda.us-east-1.amazonaws.com").unwrap();
-        assert_eq!(cred.value, "pattern:pattern_secret");
+        let headers = cred.inject("GET", "/", &[], None).unwrap();
+        assert_eq!(headers[0].1, "pattern:pattern_secret");
 
         std::env::remove_var("STRAIT_TEST_AWS_EXACT");
         std::env::remove_var("STRAIT_TEST_AWS_PATTERN");
@@ -597,7 +754,8 @@ mod tests {
 
         // GitHub exact match works
         let cred = store.get("api.github.com").unwrap();
-        assert_eq!(cred.value, "token gh_token");
+        let headers = cred.inject("GET", "/", &[], None).unwrap();
+        assert_eq!(headers[0].1, "token gh_token");
 
         // Random non-AWS host has no credential
         assert!(store.get("api.stripe.com").is_none());
@@ -615,6 +773,7 @@ mod tests {
             value_prefix: String::new(),
             source: "env".to_string(),
             env_var: Some("IRRELEVANT".to_string()),
+            credential_type: "bearer".to_string(),
         }];
 
         let result = CredentialStore::from_entries(&entries);
@@ -632,6 +791,7 @@ mod tests {
             value_prefix: String::new(),
             source: "env".to_string(),
             env_var: Some("IRRELEVANT".to_string()),
+            credential_type: "bearer".to_string(),
         }];
 
         let result = CredentialStore::from_entries(&entries);

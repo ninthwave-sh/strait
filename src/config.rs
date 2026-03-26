@@ -117,6 +117,14 @@ pub struct CredentialEntryConfig {
     pub source: String,
     /// Environment variable name (required when `source = "env"`).
     pub env_var: Option<String>,
+    /// Credential type. Currently only `"bearer"` is supported.
+    /// Defaults to `"bearer"` for backward compatibility.
+    #[serde(rename = "type", default = "default_credential_type")]
+    pub credential_type: String,
+}
+
+fn default_credential_type() -> String {
+    "bearer".to_string()
 }
 
 /// `[audit]` section — audit log file configuration.
@@ -441,8 +449,10 @@ env_var = "STRAIT_CONFIG_TEST_TOKEN"
         assert!(ctx.credential_store.is_some());
         let store = ctx.credential_store.as_ref().unwrap();
         let cred = store.get("api.github.com").unwrap();
-        assert_eq!(cred.header, "Authorization");
-        assert_eq!(cred.value, "token ghp_test");
+        let injected = cred.inject("GET", "/", &[], None).unwrap();
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].0, "Authorization");
+        assert_eq!(injected[0].1, "token ghp_test");
 
         std::env::remove_var("STRAIT_CONFIG_TEST_TOKEN");
     }

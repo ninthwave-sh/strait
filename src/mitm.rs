@@ -165,7 +165,8 @@ pub async fn handle_mitm(
         }
 
         // ALLOW path -- check for credential injection
-        let credential_injected = inject_credential(host, &mut headers, credentials);
+        let credential_injected =
+            inject_credential(host, &method, &path, &mut headers, None, credentials);
 
         // Log ALLOW audit event
         audit.log_decision(
@@ -192,7 +193,8 @@ pub async fn handle_mitm(
         );
     } else {
         // No policy engine -- allow by default, still inject credentials
-        let credential_injected = inject_credential(host, &mut headers, credentials);
+        let credential_injected =
+            inject_credential(host, &method, &path, &mut headers, None, credentials);
 
         audit.log_decision(
             host,
@@ -311,20 +313,31 @@ Connection: close\r\n\
     )
 }
 
-/// Inject a credential header if one is configured for the target host.
+/// Inject credential headers if one is configured for the target host.
+///
+/// Delegates to the [`Credential::inject`] trait method, which allows each
+/// credential type to compute its own headers. Bearer tokens return a static
+/// header/value; future types (e.g. SigV4) can inspect the full request.
+///
 /// Returns true if a credential was injected.
 fn inject_credential(
     host: &str,
+    method: &str,
+    path: &str,
     headers: &mut Vec<(String, String)>,
+    body: Option<&[u8]>,
     credentials: Option<&CredentialStore>,
 ) -> bool {
     if let Some(store) = credentials {
         if let Some(cred) = store.get(host) {
-            // Remove any existing header with the same name (case-insensitive)
-            headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&cred.header));
-            // Inject the credential header
-            headers.push((cred.header.clone(), cred.value.clone()));
-            return true;
+            if let Some(new_headers) = cred.inject(method, path, headers, body) {
+                // Remove any existing headers that match the injected names (case-insensitive)
+                for (name, _) in &new_headers {
+                    headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+                }
+                headers.extend(new_headers);
+                return true;
+            }
         }
     }
     false
@@ -367,6 +380,7 @@ mod tests {
             value_prefix: "token ".to_string(),
             source: "env".to_string(),
             env_var: Some("STRAIT_TEST_INJECT_1".to_string()),
+            credential_type: "bearer".to_string(),
         }];
 
         let store = CredentialStore::from_entries(&entries).unwrap();
@@ -375,7 +389,14 @@ mod tests {
             ("Accept".to_string(), "application/json".to_string()),
         ];
 
-        let injected = inject_credential("api.github.com", &mut headers, Some(&store));
+        let injected = inject_credential(
+            "api.github.com",
+            "GET",
+            "/repos",
+            &mut headers,
+            None,
+            Some(&store),
+        );
         assert!(injected, "credential should be injected");
 
         let auth = headers.iter().find(|(k, _)| k == "Authorization");
@@ -396,6 +417,7 @@ mod tests {
             value_prefix: "token ".to_string(),
             source: "env".to_string(),
             env_var: Some("STRAIT_TEST_INJECT_2".to_string()),
+            credential_type: "bearer".to_string(),
         }];
 
         let store = CredentialStore::from_entries(&entries).unwrap();
@@ -404,7 +426,14 @@ mod tests {
             ("Authorization".to_string(), "token old_value".to_string()),
         ];
 
-        let injected = inject_credential("api.github.com", &mut headers, Some(&store));
+        let injected = inject_credential(
+            "api.github.com",
+            "GET",
+            "/",
+            &mut headers,
+            None,
+            Some(&store),
+        );
         assert!(injected);
 
         // Should only have one Authorization header
@@ -423,7 +452,7 @@ mod tests {
     #[test]
     fn inject_credential_no_store_returns_false() {
         let mut headers = vec![("Host".to_string(), "api.github.com".to_string())];
-        let injected = inject_credential("api.github.com", &mut headers, None);
+        let injected = inject_credential("api.github.com", "GET", "/", &mut headers, None, None);
         assert!(!injected);
     }
 
@@ -499,12 +528,14 @@ mod tests {
             value_prefix: "token ".to_string(),
             source: "env".to_string(),
             env_var: Some("STRAIT_TEST_INJECT_3".to_string()),
+            credential_type: "bearer".to_string(),
         }];
 
         let store = CredentialStore::from_entries(&entries).unwrap();
         let mut headers = vec![("Host".to_string(), "example.com".to_string())];
 
-        let injected = inject_credential("example.com", &mut headers, Some(&store));
+        let injected =
+            inject_credential("example.com", "GET", "/", &mut headers, None, Some(&store));
         assert!(
             !injected,
             "no credential should be injected for unknown host"

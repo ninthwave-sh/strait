@@ -10,11 +10,16 @@ readme = "README.md"
 [dependencies]
 hudsucker = { version = "0.22", features = ["rustls-client"] }
 cedar-policy = "4"
-rcgen = "0.13"
+rcgen = { version = "0.13", features = ["pem"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 rustls = "0.23"
+rustls-pemfile = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+webpki-roots = "1"
+http = "1"
+time = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
@@ -24,6 +29,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 toml = "0.8"
 anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 strip = true

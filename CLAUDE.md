@@ -1,6 +1,6 @@
 # strait
 
-HTTPS proxy with Cedar policy evaluation, credential injection, and audit logging. Rust + Tokio.
+HTTPS policy proxy with Cedar evaluation, credential injection, and audit logging. Rust + Tokio.
 
 ## Development
 
@@ -22,13 +22,21 @@ The `test` job is a required status check on `main` — PRs cannot merge until i
 
 ## Architecture
 
-- `src/main.rs` — CLI entry point (clap), config loading, proxy server startup
-- `src/mitm.rs` — MITM request handler with Cedar policy evaluation
-- `src/policy.rs` — Cedar policy engine (load, evaluate, authorize)
-- `src/credentials.rs` — credential injection from TOML config
-- `src/ca.rs` — session CA certificate generation for TLS interception
-- `src/audit.rs` — structured JSON audit logging
-- `tests/` — integration tests
+- `src/main.rs` — CLI entry point (clap), CONNECT handler, MITM/passthrough routing
+- `src/ca.rs` — session-local CA cert generation (rcgen)
+- `src/policy.rs` — Cedar policy engine: entity hierarchy from URL paths, per-request eval
+- `src/credentials.rs` — TOML credential store, env-var source, header injection
+- `src/mitm.rs` — TLS termination, request parsing, policy eval, credential injection, upstream forwarding
+- `src/audit.rs` — structured JSON audit logging (session ID, decisions, latency)
+- `tests/integration.rs` — loopback integration tests (TLS echo server, no network)
+
+## Key Design Decisions
+
+- **MITM only for credentialed services** — no global MITM. `should_mitm()` allowlists hosts.
+- **Cedar over OPA** — sub-ms evaluation, embeddable, no sidecar process.
+- **Session-local CA** — new CA cert generated on each startup. Caller must trust it explicitly.
+- **Credential injection on allow only** — calling process never sees real secrets.
+- **General-purpose tool** — not ninthwave-specific. Standalone binary, separate repo.
 
 ## Conventions
 
@@ -36,3 +44,12 @@ The `test` job is a required status check on `main` — PRs cannot merge until i
 - Rust 2021 edition, stable toolchain
 - All clippy warnings treated as errors
 - `cargo fmt` enforced in CI
+- Integration tests use loopback TCP/TLS (no external network access)
+- Test helpers use a `NoVerify` cert verifier for echo server connections only
+- Tracing via `tracing` crate, structured JSON to stderr
+
+## Roadmap
+
+- v0.1: GitHub API (bearer token, REST path matching) — in progress
+- v0.2: AWS (SigV4) — deferred
+- Future: macOS Keychain credential source, configurable MITM host list, health check endpoint

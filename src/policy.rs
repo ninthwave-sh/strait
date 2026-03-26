@@ -16,7 +16,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use cedar_policy::{
     Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid,
-    PolicySet, Request, RestrictedExpression,
+    PolicySet, Request, RestrictedExpression, Schema, ValidationMode, Validator,
 };
 
 /// Result of a Cedar policy evaluation.
@@ -35,14 +35,40 @@ pub struct PolicyEngine {
 }
 
 impl PolicyEngine {
-    /// Load a Cedar policy file from disk. Returns an error if the file
-    /// cannot be read or contains invalid Cedar syntax.
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
+    /// Load a Cedar policy file from disk, optionally validating it against a
+    /// `.cedarschema` file. Returns an error if the file cannot be read,
+    /// contains invalid Cedar syntax, or violates the schema.
+    pub fn load(path: &Path, schema_path: Option<&Path>) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read policy file: {}", path.display()))?;
 
         let policy_set = PolicySet::from_str(&text)
             .map_err(|e| anyhow::anyhow!("invalid Cedar policy file: {e}"))?;
+
+        // Validate against schema if provided
+        if let Some(schema_path) = schema_path {
+            let schema_text = std::fs::read_to_string(schema_path).with_context(|| {
+                format!("failed to read schema file: {}", schema_path.display())
+            })?;
+
+            let (schema, _warnings) = Schema::from_cedarschema_str(&schema_text).map_err(|e| {
+                anyhow::anyhow!("invalid Cedar schema file {}: {e}", schema_path.display())
+            })?;
+
+            let validator = Validator::new(schema);
+            let result = validator.validate(&policy_set, ValidationMode::Strict);
+            if !result.validation_passed() {
+                let errors: Vec<String> = result
+                    .validation_errors()
+                    .map(|e| format!("  - {e}"))
+                    .collect();
+                anyhow::bail!(
+                    "Cedar policy validation failed against schema {}:\n{}",
+                    schema_path.display(),
+                    errors.join("\n")
+                );
+            }
+        }
 
         Ok(Self {
             policy_set: Arc::new(policy_set),
@@ -306,13 +332,13 @@ forbid(
     #[test]
     fn load_valid_policy_file() {
         let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path()).unwrap();
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
         assert!(Arc::strong_count(&engine.policy_set) >= 1);
     }
 
     #[test]
     fn load_missing_policy_file() {
-        let result = PolicyEngine::load(Path::new("/nonexistent/policy.cedar"));
+        let result = PolicyEngine::load(Path::new("/nonexistent/policy.cedar"), None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("failed to read policy file"), "got: {err}");
@@ -321,7 +347,7 @@ forbid(
     #[test]
     fn load_invalid_policy_file() {
         let f = write_policy("this is not valid cedar @@@ {{{");
-        let result = PolicyEngine::load(f.path());
+        let result = PolicyEngine::load(f.path(), None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("invalid Cedar policy"), "got: {err}");
@@ -353,7 +379,7 @@ forbid(
     #[test]
     fn allow_get_repos_org_repo() {
         let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path()).unwrap();
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
             .evaluate("api.github.com", "GET", "/repos/our-org/repo", &[])
             .unwrap();
@@ -368,7 +394,7 @@ forbid(
     #[test]
     fn allow_post_pulls() {
         let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path()).unwrap();
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
             .evaluate("api.github.com", "POST", "/repos/our-org/repo/pulls", &[])
             .unwrap();
@@ -386,7 +412,7 @@ forbid(
     #[test]
     fn deny_delete_repos_org_repo() {
         let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path()).unwrap();
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
             .evaluate("api.github.com", "DELETE", "/repos/our-org/repo", &[])
             .unwrap();
@@ -399,7 +425,7 @@ forbid(
     #[test]
     fn deny_post_git_refs_heads_main() {
         let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path()).unwrap();
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
             .evaluate(
                 "api.github.com",
@@ -417,7 +443,7 @@ forbid(
     #[test]
     fn deny_patch_settings() {
         let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path()).unwrap();
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
             .evaluate("api.github.com", "PATCH", "/settings", &[])
             .unwrap();
@@ -427,7 +453,7 @@ forbid(
     #[test]
     fn deny_get_unknown() {
         let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path()).unwrap();
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
             .evaluate("api.github.com", "GET", "/unknown", &[])
             .unwrap();
@@ -478,7 +504,7 @@ permit(
 );
 "#,
         );
-        let engine = PolicyEngine::load(f.path()).unwrap();
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
 
         // a/b/c should be allowed because it's in Resource::"example.com/a"
         let result = engine
@@ -492,5 +518,98 @@ permit(
         // /x should be denied (not in Resource::"example.com/a")
         let result = engine.evaluate("example.com", "GET", "/x", &[]).unwrap();
         assert!(!result.allowed, "GET /x should be denied (not in /a)");
+    }
+
+    // --- Schema validation tests ---
+
+    fn write_schema(content: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::with_suffix(".cedarschema").unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    /// A valid Cedar schema matching our entity model.
+    const VALID_SCHEMA: &str = r#"
+entity Agent;
+entity Resource in [Resource];
+action "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
+    appliesTo { principal: Agent, resource: Resource, context: {} };
+"#;
+
+    /// A Cedar policy that conforms to VALID_SCHEMA.
+    const SCHEMA_CONFORMING_POLICY: &str = r#"
+@id("allow-get")
+permit(
+    principal == Agent::"worker",
+    action == Action::"GET",
+    resource in Resource::"example.com/api"
+);
+"#;
+
+    #[test]
+    fn load_valid_policy_with_valid_schema() {
+        let policy_file = write_policy(SCHEMA_CONFORMING_POLICY);
+        let schema_file = write_schema(VALID_SCHEMA);
+        let engine = PolicyEngine::load(policy_file.path(), Some(schema_file.path())).unwrap();
+        assert!(Arc::strong_count(&engine.policy_set) >= 1);
+    }
+
+    #[test]
+    fn load_valid_policy_without_schema_backward_compat() {
+        // Existing behavior: no schema → skip validation
+        let policy_file = write_policy(SCHEMA_CONFORMING_POLICY);
+        let engine = PolicyEngine::load(policy_file.path(), None).unwrap();
+        assert!(Arc::strong_count(&engine.policy_set) >= 1);
+    }
+
+    #[test]
+    fn load_policy_violating_schema() {
+        // Policy references an entity type not in the schema
+        let bad_policy = r#"
+@id("bad-principal")
+permit(
+    principal == UnknownType::"foo",
+    action == Action::"GET",
+    resource
+);
+"#;
+        let policy_file = write_policy(bad_policy);
+        let schema_file = write_schema(VALID_SCHEMA);
+        let result = PolicyEngine::load(policy_file.path(), Some(schema_file.path()));
+        assert!(result.is_err());
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("Cedar policy validation failed"),
+            "expected validation failure message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_invalid_schema_file() {
+        let policy_file = write_policy(SCHEMA_CONFORMING_POLICY);
+        let schema_file = write_schema("this is not valid cedarschema @@@ {{{");
+        let result = PolicyEngine::load(policy_file.path(), Some(schema_file.path()));
+        assert!(result.is_err());
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("invalid Cedar schema file"),
+            "expected schema parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_missing_schema_file() {
+        let policy_file = write_policy(SCHEMA_CONFORMING_POLICY);
+        let result = PolicyEngine::load(
+            policy_file.path(),
+            Some(Path::new("/nonexistent/schema.cedarschema")),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to read schema file"),
+            "expected file-not-found error, got: {err}"
+        );
     }
 }

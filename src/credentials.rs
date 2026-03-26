@@ -267,8 +267,9 @@ fn host_matches_pattern(host: &str, pattern: &str) -> bool {
 fn resolve_entry(entry: &CredentialEntryConfig) -> anyhow::Result<Box<dyn Credential>> {
     match entry.credential_type.as_str() {
         "bearer" => resolve_bearer(entry),
+        "aws-sigv4" => resolve_sigv4(entry),
         other => anyhow::bail!(
-            "credential for '{}': unsupported credential type '{}' (only 'bearer' is supported)",
+            "credential for '{}': unsupported credential type '{}' (supported: 'bearer', 'aws-sigv4')",
             entry_identifier(entry),
             other
         ),
@@ -310,6 +311,50 @@ fn resolve_bearer(entry: &CredentialEntryConfig) -> anyhow::Result<Box<dyn Crede
     }
 }
 
+/// Resolve an AWS SigV4 credential entry.
+///
+/// Reads the access key, secret key, and optional session token from
+/// environment variables. The env var names default to the standard
+/// AWS SDK names but can be overridden in the config.
+fn resolve_sigv4(entry: &CredentialEntryConfig) -> anyhow::Result<Box<dyn Credential>> {
+    let id = entry_identifier(entry);
+
+    if entry.source != "env" {
+        anyhow::bail!(
+            "credential for '{}': aws-sigv4 only supports source 'env', got '{}'",
+            id,
+            entry.source
+        );
+    }
+
+    use crate::sigv4::{
+        SigV4Credential, DEFAULT_ACCESS_KEY_ID_VAR, DEFAULT_SECRET_ACCESS_KEY_VAR,
+        DEFAULT_SESSION_TOKEN_VAR,
+    };
+
+    let ak_var = entry
+        .access_key_id_var
+        .as_deref()
+        .unwrap_or(DEFAULT_ACCESS_KEY_ID_VAR);
+    let sk_var = entry
+        .secret_access_key_var
+        .as_deref()
+        .unwrap_or(DEFAULT_SECRET_ACCESS_KEY_VAR);
+    let tok_var = entry
+        .session_token_var
+        .as_deref()
+        .unwrap_or(DEFAULT_SESSION_TOKEN_VAR);
+
+    let cred = SigV4Credential::from_env(ak_var, sk_var, tok_var).with_context(|| {
+        format!(
+            "credential for '{}': failed to resolve aws-sigv4 credentials",
+            id
+        )
+    })?;
+
+    Ok(Box::new(cred))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -335,6 +380,9 @@ mod tests {
             source: source.to_string(),
             env_var: env_var.map(|s| s.to_string()),
             credential_type: "bearer".to_string(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
         }
     }
 
@@ -353,6 +401,9 @@ mod tests {
             source: source.to_string(),
             env_var: env_var.map(|s| s.to_string()),
             credential_type: "bearer".to_string(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
         }
     }
 
@@ -579,7 +630,10 @@ mod tests {
             value_prefix: String::new(),
             source: "env".to_string(),
             env_var: Some("SOME_VAR".to_string()),
-            credential_type: "sigv4".to_string(),
+            credential_type: "oauth2".to_string(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
         }];
 
         let result = CredentialStore::from_entries(&entries);
@@ -602,6 +656,9 @@ mod tests {
                 source: "env".to_string(),
                 env_var: Some("STRAIT_TEST_DISPATCH_1".to_string()),
                 credential_type: "bearer".to_string(),
+                access_key_id_var: None,
+                secret_access_key_var: None,
+                session_token_var: None,
             },
             CredentialEntryConfig {
                 host: Some("api.stripe.com".to_string()),
@@ -611,6 +668,9 @@ mod tests {
                 source: "env".to_string(),
                 env_var: Some("STRAIT_TEST_DISPATCH_2".to_string()),
                 credential_type: "bearer".to_string(),
+                access_key_id_var: None,
+                secret_access_key_var: None,
+                session_token_var: None,
             },
         ];
 
@@ -774,6 +834,9 @@ mod tests {
             source: "env".to_string(),
             env_var: Some("IRRELEVANT".to_string()),
             credential_type: "bearer".to_string(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
         }];
 
         let result = CredentialStore::from_entries(&entries);
@@ -792,6 +855,9 @@ mod tests {
             source: "env".to_string(),
             env_var: Some("IRRELEVANT".to_string()),
             credential_type: "bearer".to_string(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
         }];
 
         let result = CredentialStore::from_entries(&entries);

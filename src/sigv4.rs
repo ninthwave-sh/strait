@@ -47,11 +47,21 @@ const DEFAULT_REGION: &str = "us-east-1";
 /// Holds the resolved access key, secret key, and optional session token.
 /// At request time, extracts the service and region from the `Host` header
 /// and signs the request using the `aws-sigv4` crate.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SigV4Credential {
     access_key_id: String,
     secret_access_key: String,
     session_token: Option<String>,
+}
+
+impl std::fmt::Debug for SigV4Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SigV4Credential")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"***")
+            .field("session_token", &self.session_token.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 impl SigV4Credential {
@@ -684,6 +694,63 @@ mod tests {
             msgs.iter().any(|m| m.contains("SigV4")),
             "warning should mention SigV4, got: {:?}",
             *msgs
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Debug redaction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sigv4_debug_redacts_secret_key() {
+        let cred = test_credential();
+        let debug_output = format!("{:?}", cred);
+
+        // Must NOT contain the secret access key
+        assert!(
+            !debug_output.contains("wJalrXUtnFEMI"),
+            "Debug output must not contain the secret access key, got: {debug_output}"
+        );
+
+        // Access key ID is non-secret metadata and should be visible
+        assert!(
+            debug_output.contains("AKIAIOSFODNN7EXAMPLE"),
+            "Debug output should show the access key ID, got: {debug_output}"
+        );
+
+        // Should contain redaction markers
+        assert!(
+            debug_output.contains("***"),
+            "Debug output should contain redaction marker, got: {debug_output}"
+        );
+    }
+
+    #[test]
+    fn sigv4_debug_redacts_session_token() {
+        let cred = test_credential_with_token();
+        let debug_output = format!("{:?}", cred);
+
+        // Must NOT contain the session token value
+        assert!(
+            !debug_output.contains("AQoDYXdzEJr"),
+            "Debug output must not contain the session token, got: {debug_output}"
+        );
+
+        // Should show that a session token exists (redacted)
+        assert!(
+            debug_output.contains("session_token"),
+            "Debug output should mention session_token field, got: {debug_output}"
+        );
+    }
+
+    #[test]
+    fn sigv4_debug_shows_none_session_token() {
+        let cred = test_credential(); // no session token
+        let debug_output = format!("{:?}", cred);
+
+        assert!(
+            debug_output.contains("None"),
+            "Debug output should show None for missing session token, got: {debug_output}"
         );
     }
 

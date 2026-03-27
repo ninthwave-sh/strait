@@ -2,6 +2,7 @@ mod audit;
 mod ca;
 pub mod config;
 pub mod credentials;
+pub mod generate;
 mod health;
 mod mitm;
 pub mod observe;
@@ -12,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
@@ -24,8 +25,17 @@ use crate::mitm::{handle_mitm, should_mitm};
 #[command(
     name = "strait",
     version,
-    about = "HTTPS proxy with Cedar policy evaluation, credential injection, and audit logging",
-    after_help = "\
+    about = "HTTPS proxy with Cedar policy evaluation, credential injection, and audit logging"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the HTTPS proxy.
+    #[command(after_help = "\
 TLS TRUST:
   strait generates a session-local CA certificate on each startup.
   The CA cert PEM is written to the path specified by `ca_cert_path` in strait.toml.
@@ -35,27 +45,63 @@ TLS TRUST:
 
   Or concatenate with the system CA bundle:
     cat /tmp/strait-ca.pem >> /path/to/ca-bundle.crt
-    SSL_CERT_FILE=/path/to/ca-bundle.crt HTTPS_PROXY=127.0.0.1:<port> curl https://api.github.com/user"
-)]
-struct Cli {
-    /// Path to the strait.toml configuration file.
-    #[arg(short, long, value_name = "FILE")]
-    config: PathBuf,
+    SSL_CERT_FILE=/path/to/ca-bundle.crt HTTPS_PROXY=127.0.0.1:<port> curl https://api.github.com/user")]
+    Proxy {
+        /// Path to the strait.toml configuration file.
+        #[arg(short, long, value_name = "FILE")]
+        config: PathBuf,
+    },
+
+    /// Generate Cedar policy from an observation log.
+    ///
+    /// Reads a JSONL observation file and produces a Cedar policy file + schema
+    /// covering all observed activity. Dynamic path segments (UUIDs, long numbers,
+    /// SHA hashes) are collapsed to wildcards with annotation comments.
+    Generate {
+        /// Path to the observation JSONL file.
+        observations: PathBuf,
+
+        /// Output path for the Cedar policy file.
+        #[arg(short, long, default_value = "policy.cedar")]
+        output: PathBuf,
+
+        /// Output path for the Cedar schema file.
+        #[arg(long, default_value = "policy.cedarschema")]
+        schema: PathBuf,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Generate {
+            observations,
+            output,
+            schema,
+        } => {
+            generate::generate(&observations, &output, &schema)?;
+        }
+        Commands::Proxy { config } => {
+            run_proxy(config).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Run the HTTPS proxy server.
+async fn run_proxy(config_path: PathBuf) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .json()
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
-
     // Load configuration
-    let config = StraitConfig::load(&cli.config)?;
-    info!(path = %cli.config.display(), "configuration loaded");
+    let config = StraitConfig::load(&config_path)?;
+    info!(path = %config_path.display(), "configuration loaded");
 
     // Build shared proxy context
     let ctx = Arc::new(ProxyContext::from_config(&config)?);

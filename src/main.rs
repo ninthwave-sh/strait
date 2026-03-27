@@ -96,6 +96,13 @@ TLS TRUST:
         /// Path to the Cedar policy file.
         #[arg(long)]
         policy: PathBuf,
+
+        /// Agent identity (Cedar principal) to use during evaluation.
+        ///
+        /// Defaults to "agent" if not specified. Use this to test policies that
+        /// reference specific principals (e.g. `principal == Agent::"worker"`).
+        #[arg(long)]
+        agent: Option<String>,
     },
 
     /// Watch live observation events from a running strait session.
@@ -214,8 +221,12 @@ async fn main() -> anyhow::Result<()> {
                 templates::apply(&name, output_dir.as_deref())?;
             }
         },
-        Commands::Test { replay, policy } => {
-            let result = strait::replay::replay(&replay, &policy)?;
+        Commands::Test {
+            replay,
+            policy,
+            agent,
+        } => {
+            let result = strait::replay::replay(&replay, &policy, agent.as_deref())?;
             let exit_code = strait::replay::print_results(&result);
             if exit_code != 0 {
                 std::process::exit(exit_code);

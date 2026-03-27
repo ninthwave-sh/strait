@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use anyhow::Context;
 use rustls::ServerConfig;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
@@ -24,13 +24,23 @@ pub fn should_mitm(host: &str, mitm_hosts: &[String]) -> bool {
     mitm_hosts.iter().any(|h| h == host)
 }
 
-/// Perform MITM on the client connection.
+/// Perform MITM on the client connection with HTTP/1.1 keep-alive.
 ///
-/// 1. Accept TLS from the client using a leaf cert for `host`.
-/// 2. Read the inner HTTP request (method, path, headers).
-/// 3. Evaluate against Cedar policies (if a policy engine is provided).
-/// 4. On DENY, return HTTP 403 with structured JSON body. No credential injected.
-/// 5. On ALLOW (or no policy engine), inject credentials and forward upstream.
+/// After the initial TLS handshake, the proxy loops over sequential HTTP
+/// requests on the same connection:
+///
+/// 1. Read the inner HTTP request (method, path, headers, body).
+/// 2. Evaluate against Cedar policies (if a policy engine is provided).
+/// 3. On DENY, return HTTP 403 and continue the loop.
+/// 4. On ALLOW (or no policy engine), inject credentials, forward upstream,
+///    read the response, and relay it back to the client.
+///
+/// The loop exits when:
+/// - The client sends `Connection: close`.
+/// - EOF on the client connection.
+/// - The upstream sends `Connection: close` in its response.
+/// - The configurable idle timeout fires (default 30 s).
+/// - An unrecoverable error occurs (e.g. 413 Payload Too Large).
 pub async fn handle_mitm(
     client: TcpStream,
     host: &str,
@@ -52,278 +62,438 @@ pub async fn handle_mitm(
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
     // Accept TLS from the client
-    let mut tls_client = acceptor
+    let tls_client = acceptor
         .accept(client)
         .await
         .context("TLS accept from client failed")?;
 
-    // Read the inner HTTP request
-    let mut buf_reader = BufReader::new(&mut tls_client);
+    // Split into independent read/write halves for the keep-alive loop.
+    let (read_half, mut write_half) = tokio::io::split(tls_client);
+    let mut buf_reader = BufReader::new(read_half);
 
-    // Read request line
-    let mut request_line = String::new();
-    buf_reader.read_line(&mut request_line).await?;
-    let request_line = request_line.trim().to_string();
-
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        anyhow::bail!("invalid HTTP request line: {}", request_line);
-    }
-    let method = parts[0].to_string();
-    let path = parts[1].to_string();
-
-    // Read headers
-    let mut headers: Vec<(String, String)> = Vec::new();
     loop {
-        let mut line = String::new();
-        buf_reader.read_line(&mut line).await?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break;
+        // --- Read the next HTTP request (with idle timeout) ---
+        let mut request_line = String::new();
+        let read_result = tokio::time::timeout(
+            ctx.keepalive_timeout,
+            buf_reader.read_line(&mut request_line),
+        )
+        .await;
+
+        match read_result {
+            Err(_) => {
+                // Idle timeout — close connection cleanly
+                info!(
+                    host = host,
+                    "keep-alive idle timeout, closing MITM connection"
+                );
+                break;
+            }
+            Ok(Ok(0)) => {
+                // EOF — client closed the connection
+                break;
+            }
+            Ok(Err(e)) => {
+                return Err(e.into());
+            }
+            Ok(Ok(_)) => {
+                // Got data — continue processing
+            }
         }
-        if let Some((name, value)) = trimmed.split_once(':') {
-            headers.push((name.trim().to_string(), value.trim().to_string()));
+
+        let request_line = request_line.trim().to_string();
+        let parts: Vec<&str> = request_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            anyhow::bail!("invalid HTTP request line: {}", request_line);
         }
-    }
+        let method = parts[0].to_string();
+        let path = parts[1].to_string();
 
-    // --- Body buffering ---
-    // Read the request body *before* credential injection so that signing
-    // schemes (e.g. SigV4) have access to the body hash. Requests without
-    // Content-Length pass None; oversized bodies are rejected with 413.
-    let content_length: Option<usize> = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.parse().ok());
-
-    let body: Option<Vec<u8>> = if let Some(len) = content_length {
-        if len > ctx.max_body_size {
-            let response = build_payload_too_large_response(len, ctx.max_body_size);
-            let tls_client_inner = buf_reader.into_inner();
-            tls_client_inner.write_all(response.as_bytes()).await?;
-            tls_client_inner.shutdown().await?;
-            return Ok(());
+        // Read headers
+        let mut headers: Vec<(String, String)> = Vec::new();
+        let mut client_wants_close = false;
+        loop {
+            let mut line = String::new();
+            buf_reader.read_line(&mut line).await?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = trimmed.split_once(':') {
+                let name = name.trim().to_string();
+                let value = value.trim().to_string();
+                if name.eq_ignore_ascii_case("connection") && value.eq_ignore_ascii_case("close") {
+                    client_wants_close = true;
+                }
+                headers.push((name, value));
+            }
         }
-        let mut buf = vec![0u8; len];
-        tokio::io::AsyncReadExt::read_exact(&mut buf_reader, &mut buf).await?;
-        Some(buf)
-    } else {
-        None
-    };
 
-    // --- Agent identity extraction ---
-    // Extract the agent identity from the configured header. If absent, use the
-    // configured default (e.g. "anonymous"). Always strip the identity header
-    // from outbound requests to prevent spoofing upstream.
-    let identity_header = &ctx.identity_header;
-    let agent_id = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(identity_header))
-        .map(|(_, v)| v.clone())
-        .unwrap_or_else(|| ctx.identity_default.clone());
+        // --- Body buffering ---
+        // Read the request body *before* credential injection so that signing
+        // schemes (e.g. SigV4) have access to the body hash. Requests without
+        // Content-Length pass None; oversized bodies are rejected with 413.
+        let content_length: Option<usize> = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.parse().ok());
 
-    // Strip the identity header before forwarding upstream
-    headers.retain(|(k, _)| !k.eq_ignore_ascii_case(identity_header));
-
-    // Start timing policy evaluation
-    let eval_start = Instant::now();
-
-    let policy = ctx.policy_engine.as_deref();
-    let credentials = ctx.credential_store.as_deref();
-    let audit = &ctx.audit_logger;
-
-    // Evaluate Cedar policy (if configured)
-    if let Some(engine) = policy {
-        let action = format!("http:{method}");
-        let decision = engine.evaluate(host, &action, &path, &headers, &agent_id)?;
-
-        let policy_display = if decision.policy_names.is_empty() {
-            "default-deny".to_string()
+        let body: Option<Vec<u8>> = if let Some(len) = content_length {
+            if len > ctx.max_body_size {
+                let response = build_payload_too_large_response(len, ctx.max_body_size);
+                write_half.write_all(response.as_bytes()).await?;
+                write_half.flush().await?;
+                // 413 includes Connection: close — cannot skip the unread body
+                break;
+            }
+            let mut buf = vec![0u8; len];
+            AsyncReadExt::read_exact(&mut buf_reader, &mut buf).await?;
+            Some(buf)
         } else {
-            decision.policy_names.join(", ")
+            None
         };
 
-        if !decision.allowed {
-            // Build a human-readable denial reason. If the matching policy has
-            // a @reason("...") annotation, use that; otherwise use a generic format.
-            let denial_reason = if !decision.policy_reasons.is_empty() {
-                decision.policy_reasons.join("; ")
+        // --- Agent identity extraction ---
+        // Extract the agent identity from the configured header. If absent, use the
+        // configured default (e.g. "anonymous"). Always strip the identity header
+        // from outbound requests to prevent spoofing upstream.
+        let identity_header = &ctx.identity_header;
+        let agent_id = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(identity_header))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| ctx.identity_default.clone());
+
+        // Strip the identity header before forwarding upstream
+        headers.retain(|(k, _)| !k.eq_ignore_ascii_case(identity_header));
+
+        // Start timing policy evaluation
+        let eval_start = Instant::now();
+
+        let policy = ctx.policy_engine.as_deref();
+        let credentials = ctx.credential_store.as_deref();
+        let audit = &ctx.audit_logger;
+
+        // --- Policy evaluation ---
+        let mut denied = false;
+
+        if let Some(engine) = policy {
+            let action = format!("http:{method}");
+            let decision = engine.evaluate(host, &action, &path, &headers, &agent_id)?;
+
+            let policy_display = if decision.policy_names.is_empty() {
+                "default-deny".to_string()
             } else {
-                format!(
-                    "Request denied by policy '{}': {} {} on {}",
-                    policy_display, method, path, host
-                )
+                decision.policy_names.join(", ")
             };
 
-            // Log DENY audit event -- no credential injected
+            if !decision.allowed {
+                // Build a human-readable denial reason. If the matching policy has
+                // a @reason("...") annotation, use that; otherwise use a generic format.
+                let denial_reason = if !decision.policy_reasons.is_empty() {
+                    decision.policy_reasons.join("; ")
+                } else {
+                    format!(
+                        "Request denied by policy '{}': {} {} on {}",
+                        policy_display, method, path, host
+                    )
+                };
+
+                // Log DENY audit event — no credential injected
+                audit.log_decision(
+                    host,
+                    port,
+                    &method,
+                    &path,
+                    &agent_id,
+                    "deny",
+                    &decision.policy_names,
+                    false,
+                    Some(&denial_reason),
+                    eval_start,
+                );
+
+                warn!(
+                    host = host,
+                    method = method.as_str(),
+                    path = path.as_str(),
+                    agent = agent_id.as_str(),
+                    policy = policy_display.as_str(),
+                    "DENY: request blocked by Cedar policy"
+                );
+
+                // Return 403 with structured JSON body
+                let body_json =
+                    crate::policy::deny_response_body(host, &method, &path, &decision.policy_names);
+                let body_bytes = serde_json::to_string(&body_json)?;
+                let response = build_deny_response(&body_bytes);
+                write_half.write_all(response.as_bytes()).await?;
+                write_half.flush().await?;
+
+                denied = true;
+            } else {
+                // ALLOW path — check for credential injection
+                let credential_injected = inject_credential(
+                    host,
+                    &method,
+                    &path,
+                    &mut headers,
+                    body.as_deref(),
+                    credentials,
+                );
+
+                // Log ALLOW audit event
+                audit.log_decision(
+                    host,
+                    port,
+                    &method,
+                    &path,
+                    &agent_id,
+                    "allow",
+                    &decision.policy_names,
+                    credential_injected,
+                    None,
+                    eval_start,
+                );
+
+                info!(
+                    host = host,
+                    method = method.as_str(),
+                    path = path.as_str(),
+                    agent = agent_id.as_str(),
+                    policy = policy_display.as_str(),
+                    credential_injected = credential_injected,
+                    "ALLOW: request permitted by Cedar policy"
+                );
+            }
+        } else {
+            // No policy engine — allow by default, still inject credentials
+            let credential_injected = inject_credential(
+                host,
+                &method,
+                &path,
+                &mut headers,
+                body.as_deref(),
+                credentials,
+            );
+
             audit.log_decision(
                 host,
                 port,
                 &method,
                 &path,
                 &agent_id,
-                "deny",
-                &decision.policy_names,
-                false,
-                Some(&denial_reason),
+                "allow",
+                &["no-policy".to_string()],
+                credential_injected,
+                None,
                 eval_start,
             );
 
-            warn!(
+            info!(
                 host = host,
                 method = method.as_str(),
                 path = path.as_str(),
                 agent = agent_id.as_str(),
-                policy = policy_display.as_str(),
-                "DENY: request blocked by Cedar policy"
+                credential_injected = credential_injected,
+                "ALLOW: no policy engine configured"
             );
-
-            // Return 403 with structured JSON body
-            let body =
-                crate::policy::deny_response_body(host, &method, &path, &decision.policy_names);
-            let body_bytes = serde_json::to_string(&body)?;
-            let response = build_deny_response(&body_bytes);
-
-            let tls_client_inner = buf_reader.into_inner();
-            tls_client_inner.write_all(response.as_bytes()).await?;
-            tls_client_inner.shutdown().await?;
-            return Ok(());
         }
 
-        // ALLOW path -- check for credential injection
-        let credential_injected = inject_credential(
-            host,
-            &method,
-            &path,
-            &mut headers,
-            body.as_deref(),
-            credentials,
-        );
-
-        // Log ALLOW audit event
-        audit.log_decision(
-            host,
-            port,
-            &method,
-            &path,
-            &agent_id,
-            "allow",
-            &decision.policy_names,
-            credential_injected,
-            None,
-            eval_start,
-        );
-
-        info!(
-            host = host,
-            method = method.as_str(),
-            path = path.as_str(),
-            agent = agent_id.as_str(),
-            policy = policy_display.as_str(),
-            credential_injected = credential_injected,
-            "ALLOW: request permitted by Cedar policy"
-        );
-    } else {
-        // No policy engine -- allow by default, still inject credentials
-        let credential_injected = inject_credential(
-            host,
-            &method,
-            &path,
-            &mut headers,
-            body.as_deref(),
-            credentials,
-        );
-
-        audit.log_decision(
-            host,
-            port,
-            &method,
-            &path,
-            &agent_id,
-            "allow",
-            &["no-policy".to_string()],
-            credential_injected,
-            None,
-            eval_start,
-        );
-
-        info!(
-            host = host,
-            method = method.as_str(),
-            path = path.as_str(),
-            agent = agent_id.as_str(),
-            credential_injected = credential_injected,
-            "ALLOW: no policy engine configured"
-        );
-    }
-
-    // --- Connection: close ---
-    // Inject or replace Connection header with "close" on all forwarded requests
-    // to force one-request-per-connection semantics (v0.1 keep-alive mitigation).
-    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("connection"));
-    headers.push(("Connection".to_string(), "close".to_string()));
-
-    // Build the upstream request to forward
-    // Connect to upstream with real TLS
-    let upstream_tcp = TcpStream::connect(format!("{host}:{port}")).await?;
-
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())?;
-    let mut tls_upstream = connector.connect(server_name, upstream_tcp).await?;
-
-    // Reconstruct and forward the request (headers now include injected credentials)
-    let mut request_bytes = format!("{method} {path} HTTP/1.1\r\n");
-    for (name, value) in &headers {
-        request_bytes.push_str(&format!("{name}: {value}\r\n"));
-    }
-    request_bytes.push_str("\r\n");
-    tls_upstream.write_all(request_bytes.as_bytes()).await?;
-
-    // Write the buffered body (already read before credential injection)
-    if let Some(ref body_bytes) = body {
-        tls_upstream.write_all(body_bytes).await?;
-    }
-
-    // Relay the response back: bidirectional copy
-    // Drop the BufReader wrapper to get back the inner stream
-    // We need to handle buffered data + remaining stream
-    let buf = buf_reader.buffer().to_vec();
-    let tls_client_inner = buf_reader.into_inner();
-
-    // Write any buffered data to upstream
-    if !buf.is_empty() {
-        tls_upstream.write_all(&buf).await?;
-    }
-
-    // Bidirectional relay: when one direction finishes (e.g. upstream sends
-    // response and closes), shut down the other direction so the peer sees EOF.
-    let (mut client_read, mut client_write) = tokio::io::split(tls_client_inner);
-    let (mut upstream_read, mut upstream_write) = tokio::io::split(tls_upstream);
-
-    tokio::select! {
-        result = tokio::io::copy(&mut upstream_read, &mut client_write) => {
-            // Upstream finished sending (response complete). Shut down client write.
-            let _ = result;
-            let _ = client_write.shutdown().await;
-            // Drain remaining client data to upstream
-            let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
+        if denied {
+            // After deny, continue the loop unless client requested close
+            if client_wants_close {
+                break;
+            }
+            continue;
         }
-        result = tokio::io::copy(&mut client_read, &mut upstream_write) => {
-            // Client finished sending. Shut down upstream write.
-            let _ = result;
-            let _ = upstream_write.shutdown().await;
-            // Drain remaining upstream data to client
-            let _ = tokio::io::copy(&mut upstream_read, &mut client_write).await;
+
+        // --- Forward to upstream ---
+        let upstream_tcp = TcpStream::connect(format!("{host}:{port}")).await?;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())?;
+        let tls_upstream = connector.connect(server_name, upstream_tcp).await?;
+
+        let (upstream_read, mut upstream_write) = tokio::io::split(tls_upstream);
+
+        // Reconstruct and forward the request (headers now include injected credentials)
+        let mut request_bytes = format!("{method} {path} HTTP/1.1\r\n");
+        for (name, value) in &headers {
+            request_bytes.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request_bytes.push_str("\r\n");
+        upstream_write.write_all(request_bytes.as_bytes()).await?;
+
+        // Write the buffered body (already read before credential injection)
+        if let Some(ref body_bytes) = body {
+            upstream_write.write_all(body_bytes).await?;
+        }
+        upstream_write.flush().await?;
+
+        // Read the upstream response and relay it back to the client
+        let mut upstream_reader = BufReader::new(upstream_read);
+        let response_info =
+            relay_upstream_response(&method, &mut upstream_reader, &mut write_half).await?;
+
+        // Check exit conditions
+        if client_wants_close || response_info.upstream_wants_close {
+            break;
         }
     }
 
+    // Shut down the client TLS connection
+    let _ = write_half.shutdown().await;
     Ok(())
+}
+
+/// Metadata extracted from a relayed upstream HTTP response.
+struct ResponseInfo {
+    /// True if the upstream sent `Connection: close` or the body was
+    /// framed by connection close (no Content-Length, no chunked).
+    upstream_wants_close: bool,
+}
+
+/// Read an HTTP response from `upstream` and forward it to `client`.
+///
+/// Handles Content-Length, Transfer-Encoding: chunked, and read-until-EOF
+/// body framing. Returns metadata about the response for keep-alive decisions.
+async fn relay_upstream_response<R, W>(
+    request_method: &str,
+    upstream: &mut BufReader<R>,
+    client: &mut W,
+) -> anyhow::Result<ResponseInfo>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    // Read and forward status line
+    let mut status_line = String::new();
+    upstream.read_line(&mut status_line).await?;
+    client.write_all(status_line.as_bytes()).await?;
+
+    // Parse status code for body-framing decisions
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+
+    // Read and forward headers, extracting framing info
+    let mut content_length: Option<usize> = None;
+    let mut chunked = false;
+    let mut connection_close = false;
+
+    loop {
+        let mut line = String::new();
+        upstream.read_line(&mut line).await?;
+        client.write_all(line.as_bytes()).await?;
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+
+        if let Some((k, v)) = trimmed.split_once(':') {
+            let key = k.trim();
+            let val = v.trim();
+            if key.eq_ignore_ascii_case("content-length") {
+                content_length = val.parse().ok();
+            } else if key.eq_ignore_ascii_case("transfer-encoding") {
+                chunked = val.to_ascii_lowercase().contains("chunked");
+            } else if key.eq_ignore_ascii_case("connection") {
+                connection_close = val.eq_ignore_ascii_case("close");
+            }
+        }
+    }
+
+    // Determine if this response carries a body.
+    // 1xx, 204, 304 never have a body; HEAD responses omit the body.
+    let has_body = !matches!(status_code, 100..=199 | 204 | 304)
+        && !request_method.eq_ignore_ascii_case("HEAD");
+
+    if has_body {
+        if let Some(len) = content_length {
+            // Fixed-length body
+            let mut remaining = len;
+            let mut buf = vec![0u8; 8192];
+            while remaining > 0 {
+                let to_read = buf.len().min(remaining);
+                let n = AsyncReadExt::read(upstream, &mut buf[..to_read]).await?;
+                if n == 0 {
+                    break;
+                }
+                client.write_all(&buf[..n]).await?;
+                remaining -= n;
+            }
+        } else if chunked {
+            // Chunked transfer encoding
+            loop {
+                // Read chunk size line
+                let mut chunk_line = String::new();
+                upstream.read_line(&mut chunk_line).await?;
+                client.write_all(chunk_line.as_bytes()).await?;
+
+                let size_str = chunk_line.trim().split(';').next().unwrap_or("0");
+                let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
+
+                if chunk_size == 0 {
+                    // Terminal chunk — read and forward trailers + final CRLF
+                    loop {
+                        let mut trailer = String::new();
+                        upstream.read_line(&mut trailer).await?;
+                        client.write_all(trailer.as_bytes()).await?;
+                        if trailer.trim().is_empty() {
+                            break;
+                        }
+                    }
+                    break;
+                }
+
+                // Read chunk data
+                let mut remaining = chunk_size;
+                let mut buf = vec![0u8; 8192];
+                while remaining > 0 {
+                    let to_read = buf.len().min(remaining);
+                    let n = AsyncReadExt::read(upstream, &mut buf[..to_read]).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    client.write_all(&buf[..n]).await?;
+                    remaining -= n;
+                }
+                // Read and forward the trailing \r\n after chunk data
+                let mut crlf = [0u8; 2];
+                AsyncReadExt::read_exact(upstream, &mut crlf).await?;
+                client.write_all(&crlf).await?;
+            }
+        } else {
+            // No Content-Length, no chunked: read until upstream closes (EOF)
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let n = AsyncReadExt::read(upstream, &mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                client.write_all(&buf[..n]).await?;
+            }
+            // Connection is closed by definition
+            connection_close = true;
+        }
+    }
+
+    client.flush().await?;
+
+    Ok(ResponseInfo {
+        upstream_wants_close: connection_close,
+    })
 }
 
 /// Build the HTTP 413 Payload Too Large response string.
@@ -356,12 +526,13 @@ Connection: close\r\n\
 ///
 /// The response includes properly formatted HTTP/1.1 headers with no leading
 /// whitespace and a Content-Length that exactly matches the body byte length.
+/// No `Connection: close` is included — the keep-alive loop continues after
+/// a deny, allowing the client to retry or send a different request.
 fn build_deny_response(body_bytes: &str) -> String {
     format!(
         "HTTP/1.1 403 Forbidden\r\n\
 Content-Type: application/json\r\n\
 Content-Length: {}\r\n\
-Connection: close\r\n\
 \r\n\
 {}",
         body_bytes.len(),
@@ -532,13 +703,14 @@ mod tests {
         // Header lines should not have leading whitespace
         assert_eq!(lines[1], "Content-Type: application/json");
         assert_eq!(lines[2], format!("Content-Length: {}", body.len()));
-        assert_eq!(lines[3], "Connection: close");
+
+        // No Connection: close — keep-alive loop continues after deny
 
         // Empty line separating headers from body
-        assert_eq!(lines[4], "");
+        assert_eq!(lines[3], "");
 
         // Body
-        assert_eq!(lines[5], body);
+        assert_eq!(lines[4], body);
     }
 
     #[test]
@@ -676,48 +848,50 @@ mod tests {
         assert_eq!(agent, "ci-bot", "case-insensitive header match");
     }
 
-    // --- Connection: close tests ---
+    // --- Keep-alive: Connection header pass-through tests ---
 
     #[test]
-    fn connection_close_injected_into_headers() {
-        let mut headers = vec![
+    fn connection_header_not_injected_on_outbound() {
+        // Verify that handle_mitm no longer force-injects Connection: close.
+        // The client's Connection header should be forwarded as-is.
+        let headers = vec![
             ("Host".to_string(), "api.github.com".to_string()),
             ("Accept".to_string(), "application/json".to_string()),
         ];
 
-        // Simulate the Connection: close injection logic from handle_mitm
-        headers.retain(|(k, _)| !k.eq_ignore_ascii_case("connection"));
-        headers.push(("Connection".to_string(), "close".to_string()));
-
+        // No Connection header present — none should be added
         let conn = headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("connection"));
-        assert!(conn.is_some(), "Connection header should be present");
-        assert_eq!(conn.unwrap().1, "close");
+        assert!(conn.is_none(), "Connection: close should not be injected");
     }
 
     #[test]
-    fn connection_close_replaces_existing_keepalive() {
-        let mut headers = vec![
+    fn client_keepalive_header_preserved() {
+        let headers = vec![
             ("Host".to_string(), "api.github.com".to_string()),
             ("Connection".to_string(), "keep-alive".to_string()),
         ];
 
-        // Simulate the Connection: close injection logic
-        headers.retain(|(k, _)| !k.eq_ignore_ascii_case("connection"));
-        headers.push(("Connection".to_string(), "close".to_string()));
-
-        let conn_count = headers
-            .iter()
-            .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
-            .count();
-        assert_eq!(conn_count, 1, "should have exactly one Connection header");
-
+        // Connection: keep-alive from client should be preserved (not replaced)
         let conn = headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("connection"))
             .unwrap();
-        assert_eq!(conn.1, "close");
+        assert_eq!(
+            conn.1, "keep-alive",
+            "client keep-alive should be preserved, not overwritten"
+        );
+    }
+
+    #[test]
+    fn deny_response_has_no_connection_close() {
+        let body = r#"{"error":"policy_denied"}"#;
+        let response = build_deny_response(body);
+        assert!(
+            !response.contains("Connection: close"),
+            "deny response should not include Connection: close"
+        );
     }
 
     // --- Body buffering tests ---

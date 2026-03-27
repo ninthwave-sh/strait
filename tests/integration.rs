@@ -112,6 +112,140 @@ async fn start_tls_echo_server() -> (std::net::SocketAddr, String, CertificateDe
     (addr, ca_cert_pem, ca_cert_der)
 }
 
+/// Start a local TLS server that echoes back HTTP requests with keep-alive support.
+/// Unlike `start_tls_echo_server`, this server does NOT send `Connection: close`
+/// and handles multiple sequential requests on the same TLS connection.
+/// Returns (addr, CA cert PEM, CA cert DER) so the test client can trust this server.
+async fn start_keepalive_echo_server() -> (std::net::SocketAddr, String, CertificateDer<'static>) {
+    let key_pair = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::default();
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "test-echo-ca");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&key_pair).unwrap();
+    let ca_cert_pem = ca_cert.pem();
+    let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
+
+    // Generate leaf cert for api.github.com
+    let leaf_key = KeyPair::generate().unwrap();
+    let mut leaf_params = CertificateParams::default();
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, "api.github.com");
+    leaf_params.subject_alt_names.push(rcgen::SanType::DnsName(
+        "api.github.com".try_into().unwrap(),
+    ));
+    leaf_params
+        .subject_alt_names
+        .push(rcgen::SanType::DnsName("localhost".try_into().unwrap()));
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &ca_cert, &key_pair)
+        .unwrap();
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![
+                CertificateDer::from(leaf_cert.der().to_vec()),
+                ca_cert_der.clone(),
+            ],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+        )
+        .unwrap();
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let tls = match acceptor.accept(stream).await {
+                    Ok(tls) => tls,
+                    Err(_) => return,
+                };
+
+                let (read_half, mut write_half) = tokio::io::split(tls);
+                let mut buf = BufReader::new(read_half);
+
+                loop {
+                    // Read request line
+                    let mut first_line = String::new();
+                    match buf.read_line(&mut first_line).await {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                    if first_line.trim().is_empty() {
+                        break;
+                    }
+
+                    let mut request_lines = vec![first_line.trim().to_string()];
+                    let mut content_length: Option<usize> = None;
+                    let mut connection_close = false;
+
+                    // Read headers
+                    loop {
+                        let mut line = String::new();
+                        if buf.read_line(&mut line).await.is_err() || line.trim().is_empty() {
+                            break;
+                        }
+                        let trimmed = line.trim().to_string();
+                        if let Some((k, v)) = trimmed.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                content_length = v.trim().parse().ok();
+                            }
+                            if k.trim().eq_ignore_ascii_case("connection")
+                                && v.trim().eq_ignore_ascii_case("close")
+                            {
+                                connection_close = true;
+                            }
+                        }
+                        request_lines.push(trimmed);
+                    }
+
+                    // Read request body
+                    let mut request_body = Vec::new();
+                    if let Some(len) = content_length {
+                        request_body.resize(len, 0);
+                        let _ = buf.read_exact(&mut request_body).await;
+                    }
+
+                    // Build echo response (NO Connection: close)
+                    let mut echo = request_lines.join("\n");
+                    if !request_body.is_empty() {
+                        echo.push_str("\n\n");
+                        echo.push_str(&String::from_utf8_lossy(&request_body));
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        echo.len(),
+                        echo
+                    );
+
+                    if write_half.write_all(response.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    if write_half.flush().await.is_err() {
+                        break;
+                    }
+
+                    if connection_close {
+                        break;
+                    }
+                }
+
+                let _ = write_half.shutdown().await;
+            });
+        }
+    });
+
+    (addr, ca_cert_pem, ca_cert_der)
+}
+
 /// Start a plain TCP echo server for passthrough testing.
 /// Returns the server address.
 async fn start_tcp_echo_server() -> std::net::SocketAddr {
@@ -825,6 +959,413 @@ async fn passthrough_non_mitm_aws_host() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// HTTP/1.1 keep-alive integration tests
+// ---------------------------------------------------------------------------
+
+/// Helper: read a single HTTP response from a BufReader, returning the full
+/// response string (status + headers + body). Uses Content-Length framing.
+async fn read_http_response<R: tokio::io::AsyncRead + Unpin>(reader: &mut BufReader<R>) -> String {
+    // Read status line
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).await.unwrap();
+
+    let mut header_text = String::new();
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        if line.trim().is_empty() {
+            header_text.push_str(&line);
+            break;
+        }
+        if let Some((k, v)) = line.trim().split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                content_length = v.trim().parse().ok();
+            }
+        }
+        header_text.push_str(&line);
+    }
+
+    let mut body = Vec::new();
+    if let Some(len) = content_length {
+        body.resize(len, 0);
+        reader.read_exact(&mut body).await.unwrap();
+    }
+
+    let mut response = status_line;
+    response.push_str(&header_text);
+    response.push_str(&String::from_utf8_lossy(&body));
+    response
+}
+
+/// Two sequential GET requests on the same CONNECT tunnel — both succeed,
+/// second request processed after first response completes.
+#[tokio::test]
+async fn keepalive_two_sequential_requests() {
+    let ca = strait_test_helpers::generate_ca();
+    let (echo_addr, _pem, _der) = start_keepalive_echo_server().await;
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ca_clone = ca.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        strait_test_helpers::handle_mitm_keepalive(
+            client,
+            peer,
+            &ca_clone,
+            echo_addr,
+            "api.github.com",
+        )
+        .await;
+    });
+
+    // Connect and CONNECT
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
+        .await
+        .unwrap();
+
+    // Read 200 + drain headers
+    let mut buf = BufReader::new(&mut client);
+    let mut response_line = String::new();
+    buf.read_line(&mut response_line).await.unwrap();
+    assert!(response_line.contains("200"));
+    loop {
+        let mut line = String::new();
+        buf.read_line(&mut line).await.unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+
+    // TLS handshake with proxy
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut cursor = std::io::Cursor::new(ca.ca_cert_pem.as_bytes());
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let server_name = ServerName::try_from("api.github.com").unwrap();
+    let client_inner = buf.into_inner();
+    let tls = connector.connect(server_name, client_inner).await.unwrap();
+
+    let (read_half, mut write_half) = tokio::io::split(tls);
+    let mut reader = BufReader::new(read_half);
+
+    // --- First request ---
+    write_half
+        .write_all(b"GET /repos/first HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+        .await
+        .unwrap();
+    let response1 = read_http_response(&mut reader).await;
+    assert!(
+        response1.contains("200 OK"),
+        "First request should get 200 OK, got: {}",
+        response1
+    );
+    assert!(
+        response1.contains("GET /repos/first"),
+        "First request path should be echoed, got: {}",
+        response1
+    );
+
+    // --- Second request (same connection) ---
+    write_half
+        .write_all(b"GET /repos/second HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+        .await
+        .unwrap();
+    let response2 = read_http_response(&mut reader).await;
+    assert!(
+        response2.contains("200 OK"),
+        "Second request should get 200 OK, got: {}",
+        response2
+    );
+    assert!(
+        response2.contains("GET /repos/second"),
+        "Second request path should be echoed, got: {}",
+        response2
+    );
+
+    // Clean up: send Connection: close to terminate
+    write_half
+        .write_all(b"GET /done HTTP/1.1\r\nHost: api.github.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let _ = read_http_response(&mut reader).await;
+}
+
+/// Client sends `Connection: close` — proxy processes the request and then
+/// closes the connection (no further requests accepted).
+#[tokio::test]
+async fn keepalive_client_connection_close_exits_loop() {
+    let ca = strait_test_helpers::generate_ca();
+    let (echo_addr, _pem, _der) = start_keepalive_echo_server().await;
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ca_clone = ca.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        strait_test_helpers::handle_mitm_keepalive(
+            client,
+            peer,
+            &ca_clone,
+            echo_addr,
+            "api.github.com",
+        )
+        .await;
+    });
+
+    // Connect, CONNECT, TLS handshake
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = BufReader::new(&mut client);
+    let mut response_line = String::new();
+    buf.read_line(&mut response_line).await.unwrap();
+    assert!(response_line.contains("200"));
+    loop {
+        let mut line = String::new();
+        buf.read_line(&mut line).await.unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut cursor = std::io::Cursor::new(ca.ca_cert_pem.as_bytes());
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let server_name = ServerName::try_from("api.github.com").unwrap();
+    let client_inner = buf.into_inner();
+    let tls = connector.connect(server_name, client_inner).await.unwrap();
+
+    let (read_half, mut write_half) = tokio::io::split(tls);
+    let mut reader = BufReader::new(read_half);
+
+    // Send request WITH Connection: close
+    write_half
+        .write_all(b"GET /final HTTP/1.1\r\nHost: api.github.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let response = read_http_response(&mut reader).await;
+    assert!(
+        response.contains("200 OK"),
+        "Request should succeed, got: {}",
+        response
+    );
+    assert!(
+        response.contains("GET /final"),
+        "Request path should be echoed, got: {}",
+        response
+    );
+
+    // Connection should be closed — read_to_end should return quickly
+    let mut remaining = Vec::new();
+    reader.read_to_end(&mut remaining).await.unwrap();
+    // No more data expected (connection closed by proxy)
+}
+
+/// Idle timeout fires — proxy closes the connection cleanly when no request
+/// arrives within the keep-alive timeout window.
+#[tokio::test]
+async fn keepalive_idle_timeout_closes_connection() {
+    let ca = strait_test_helpers::generate_ca();
+    let (echo_addr, _pem, _der) = start_keepalive_echo_server().await;
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ca_clone = ca.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        // Use a very short timeout (1s) so the test doesn't hang
+        strait_test_helpers::handle_mitm_keepalive_with_timeout(
+            client,
+            peer,
+            &ca_clone,
+            echo_addr,
+            "api.github.com",
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+    });
+
+    // Connect, CONNECT, TLS handshake
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = BufReader::new(&mut client);
+    let mut response_line = String::new();
+    buf.read_line(&mut response_line).await.unwrap();
+    assert!(response_line.contains("200"));
+    loop {
+        let mut line = String::new();
+        buf.read_line(&mut line).await.unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut cursor = std::io::Cursor::new(ca.ca_cert_pem.as_bytes());
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let server_name = ServerName::try_from("api.github.com").unwrap();
+    let client_inner = buf.into_inner();
+    let tls = connector.connect(server_name, client_inner).await.unwrap();
+
+    let (read_half, mut write_half) = tokio::io::split(tls);
+    let mut reader = BufReader::new(read_half);
+
+    // Send one request (keep connection alive)
+    write_half
+        .write_all(b"GET /hello HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+        .await
+        .unwrap();
+    let response = read_http_response(&mut reader).await;
+    assert!(response.contains("200 OK"));
+
+    // Wait for idle timeout (> 1s)
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // Connection should be closed by the proxy — read_to_end returns
+    let mut remaining = Vec::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        reader.read_to_end(&mut remaining),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "read_to_end should complete (proxy closed connection)"
+    );
+}
+
+/// Policy deny mid-loop — proxy sends 403 and the connection continues for
+/// the next request.
+#[tokio::test]
+async fn keepalive_deny_mid_loop_continues() {
+    let ca = strait_test_helpers::generate_ca();
+    let (echo_addr, _pem, _der) = start_keepalive_echo_server().await;
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ca_clone = ca.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        // Deny requests to /denied, allow everything else
+        strait_test_helpers::handle_mitm_keepalive_deny_path(
+            client,
+            peer,
+            &ca_clone,
+            echo_addr,
+            "api.github.com",
+            "/denied",
+        )
+        .await;
+    });
+
+    // Connect, CONNECT, TLS handshake
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = BufReader::new(&mut client);
+    let mut response_line = String::new();
+    buf.read_line(&mut response_line).await.unwrap();
+    assert!(response_line.contains("200"));
+    loop {
+        let mut line = String::new();
+        buf.read_line(&mut line).await.unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut cursor = std::io::Cursor::new(ca.ca_cert_pem.as_bytes());
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let server_name = ServerName::try_from("api.github.com").unwrap();
+    let client_inner = buf.into_inner();
+    let tls = connector.connect(server_name, client_inner).await.unwrap();
+
+    let (read_half, mut write_half) = tokio::io::split(tls);
+    let mut reader = BufReader::new(read_half);
+
+    // --- First request: denied ---
+    write_half
+        .write_all(b"GET /denied HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+        .await
+        .unwrap();
+    let response1 = read_http_response(&mut reader).await;
+    assert!(
+        response1.contains("403 Forbidden"),
+        "Denied request should get 403, got: {}",
+        response1
+    );
+    // Deny response should NOT have Connection: close
+    assert!(
+        !response1.contains("Connection: close"),
+        "Deny response should not include Connection: close, got: {}",
+        response1
+    );
+
+    // --- Second request: allowed (connection should still be open) ---
+    write_half
+        .write_all(b"GET /allowed HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+        .await
+        .unwrap();
+    let response2 = read_http_response(&mut reader).await;
+    assert!(
+        response2.contains("200 OK"),
+        "Allowed request should get 200, got: {}",
+        response2
+    );
+    assert!(
+        response2.contains("GET /allowed"),
+        "Allowed request path should be echoed, got: {}",
+        response2
+    );
+
+    // Clean up
+    write_half
+        .write_all(b"GET /done HTTP/1.1\r\nHost: api.github.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let _ = read_http_response(&mut reader).await;
+}
+
 /// Test helper module exposed for integration tests.
 mod strait_test_helpers {
     use super::*;
@@ -1277,6 +1818,410 @@ mod strait_test_helpers {
         let tls_client_inner = buf.into_inner();
         let _ = tls_client_inner.write_all(response.as_bytes()).await;
         let _ = tls_client_inner.shutdown().await;
+    }
+
+    // --- Keep-alive test helpers ---
+
+    /// Handle a MITM connection with HTTP/1.1 keep-alive support.
+    ///
+    /// Loops over sequential requests on the same TLS connection, forwarding
+    /// each to the upstream echo server and relaying the response back.
+    /// Exits when the client sends `Connection: close`, on EOF, or on upstream
+    /// `Connection: close`.
+    pub async fn handle_mitm_keepalive(
+        client: TcpStream,
+        _peer: std::net::SocketAddr,
+        ca: &TestCa,
+        upstream_addr: std::net::SocketAddr,
+        hostname: &str,
+    ) {
+        handle_mitm_keepalive_with_timeout(
+            client,
+            _peer,
+            ca,
+            upstream_addr,
+            hostname,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+    }
+
+    /// Like [`handle_mitm_keepalive`] but with a configurable idle timeout.
+    pub async fn handle_mitm_keepalive_with_timeout(
+        mut client: TcpStream,
+        _peer: std::net::SocketAddr,
+        ca: &TestCa,
+        upstream_addr: std::net::SocketAddr,
+        hostname: &str,
+        idle_timeout: std::time::Duration,
+    ) {
+        let mut buf = BufReader::new(&mut client);
+        // Read CONNECT line
+        let mut line = String::new();
+        buf.read_line(&mut line).await.unwrap();
+        // Drain headers
+        loop {
+            let mut l = String::new();
+            buf.read_line(&mut l).await.unwrap();
+            if l.trim().is_empty() {
+                break;
+            }
+        }
+        drop(buf);
+
+        // Send 200
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+
+        // Accept TLS from client using session CA
+        let (cert_chain, key) = ca.issue_leaf_cert(hostname);
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let tls_client = acceptor.accept(client).await.unwrap();
+
+        let (read_half, mut write_half) = tokio::io::split(tls_client);
+        let mut buf_reader = BufReader::new(read_half);
+
+        loop {
+            // Read request with idle timeout
+            let mut request_line = String::new();
+            let read_result =
+                tokio::time::timeout(idle_timeout, buf_reader.read_line(&mut request_line)).await;
+
+            match read_result {
+                Err(_) => break,    // timeout
+                Ok(Ok(0)) => break, // EOF
+                Ok(Err(_)) => break,
+                Ok(Ok(_)) => {}
+            }
+
+            if request_line.trim().is_empty() {
+                break;
+            }
+
+            let mut headers: Vec<(String, String)> = Vec::new();
+            let mut content_length: Option<usize> = None;
+            let mut client_close = false;
+
+            loop {
+                let mut h = String::new();
+                buf_reader.read_line(&mut h).await.unwrap();
+                if h.trim().is_empty() {
+                    break;
+                }
+                let trimmed = h.trim().to_string();
+                if let Some((k, v)) = trimmed.split_once(':') {
+                    let key = k.trim().to_string();
+                    let val = v.trim().to_string();
+                    if key.eq_ignore_ascii_case("content-length") {
+                        content_length = val.parse().ok();
+                    }
+                    if key.eq_ignore_ascii_case("connection") && val.eq_ignore_ascii_case("close") {
+                        client_close = true;
+                    }
+                    headers.push((key, val));
+                }
+            }
+
+            let mut request_body = Vec::new();
+            if let Some(len) = content_length {
+                request_body.resize(len, 0);
+                buf_reader.read_exact(&mut request_body).await.unwrap();
+            }
+
+            // Forward to echo server
+            let upstream_tcp = TcpStream::connect(upstream_addr).await.unwrap();
+            let client_config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+                .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+            let server_name = ServerName::try_from("localhost").unwrap();
+            let tls_upstream = connector.connect(server_name, upstream_tcp).await.unwrap();
+            let (upstream_read, mut upstream_write) = tokio::io::split(tls_upstream);
+
+            let mut req = request_line.clone();
+            for (k, v) in &headers {
+                req.push_str(&format!("{k}: {v}\r\n"));
+            }
+            req.push_str("\r\n");
+            upstream_write.write_all(req.as_bytes()).await.unwrap();
+            if !request_body.is_empty() {
+                upstream_write.write_all(&request_body).await.unwrap();
+            }
+            upstream_write.flush().await.unwrap();
+
+            // Read and relay response
+            let mut upstream_reader = BufReader::new(upstream_read);
+            let mut status = String::new();
+            upstream_reader.read_line(&mut status).await.unwrap();
+            write_half.write_all(status.as_bytes()).await.unwrap();
+
+            let mut resp_content_length: Option<usize> = None;
+            let mut upstream_close = false;
+            let mut resp_headers = String::new();
+            loop {
+                let mut line = String::new();
+                upstream_reader.read_line(&mut line).await.unwrap();
+                resp_headers.push_str(&line);
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.trim().split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        resp_content_length = v.trim().parse().ok();
+                    }
+                    if k.trim().eq_ignore_ascii_case("connection")
+                        && v.trim().eq_ignore_ascii_case("close")
+                    {
+                        upstream_close = true;
+                    }
+                }
+            }
+            write_half.write_all(resp_headers.as_bytes()).await.unwrap();
+
+            if let Some(len) = resp_content_length {
+                let mut remaining = len;
+                let mut buf = vec![0u8; 8192];
+                while remaining > 0 {
+                    let to_read = buf.len().min(remaining);
+                    let n = upstream_reader.read(&mut buf[..to_read]).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    write_half.write_all(&buf[..n]).await.unwrap();
+                    remaining -= n;
+                }
+            } else {
+                // Read until EOF
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    let n = upstream_reader.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    write_half.write_all(&buf[..n]).await.unwrap();
+                }
+                upstream_close = true;
+            }
+
+            write_half.flush().await.unwrap();
+
+            if client_close || upstream_close {
+                break;
+            }
+        }
+
+        let _ = write_half.shutdown().await;
+    }
+
+    /// Keep-alive MITM handler that denies requests to a specific path with 403
+    /// and forwards all other requests normally.
+    pub async fn handle_mitm_keepalive_deny_path(
+        mut client: TcpStream,
+        _peer: std::net::SocketAddr,
+        ca: &TestCa,
+        upstream_addr: std::net::SocketAddr,
+        hostname: &str,
+        deny_path: &str,
+    ) {
+        let mut buf = BufReader::new(&mut client);
+        let mut line = String::new();
+        buf.read_line(&mut line).await.unwrap();
+        loop {
+            let mut l = String::new();
+            buf.read_line(&mut l).await.unwrap();
+            if l.trim().is_empty() {
+                break;
+            }
+        }
+        drop(buf);
+
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+
+        let (cert_chain, key) = ca.issue_leaf_cert(hostname);
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let tls_client = acceptor.accept(client).await.unwrap();
+
+        let (read_half, mut write_half) = tokio::io::split(tls_client);
+        let mut buf_reader = BufReader::new(read_half);
+
+        loop {
+            let mut request_line = String::new();
+            let read_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                buf_reader.read_line(&mut request_line),
+            )
+            .await;
+
+            match read_result {
+                Err(_) => break,
+                Ok(Ok(0)) => break,
+                Ok(Err(_)) => break,
+                Ok(Ok(_)) => {}
+            }
+
+            if request_line.trim().is_empty() {
+                break;
+            }
+
+            let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+            let method = parts.first().copied().unwrap_or("GET");
+            let path = parts.get(1).copied().unwrap_or("/");
+
+            let mut headers: Vec<(String, String)> = Vec::new();
+            let mut content_length: Option<usize> = None;
+            let mut client_close = false;
+
+            loop {
+                let mut h = String::new();
+                buf_reader.read_line(&mut h).await.unwrap();
+                if h.trim().is_empty() {
+                    break;
+                }
+                let trimmed = h.trim().to_string();
+                if let Some((k, v)) = trimmed.split_once(':') {
+                    let key = k.trim().to_string();
+                    let val = v.trim().to_string();
+                    if key.eq_ignore_ascii_case("content-length") {
+                        content_length = val.parse().ok();
+                    }
+                    if key.eq_ignore_ascii_case("connection") && val.eq_ignore_ascii_case("close") {
+                        client_close = true;
+                    }
+                    headers.push((key, val));
+                }
+            }
+
+            let mut request_body = Vec::new();
+            if let Some(len) = content_length {
+                request_body.resize(len, 0);
+                buf_reader.read_exact(&mut request_body).await.unwrap();
+            }
+
+            // Check if this path should be denied
+            if path == deny_path {
+                let body = serde_json::json!({
+                    "error": "policy_denied",
+                    "message": format!("Request denied: {} {}", method, path),
+                    "host": hostname,
+                    "method": method,
+                    "path": path,
+                });
+                let body_bytes = serde_json::to_string(&body).unwrap();
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     \r\n\
+                     {}",
+                    body_bytes.len(),
+                    body_bytes
+                );
+                write_half.write_all(response.as_bytes()).await.unwrap();
+                write_half.flush().await.unwrap();
+
+                if client_close {
+                    break;
+                }
+                continue;
+            }
+
+            // Forward to echo server
+            let upstream_tcp = TcpStream::connect(upstream_addr).await.unwrap();
+            let client_config = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+                .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+            let server_name = ServerName::try_from("localhost").unwrap();
+            let tls_upstream = connector.connect(server_name, upstream_tcp).await.unwrap();
+            let (upstream_read, mut upstream_write) = tokio::io::split(tls_upstream);
+
+            let mut req = request_line.clone();
+            for (k, v) in &headers {
+                req.push_str(&format!("{k}: {v}\r\n"));
+            }
+            req.push_str("\r\n");
+            upstream_write.write_all(req.as_bytes()).await.unwrap();
+            if !request_body.is_empty() {
+                upstream_write.write_all(&request_body).await.unwrap();
+            }
+            upstream_write.flush().await.unwrap();
+
+            // Read and relay response
+            let mut upstream_reader = BufReader::new(upstream_read);
+            let mut status = String::new();
+            upstream_reader.read_line(&mut status).await.unwrap();
+            write_half.write_all(status.as_bytes()).await.unwrap();
+
+            let mut resp_content_length: Option<usize> = None;
+            let mut upstream_close = false;
+            let mut resp_headers = String::new();
+            loop {
+                let mut line = String::new();
+                upstream_reader.read_line(&mut line).await.unwrap();
+                resp_headers.push_str(&line);
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.trim().split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        resp_content_length = v.trim().parse().ok();
+                    }
+                    if k.trim().eq_ignore_ascii_case("connection")
+                        && v.trim().eq_ignore_ascii_case("close")
+                    {
+                        upstream_close = true;
+                    }
+                }
+            }
+            write_half.write_all(resp_headers.as_bytes()).await.unwrap();
+
+            if let Some(len) = resp_content_length {
+                let mut remaining = len;
+                let mut buf = vec![0u8; 8192];
+                while remaining > 0 {
+                    let to_read = buf.len().min(remaining);
+                    let n = upstream_reader.read(&mut buf[..to_read]).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    write_half.write_all(&buf[..n]).await.unwrap();
+                    remaining -= n;
+                }
+            } else {
+                let mut buf = vec![0u8; 8192];
+                loop {
+                    let n = upstream_reader.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    write_half.write_all(&buf[..n]).await.unwrap();
+                }
+                upstream_close = true;
+            }
+
+            write_half.flush().await.unwrap();
+
+            if client_close || upstream_close {
+                break;
+            }
+        }
+
+        let _ = write_half.shutdown().await;
     }
 
     /// Certificate verifier that accepts any certificate (for test echo server).

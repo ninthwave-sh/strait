@@ -37,6 +37,7 @@ hosts = [
     "s3.us-east-1.amazonaws.com",
     "lambda.us-east-1.amazonaws.com",
 ]
+keepalive_timeout_secs = 30    # Close idle MITM connections after this many seconds (default: 30)
 
 # ---------------------------------------------------------------------------
 # [policy] — Cedar policy for request authorization.

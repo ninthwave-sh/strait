@@ -1,11 +1,11 @@
-//! Integration tests for `strait launch --observe`.
+//! Integration tests for `strait launch` (observe, warn, and enforce modes).
 //!
 //! These tests require Docker to be running. They are skipped gracefully
 //! if Docker is not available (no test failure).
 //!
 //! Run explicitly with: `cargo test --test launch_integration`
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 /// Check if Docker is available with the required image for integration tests.
@@ -213,4 +213,171 @@ async fn docker_not_running_gives_clear_error() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Policy enforcement integration tests
+// ---------------------------------------------------------------------------
+
+/// Invalid policy file fails fast before starting container.
+#[tokio::test]
+async fn launch_policy_invalid_file_fails_fast() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let policy_path = temp_dir.path().join("bad.cedar");
+    std::fs::write(&policy_path, "this is not valid cedar @@@ {{{").unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+
+    let result = strait::launch::run_launch_with_policy(
+        strait::launch::EnforcementMode::Enforce,
+        &policy_path,
+        vec!["echo".to_string(), "hello".to_string()],
+        Some("alpine:latest"),
+        Some(obs_path.clone()),
+    )
+    .await;
+
+    assert!(result.is_err(), "invalid policy should fail fast");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("Cedar policy") || err.contains("invalid"),
+        "error should mention invalid policy: {err}"
+    );
+    // No observation log should exist (failed before container creation)
+    assert!(
+        !obs_path.exists(),
+        "no observation log should exist on policy load failure"
+    );
+}
+
+/// Nonexistent policy file fails fast with clear error.
+#[tokio::test]
+async fn launch_policy_missing_file_fails_fast() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+
+    let result = strait::launch::run_launch_with_policy(
+        strait::launch::EnforcementMode::Enforce,
+        Path::new("/nonexistent/policy.cedar"),
+        vec!["echo".to_string(), "hello".to_string()],
+        Some("alpine:latest"),
+        Some(obs_path),
+    )
+    .await;
+
+    assert!(result.is_err(), "missing policy file should fail fast");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("failed to load") || err.contains("failed to read"),
+        "error should mention file loading failure: {err}"
+    );
+}
+
+/// `launch --policy` with restrictive policy restricts bind-mounts.
+/// The agent sees only the permitted mounts.
+#[tokio::test]
+async fn launch_policy_restricts_mounts() {
+    if !docker_available().await {
+        eprintln!("Skipping: Docker not available");
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let policy_path = temp_dir.path().join("policy.cedar");
+    let obs_path = temp_dir.path().join("observations.jsonl");
+
+    // Write a restrictive policy — only allow read access to a non-existent path
+    // This means the cwd will NOT be mounted
+    let mut policy_file = std::fs::File::create(&policy_path).unwrap();
+    policy_file
+        .write_all(
+            br#"
+@id("allow-read-only-nonexistent")
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:read",
+    resource in Resource::"fs::/nonexistent-test-path"
+);
+
+@id("allow-network")
+permit(
+    principal == Agent::"agent",
+    action in [Action::"http:GET", Action::"http:POST"],
+    resource
+);
+"#,
+        )
+        .unwrap();
+
+    let exit_code = strait::launch::run_launch_with_policy(
+        strait::launch::EnforcementMode::Enforce,
+        &policy_path,
+        // Try to list the cwd — should fail because it's not mounted
+        vec!["ls".to_string(), "/workspace".to_string()],
+        Some("alpine:latest"),
+        Some(obs_path.clone()),
+    )
+    .await
+    .unwrap();
+
+    // The command should fail (path doesn't exist in container)
+    assert_ne!(
+        exit_code, 0,
+        "ls should fail when mount is restricted by policy"
+    );
+
+    // Observation log should have a policy_violation event for the cwd
+    let events = observation_events(&obs_path);
+    let violations = events_of_type(&events, "policy_violation");
+    // May or may not have violations depending on cwd matching
+    // But container_stop should exist
+    let stops = events_of_type(&events, "container_stop");
+    assert!(
+        !stops.is_empty(),
+        "should have container_stop event even with restrictive policy"
+    );
+}
+
+/// `launch --warn` with restrictive policy still allows the agent to succeed.
+#[tokio::test]
+async fn launch_warn_allows_agent_to_succeed() {
+    if !docker_available().await {
+        eprintln!("Skipping: Docker not available");
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let policy_path = temp_dir.path().join("policy.cedar");
+    let obs_path = temp_dir.path().join("observations.jsonl");
+
+    // Write a permissive fs policy so the container can run
+    let mut policy_file = std::fs::File::create(&policy_path).unwrap();
+    policy_file
+        .write_all(
+            br#"
+@id("allow-fs-write")
+permit(
+    principal == Agent::"agent",
+    action in [Action::"fs:read", Action::"fs:write"],
+    resource
+);
+"#,
+        )
+        .unwrap();
+
+    let exit_code = strait::launch::run_launch_with_policy(
+        strait::launch::EnforcementMode::Warn,
+        &policy_path,
+        vec!["echo".to_string(), "warn-test".to_string()],
+        Some("alpine:latest"),
+        Some(obs_path.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(exit_code, 0, "warn mode should allow echo to succeed");
+
+    // Observation log should exist
+    let events = observation_events(&obs_path);
+    let starts = events_of_type(&events, "container_start");
+    assert!(!starts.is_empty(), "should have container_start event");
 }

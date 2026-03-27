@@ -309,6 +309,7 @@ pub async fn handle_mitm(
                 path: path.clone(),
                 decision: decision_str.to_string(),
                 latency_us: eval_start.elapsed().as_micros() as u64,
+                enforcement_mode: String::new(),
             });
         }
 

@@ -577,7 +577,7 @@ pub fn build_proc_entities(command: &str, agent_id: &str) -> anyhow::Result<Enti
 }
 
 /// Escape a string for use in a Cedar string literal.
-fn escape_cedar_string(s: &str) -> String {
+pub(crate) fn escape_cedar_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 

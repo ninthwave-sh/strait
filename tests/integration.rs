@@ -1812,7 +1812,7 @@ fn e2e_roundtrip_observe_generate_replay() {
     // --- Phase 3: Replay ---
     // Run `strait test --replay observations.jsonl --policy generated.cedar`
     // to verify all observed events match the generated policy (exit 0).
-    let replay_result = strait::replay::replay(&obs_log_path, &policy_path).unwrap();
+    let replay_result = strait::replay::replay(&obs_log_path, &policy_path, None).unwrap();
 
     assert!(
         replay_result.mismatches.is_empty(),
@@ -1889,7 +1889,7 @@ fn e2e_enforce_denies_unauthorized_actions() {
     strait::generate::generate(&obs_log_path, &policy_path, &schema_path).unwrap();
 
     // Verify the authorized observations replay cleanly
-    let authorized_result = strait::replay::replay(&obs_log_path, &policy_path).unwrap();
+    let authorized_result = strait::replay::replay(&obs_log_path, &policy_path, None).unwrap();
     assert!(
         authorized_result.mismatches.is_empty(),
         "authorized observations should replay cleanly"
@@ -1933,7 +1933,7 @@ fn e2e_enforce_denies_unauthorized_actions() {
 
     drop(bad_obs);
 
-    let bad_result = strait::replay::replay(&bad_obs_log_path, &policy_path).unwrap();
+    let bad_result = strait::replay::replay(&bad_obs_log_path, &policy_path, None).unwrap();
 
     // All unauthorized events should be mismatches (policy denies them)
     assert_eq!(
@@ -2019,7 +2019,7 @@ fn e2e_roundtrip_filesystem_only() {
     );
 
     // Replay should match all events
-    let result = strait::replay::replay(&obs_log_path, &policy_path).unwrap();
+    let result = strait::replay::replay(&obs_log_path, &policy_path, None).unwrap();
     assert!(
         result.mismatches.is_empty(),
         "filesystem-only round-trip should be consistent"
@@ -2083,7 +2083,7 @@ fn e2e_roundtrip_network_only() {
     );
 
     // Replay should match all events
-    let result = strait::replay::replay(&obs_log_path, &policy_path).unwrap();
+    let result = strait::replay::replay(&obs_log_path, &policy_path, None).unwrap();
     assert!(
         result.mismatches.is_empty(),
         "network-only round-trip should be consistent"
@@ -2271,7 +2271,7 @@ fn e2e_roundtrip_full_lifecycle_mixed_events() {
     strait::generate::generate(&obs_log_path, &policy_path, &schema_path).unwrap();
 
     // Replay
-    let result = strait::replay::replay(&obs_log_path, &policy_path).unwrap();
+    let result = strait::replay::replay(&obs_log_path, &policy_path, None).unwrap();
 
     assert_eq!(result.total, 7, "total events in log");
     assert_eq!(result.skipped, 2, "container start/stop should be skipped");
@@ -2310,7 +2310,7 @@ fn e2e_roundtrip_full_lifecycle_mixed_events() {
 
     drop(bad_obs);
 
-    let bad_result = strait::replay::replay(&bad_obs_path, &policy_path).unwrap();
+    let bad_result = strait::replay::replay(&bad_obs_path, &policy_path, None).unwrap();
     assert_eq!(
         bad_result.mismatches.len(),
         2,

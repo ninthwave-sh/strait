@@ -12,10 +12,14 @@ use std::str::FromStr;
 
 use cedar_policy::{
     Authorizer, Context, Decision, EntityId, EntityTypeName, EntityUid, PolicySet, Request,
+    RestrictedExpression,
 };
 
+use crate::credentials::parse_aws_host;
 use crate::observe::{EventKind, ObservationEvent};
-use crate::policy::{build_fs_entities, build_http_entity_hierarchy, build_proc_entities};
+use crate::policy::{
+    build_fs_entities, build_http_entity_hierarchy, build_proc_entities, escape_cedar_string,
+};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -51,7 +55,14 @@ pub struct Mismatch {
 ///
 /// Loads the policy file, reads every event from the JSONL log, evaluates
 /// each evaluable event against the policy, and returns the results.
-pub fn replay(observations_path: &Path, policy_path: &Path) -> anyhow::Result<ReplayResult> {
+///
+/// The `agent_id` parameter specifies the Cedar principal identity to use
+/// during evaluation. If `None`, defaults to `"agent"`.
+pub fn replay(
+    observations_path: &Path,
+    policy_path: &Path,
+    agent_id: Option<&str>,
+) -> anyhow::Result<ReplayResult> {
     // Load the Cedar policy first — fail fast on invalid policy.
     let policy_text = std::fs::read_to_string(policy_path).map_err(|e| {
         anyhow::anyhow!(
@@ -65,6 +76,9 @@ pub fn replay(observations_path: &Path, policy_path: &Path) -> anyhow::Result<Re
 
     let authorizer = Authorizer::new();
 
+    // Resolve agent identity: use the provided value, or fall back to default.
+    let agent = agent_id.unwrap_or(DEFAULT_AGENT_ID);
+
     // Read and process the observation log.
     let events = read_observations(observations_path)?;
     let total = events.len();
@@ -75,7 +89,7 @@ pub fn replay(observations_path: &Path, policy_path: &Path) -> anyhow::Result<Re
     for (idx, event) in events.iter().enumerate() {
         let line = idx + 1;
 
-        match evaluate_event(event, &policy_set, &authorizer) {
+        match evaluate_event(event, &policy_set, &authorizer, agent) {
             EventEvaluation::Match => {
                 matches += 1;
             }
@@ -168,8 +182,9 @@ fn read_observations(path: &Path) -> anyhow::Result<Vec<ObservationEvent>> {
 // Event evaluation
 // ---------------------------------------------------------------------------
 
-/// The default agent identity used for replay evaluation.
-const REPLAY_AGENT_ID: &str = "agent";
+/// The default agent identity used for replay evaluation when no agent ID
+/// is specified by the caller.
+const DEFAULT_AGENT_ID: &str = "agent";
 
 enum EventEvaluation {
     /// The policy decision matches the observed decision.
@@ -188,6 +203,7 @@ fn evaluate_event(
     event: &ObservationEvent,
     policy_set: &PolicySet,
     authorizer: &Authorizer,
+    agent_id: &str,
 ) -> EventEvaluation {
     match &event.event {
         EventKind::NetworkRequest {
@@ -198,16 +214,22 @@ fn evaluate_event(
             ..
         } => {
             let action_str = format!("http:{method}");
-            let entities = match build_http_entity_hierarchy(host, path, REPLAY_AGENT_ID) {
+            let entities = match build_http_entity_hierarchy(host, path, agent_id) {
                 Ok(e) => e,
                 Err(_) => return EventEvaluation::Skip,
             };
 
+            let context = match build_http_context(host, path, method) {
+                Ok(c) => c,
+                Err(_) => return EventEvaluation::Skip,
+            };
+
             let policy_allowed = cedar_evaluate(
-                REPLAY_AGENT_ID,
+                agent_id,
                 &action_str,
                 &build_http_resource_id(host, path),
                 &entities,
+                &context,
                 policy_set,
                 authorizer,
             );
@@ -232,16 +254,22 @@ fn evaluate_event(
         EventKind::FsAccess { path, operation } => {
             let action_str = format!("fs:{operation}");
             let resource_id = format!("fs::{path}");
-            let entities = match build_fs_entities(path, REPLAY_AGENT_ID) {
+            let entities = match build_fs_entities(path, agent_id) {
                 Ok(e) => e,
                 Err(_) => return EventEvaluation::Skip,
             };
 
+            let context = match build_fs_context(path, operation) {
+                Ok(c) => c,
+                Err(_) => return EventEvaluation::Skip,
+            };
+
             let policy_allowed = cedar_evaluate(
-                REPLAY_AGENT_ID,
+                agent_id,
                 &action_str,
                 &resource_id,
                 &entities,
+                &context,
                 policy_set,
                 authorizer,
             );
@@ -259,16 +287,22 @@ fn evaluate_event(
 
         EventKind::ProcExec { command, .. } => {
             let resource_id = format!("proc::{command}");
-            let entities = match build_proc_entities(command, REPLAY_AGENT_ID) {
+            let entities = match build_proc_entities(command, agent_id) {
                 Ok(e) => e,
                 Err(_) => return EventEvaluation::Skip,
             };
 
+            let context = match build_proc_context(command) {
+                Ok(c) => c,
+                Err(_) => return EventEvaluation::Skip,
+            };
+
             let policy_allowed = cedar_evaluate(
-                REPLAY_AGENT_ID,
+                agent_id,
                 "proc:exec",
                 &resource_id,
                 &entities,
+                &context,
                 policy_set,
                 authorizer,
             );
@@ -284,18 +318,24 @@ fn evaluate_event(
             }
         }
 
-        EventKind::Mount { path, .. } => {
+        EventKind::Mount { path, mode } => {
             let resource_id = format!("fs::{path}");
-            let entities = match build_fs_entities(path, REPLAY_AGENT_ID) {
+            let entities = match build_fs_entities(path, agent_id) {
                 Ok(e) => e,
                 Err(_) => return EventEvaluation::Skip,
             };
 
+            let context = match build_mount_context(path, mode) {
+                Ok(c) => c,
+                Err(_) => return EventEvaluation::Skip,
+            };
+
             let policy_allowed = cedar_evaluate(
-                REPLAY_AGENT_ID,
+                agent_id,
                 "fs:mount",
                 &resource_id,
                 &entities,
+                &context,
                 policy_set,
                 authorizer,
             );
@@ -324,6 +364,7 @@ fn cedar_evaluate(
     action: &str,
     resource_id: &str,
     entities: &cedar_policy::Entities,
+    context: &Context,
     policy_set: &PolicySet,
     authorizer: &Authorizer,
 ) -> bool {
@@ -342,15 +383,109 @@ fn cedar_evaluate(
         EntityId::from_str(resource_id).unwrap(),
     );
 
-    let context = Context::empty();
-
-    let request = match Request::new(principal, action_uid, resource, context, None) {
+    let request = match Request::new(principal, action_uid, resource, context.clone(), None) {
         Ok(r) => r,
         Err(_) => return false,
     };
 
     let response = authorizer.is_authorized(&request, policy_set, entities);
     response.decision() == Decision::Allow
+}
+
+// ---------------------------------------------------------------------------
+// Context builders
+// ---------------------------------------------------------------------------
+
+/// Build a Cedar context for an HTTP network request.
+///
+/// Populates `host`, `path`, and `method` attributes, plus AWS-specific
+/// `aws_service` and `aws_region` when the host is an AWS endpoint.
+/// This mirrors the context construction in `PolicyEngine::evaluate()`.
+fn build_http_context(host: &str, path: &str, method: &str) -> anyhow::Result<Context> {
+    let mut pairs: Vec<(String, RestrictedExpression)> = vec![
+        (
+            "host".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(host))).unwrap(),
+        ),
+        (
+            "path".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path))).unwrap(),
+        ),
+        (
+            "method".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(method)))
+                .unwrap(),
+        ),
+    ];
+
+    // Add AWS-specific context attributes when the host is an AWS endpoint.
+    if let Some(aws_info) = parse_aws_host(host) {
+        pairs.push((
+            "aws_service".to_string(),
+            RestrictedExpression::from_str(&format!(
+                "\"{}\"",
+                escape_cedar_string(&aws_info.service)
+            ))
+            .unwrap(),
+        ));
+        let region = aws_info.region.as_deref().unwrap_or("us-east-1");
+        pairs.push((
+            "aws_region".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(region)))
+                .unwrap(),
+        ));
+    }
+
+    Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build HTTP context: {e}"))
+}
+
+/// Build a Cedar context for a filesystem access event.
+///
+/// Populates `path` and `operation` attributes.
+fn build_fs_context(path: &str, operation: &str) -> anyhow::Result<Context> {
+    let pairs: Vec<(String, RestrictedExpression)> = vec![
+        (
+            "path".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path))).unwrap(),
+        ),
+        (
+            "operation".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(operation)))
+                .unwrap(),
+        ),
+    ];
+
+    Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build fs context: {e}"))
+}
+
+/// Build a Cedar context for a process execution event.
+///
+/// Populates `command` attribute.
+fn build_proc_context(command: &str) -> anyhow::Result<Context> {
+    let pairs: Vec<(String, RestrictedExpression)> = vec![(
+        "command".to_string(),
+        RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(command))).unwrap(),
+    )];
+
+    Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build proc context: {e}"))
+}
+
+/// Build a Cedar context for a mount event.
+///
+/// Populates `path` and `mode` attributes.
+fn build_mount_context(path: &str, mode: &str) -> anyhow::Result<Context> {
+    let pairs: Vec<(String, RestrictedExpression)> = vec![
+        (
+            "path".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path))).unwrap(),
+        ),
+        (
+            "mode".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(mode))).unwrap(),
+        ),
+    ];
+
+    Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build mount context: {e}"))
 }
 
 /// Build a resource ID for an HTTP request (mirrors `policy.rs::build_resource_id`).
@@ -484,7 +619,7 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path).unwrap();
+        let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.matches, 2);
         assert!(result.mismatches.is_empty());
         assert_eq!(result.skipped, 0);
@@ -514,7 +649,7 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path).unwrap();
+        let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.matches, 1);
         assert_eq!(result.mismatches.len(), 1);
 
@@ -541,7 +676,7 @@ permit(
 
         let policy_path = write_policy(&dir, "permit(principal, action, resource);");
 
-        let result = replay(&obs_path, &policy_path);
+        let result = replay(&obs_path, &policy_path, None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -566,7 +701,7 @@ permit(
 
         let policy_path = write_policy(&dir, "this is not valid cedar policy syntax!!!");
 
-        let result = replay(&obs_path, &policy_path);
+        let result = replay(&obs_path, &policy_path, None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -609,7 +744,7 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path).unwrap();
+        let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.total, 3);
         assert_eq!(result.matches, 1);
         assert_eq!(result.skipped, 2);
@@ -635,7 +770,7 @@ permit(
         let policy = "// empty policy — deny all\n";
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path).unwrap();
+        let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.matches, 1);
         assert!(result.mismatches.is_empty());
         assert_eq!(print_results(&result), 0);
@@ -664,7 +799,7 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path).unwrap();
+        let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.matches, 1);
         assert!(result.mismatches.is_empty());
     }
@@ -693,7 +828,7 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path).unwrap();
+        let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.mismatches.len(), 1);
         assert_eq!(result.mismatches[0].observed, "passthrough");
         assert_eq!(result.mismatches[0].policy_decision, "deny");
@@ -713,7 +848,7 @@ permit(
         let obs_path = write_observations(&dir, &events);
         let policy_path = dir.path().join("nonexistent.cedar");
 
-        let result = replay(&obs_path, &policy_path);
+        let result = replay(&obs_path, &policy_path, None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -730,7 +865,7 @@ permit(
         let obs_path = dir.path().join("nonexistent.jsonl");
         let policy_path = write_policy(&dir, "permit(principal, action, resource);");
 
-        let result = replay(&obs_path, &policy_path);
+        let result = replay(&obs_path, &policy_path, None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -763,7 +898,7 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path).unwrap();
+        let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.matches, 1);
         assert!(result.mismatches.is_empty());
     }
@@ -792,7 +927,7 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path).unwrap();
+        let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.matches, 1);
         assert!(result.mismatches.is_empty());
     }
@@ -821,7 +956,7 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path).unwrap();
+        let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.matches, 1);
         assert!(result.mismatches.is_empty());
     }
@@ -836,7 +971,7 @@ permit(
 
         let policy_path = write_policy(&dir, "permit(principal, action, resource);");
 
-        let result = replay(&obs_path, &policy_path).unwrap();
+        let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.total, 0);
         assert_eq!(result.matches, 0);
         assert!(result.mismatches.is_empty());
@@ -868,8 +1003,244 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path).unwrap();
+        let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.total, 2);
         assert_eq!(result.matches, 2);
+    }
+
+    // -- Context: path condition on HTTP events --------------------------------
+
+    #[test]
+    fn context_path_condition_evaluated_for_http() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let events = vec![
+            // This path matches the /admin/* pattern
+            make_network_event("GET", "api.example.com", "/admin/users", "allow"),
+            // This path does NOT match the /admin/* pattern
+            make_network_event("GET", "api.example.com", "/public/docs", "allow"),
+        ];
+        let obs_path = write_observations(&dir, &events);
+
+        // Policy only allows GET to paths matching /admin/*
+        let policy = r#"
+permit(
+  principal,
+  action == Action::"http:GET",
+  resource
+) when { context.path like "/admin/*" };
+"#;
+        let policy_path = write_policy(&dir, policy);
+
+        let result = replay(&obs_path, &policy_path, None).unwrap();
+        // First event matches (path is /admin/users)
+        // Second event mismatches (path is /public/docs, policy denies)
+        assert_eq!(result.matches, 1, "only /admin/users should match");
+        assert_eq!(result.mismatches.len(), 1, "/public/docs should mismatch");
+        assert_eq!(result.mismatches[0].policy_decision, "deny");
+    }
+
+    // -- Context: host condition on HTTP events --------------------------------
+
+    #[test]
+    fn context_host_condition_evaluated_for_http() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let events = vec![
+            make_network_event("GET", "api.github.com", "/repos", "allow"),
+            make_network_event("GET", "evil.example.com", "/repos", "allow"),
+        ];
+        let obs_path = write_observations(&dir, &events);
+
+        let policy = r#"
+permit(
+  principal,
+  action == Action::"http:GET",
+  resource
+) when { context.host == "api.github.com" };
+"#;
+        let policy_path = write_policy(&dir, policy);
+
+        let result = replay(&obs_path, &policy_path, None).unwrap();
+        assert_eq!(result.matches, 1, "only api.github.com should match");
+        assert_eq!(result.mismatches.len(), 1);
+    }
+
+    // -- Context: method condition on HTTP events ------------------------------
+
+    #[test]
+    fn context_method_condition_evaluated_for_http() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let events = vec![
+            make_network_event("GET", "api.github.com", "/repos", "allow"),
+            make_network_event("DELETE", "api.github.com", "/repos", "allow"),
+        ];
+        let obs_path = write_observations(&dir, &events);
+
+        // Allow all actions but only when method is GET
+        let policy = r#"
+permit(
+  principal,
+  action,
+  resource
+) when { context.method == "GET" };
+"#;
+        let policy_path = write_policy(&dir, policy);
+
+        let result = replay(&obs_path, &policy_path, None).unwrap();
+        assert_eq!(result.matches, 1, "only GET should match");
+        assert_eq!(result.mismatches.len(), 1, "DELETE should mismatch");
+    }
+
+    // -- Agent-specific policy uses correct principal --------------------------
+
+    #[test]
+    fn agent_specific_policy_uses_correct_principal() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let events = vec![make_network_event(
+            "GET",
+            "api.github.com",
+            "/repos",
+            "allow",
+        )];
+        let obs_path = write_observations(&dir, &events);
+
+        // Policy only allows principal "worker"
+        let policy = r#"
+permit(
+  principal == Agent::"worker",
+  action == Action::"http:GET",
+  resource in Resource::"api.github.com"
+);
+"#;
+        let policy_path = write_policy(&dir, policy);
+
+        // Default agent ("agent") should NOT match "worker"-only policy
+        let result = replay(&obs_path, &policy_path, None).unwrap();
+        assert_eq!(
+            result.mismatches.len(),
+            1,
+            "default agent should not match worker-only policy"
+        );
+
+        // Specifying agent_id = "worker" should match
+        let result = replay(&obs_path, &policy_path, Some("worker")).unwrap();
+        assert_eq!(result.matches, 1, "worker agent should match");
+        assert!(result.mismatches.is_empty());
+    }
+
+    // -- FS context: path condition -------------------------------------------
+
+    #[test]
+    fn fs_context_path_condition_evaluated() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let events = vec![
+            ObservationEvent {
+                timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+                event: EventKind::FsAccess {
+                    path: "/workspace/secret/keys".to_string(),
+                    operation: "read".to_string(),
+                },
+            },
+            ObservationEvent {
+                timestamp: "2026-03-27T00:00:01.000Z".to_string(),
+                event: EventKind::FsAccess {
+                    path: "/workspace/src/main.rs".to_string(),
+                    operation: "read".to_string(),
+                },
+            },
+        ];
+        let obs_path = write_observations(&dir, &events);
+
+        // Allow fs:read only for paths under /workspace/src
+        let policy = r#"
+permit(
+  principal,
+  action == Action::"fs:read",
+  resource
+) when { context.path like "/workspace/src/*" };
+"#;
+        let policy_path = write_policy(&dir, policy);
+
+        let result = replay(&obs_path, &policy_path, None).unwrap();
+        assert_eq!(
+            result.matches, 1,
+            "only /workspace/src/main.rs should match"
+        );
+        assert_eq!(
+            result.mismatches.len(),
+            1,
+            "/workspace/secret/keys should mismatch"
+        );
+    }
+
+    // -- Proc context: command condition ---------------------------------------
+
+    #[test]
+    fn proc_context_command_condition_evaluated() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let events = vec![
+            ObservationEvent {
+                timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+                event: EventKind::ProcExec {
+                    pid: 1,
+                    command: "node index.js".to_string(),
+                },
+            },
+            ObservationEvent {
+                timestamp: "2026-03-27T00:00:01.000Z".to_string(),
+                event: EventKind::ProcExec {
+                    pid: 2,
+                    command: "rm -rf /".to_string(),
+                },
+            },
+        ];
+        let obs_path = write_observations(&dir, &events);
+
+        // Only allow "node" commands
+        let policy = r#"
+permit(
+  principal,
+  action == Action::"proc:exec",
+  resource
+) when { context.command like "node*" };
+"#;
+        let policy_path = write_policy(&dir, policy);
+
+        let result = replay(&obs_path, &policy_path, None).unwrap();
+        assert_eq!(result.matches, 1, "only 'node index.js' should match");
+        assert_eq!(result.mismatches.len(), 1, "'rm -rf /' should mismatch");
+    }
+
+    // -- AWS context attributes in replay -------------------------------------
+
+    #[test]
+    fn aws_context_attributes_populated_in_replay() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let events = vec![make_network_event(
+            "GET",
+            "s3.us-east-1.amazonaws.com",
+            "/my-bucket/object",
+            "allow",
+        )];
+        let obs_path = write_observations(&dir, &events);
+
+        let policy = r#"
+permit(
+  principal,
+  action == Action::"http:GET",
+  resource
+) when { context.aws_service == "s3" && context.aws_region == "us-east-1" };
+"#;
+        let policy_path = write_policy(&dir, policy);
+
+        let result = replay(&obs_path, &policy_path, None).unwrap();
+        assert_eq!(result.matches, 1, "AWS S3 context should match");
+        assert!(result.mismatches.is_empty());
     }
 }

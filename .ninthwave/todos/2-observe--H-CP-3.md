@@ -7,7 +7,7 @@
 
 Create the unified observation event model and stream infrastructure. Define event types covering network (existing audit events), container lifecycle (start, stop, mount), and filesystem/process actions. Events flow through a tokio broadcast channel and persist to JSONL file.
 
-This replaces the current `AuditLogger` file-writing path with a more general observation stream that multiple consumers can subscribe to (file writer, Unix socket, future `strait watch`).
+This is a NEW module alongside the existing `AuditLogger` (which stays untouched for v0.2 compatibility). The `AuditLogger` callers migrate to ObservationStream in H-CP-7a when the launch orchestrator wires everything together.
 
 Event types:
 - `network_request` -- HTTP request through proxy (method, host, path, decision, latency)
@@ -25,4 +25,4 @@ Event types:
 
 Acceptance: `ObservationStream` struct with `emit()`, `subscribe()`, and `persist_to_file()`. Events are serde-serializable. File output is one JSON object per line. Channel handles slow consumers gracefully.
 
-Key files: `src/observe.rs` (NEW), `src/audit.rs` (adapt existing AuditEvent)
+Key files: `src/observe.rs` (NEW)

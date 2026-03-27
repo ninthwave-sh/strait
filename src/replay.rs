@@ -311,8 +311,10 @@ fn evaluate_event(
             }
         }
 
-        // Container lifecycle events cannot be evaluated against a Cedar policy.
-        EventKind::ContainerStart { .. } | EventKind::ContainerStop { .. } => EventEvaluation::Skip,
+        // Container lifecycle and policy violation events cannot be evaluated against a Cedar policy.
+        EventKind::ContainerStart { .. }
+        | EventKind::ContainerStop { .. }
+        | EventKind::PolicyViolation { .. } => EventEvaluation::Skip,
     }
 }
 
@@ -395,6 +397,14 @@ fn format_event_summary(event: &ObservationEvent) -> String {
                     .unwrap_or_else(|| "unknown".to_string())
             )
         }
+        EventKind::PolicyViolation {
+            action,
+            resource,
+            decision,
+            ..
+        } => {
+            format!("policy:{decision} {action} {resource}")
+        }
     }
 }
 
@@ -442,6 +452,7 @@ mod tests {
                 path: path.to_string(),
                 decision: decision.to_string(),
                 latency_us: 100,
+                enforcement_mode: String::new(),
             },
         }
     }

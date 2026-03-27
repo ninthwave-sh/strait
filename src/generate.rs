@@ -183,8 +183,10 @@ fn event_to_action_resource(event: &EventKind) -> Option<(String, String)> {
             let resource = format!("fs::{path}");
             Some((action, resource))
         }
-        // Container lifecycle events don't map to Cedar actions.
-        EventKind::ContainerStart { .. } | EventKind::ContainerStop { .. } => None,
+        // Container lifecycle and policy violation events don't map to Cedar actions.
+        EventKind::ContainerStart { .. }
+        | EventKind::ContainerStop { .. }
+        | EventKind::PolicyViolation { .. } => None,
     }
 }
 
@@ -349,6 +351,7 @@ mod tests {
                 path: path.to_string(),
                 decision: "allow".to_string(),
                 latency_us: 100,
+                enforcement_mode: String::new(),
             },
         }
     }

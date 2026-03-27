@@ -1412,6 +1412,7 @@ async fn observe_mode_generates_policy_covering_observed_requests() {
             path: path.to_string(),
             decision: "allow".to_string(),
             latency_us: 100,
+            enforcement_mode: String::new(),
         });
     }
 
@@ -1487,6 +1488,7 @@ async fn observe_mode_path_normalization() {
         path: format!("/repos/my-org/my-repo/pulls/42"),
         decision: "allow".to_string(),
         latency_us: 100,
+        enforcement_mode: String::new(),
     });
     obs.emit(EventKind::NetworkRequest {
         method: "GET".to_string(),
@@ -1494,6 +1496,7 @@ async fn observe_mode_path_normalization() {
         path: format!("/repos/my-org/my-repo/pulls/9999"),
         decision: "allow".to_string(),
         latency_us: 100,
+        enforcement_mode: String::new(),
     });
     obs.emit(EventKind::NetworkRequest {
         method: "GET".to_string(),
@@ -1501,6 +1504,7 @@ async fn observe_mode_path_normalization() {
         path: format!("/users/{uuid}/profile"),
         decision: "allow".to_string(),
         latency_us: 100,
+        enforcement_mode: String::new(),
     });
     obs.emit(EventKind::NetworkRequest {
         method: "GET".to_string(),
@@ -1508,6 +1512,7 @@ async fn observe_mode_path_normalization() {
         path: format!("/repos/org/repo/commits/{sha}"),
         decision: "allow".to_string(),
         latency_us: 100,
+        enforcement_mode: String::new(),
     });
 
     drop(obs);
@@ -1589,6 +1594,7 @@ async fn observe_mode_with_echo_server_records_and_generates() {
             path: path.to_string(),
             decision: "allow".to_string(),
             latency_us: 50,
+            enforcement_mode: String::new(),
         });
     }
 

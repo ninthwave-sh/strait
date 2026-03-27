@@ -222,6 +222,118 @@ impl PolicyEngine {
             policy_reasons,
         })
     }
+
+    /// Evaluate a filesystem action against the loaded policy set.
+    ///
+    /// - `path`: filesystem path (e.g. `/project/src`)
+    /// - `action`: fs action string (e.g. `fs:read`, `fs:write`)
+    /// - `agent_id`: identity of the requesting agent
+    pub fn evaluate_fs(
+        &self,
+        path: &str,
+        action: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<PolicyDecision> {
+        let entities = build_fs_entities(path, agent_id)?;
+
+        let principal = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Agent").unwrap(),
+            EntityId::from_str(agent_id).unwrap(),
+        );
+
+        let action_uid = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Action").unwrap(),
+            EntityId::from_str(action).unwrap(),
+        );
+
+        let normalized = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        let resource_id = format!("fs::{normalized}");
+        let resource = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Resource").unwrap(),
+            EntityId::from_str(&resource_id).unwrap(),
+        );
+
+        let context = Context::empty();
+        let request = Request::new(principal, action_uid, resource, context, None)
+            .map_err(|e| anyhow::anyhow!("failed to build Cedar fs request: {e}"))?;
+
+        let response = self
+            .authorizer
+            .is_authorized(&request, &self.policy_set, &entities);
+
+        let mut policy_names = Vec::new();
+        let mut policy_reasons = Vec::new();
+        for pid in response.diagnostics().reason() {
+            let name = self
+                .policy_set
+                .annotation(pid, "id")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| pid.to_string());
+            policy_names.push(name);
+            if let Some(reason) = self.policy_set.annotation(pid, "reason") {
+                policy_reasons.push(reason.to_string());
+            }
+        }
+
+        Ok(PolicyDecision {
+            allowed: response.decision() == Decision::Allow,
+            policy_names,
+            policy_reasons,
+        })
+    }
+
+    /// Check if a host is permitted by any http: policy.
+    ///
+    /// Evaluates each standard HTTP method against the host's root resource.
+    /// Returns `true` if any method is permitted, indicating the agent is
+    /// allowed to connect to this host.
+    pub fn is_host_permitted(&self, host: &str, agent_id: &str) -> anyhow::Result<bool> {
+        for method in &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+            let action = format!("http:{method}");
+            let result = self.evaluate(host, &action, "/", &[], agent_id)?;
+            if result.allowed {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Extract filesystem permissions from a Cedar policy for container configuration.
+///
+/// For each candidate path, evaluates `fs:write` and `fs:read` actions against
+/// the policy engine. Returns:
+/// - `FsWrite` if `fs:write` is permitted (implies read access too)
+/// - `FsRead` if only `fs:read` is permitted
+/// - Nothing if neither is permitted (path will not be mounted)
+pub fn extract_fs_permissions(
+    engine: &PolicyEngine,
+    paths: &[String],
+    agent_id: &str,
+) -> Vec<crate::container::ContainerPermission> {
+    use crate::container::ContainerPermission;
+    let mut perms = Vec::new();
+    for path in paths {
+        // Check write first (more permissive — write implies read)
+        if let Ok(result) = engine.evaluate_fs(path, "fs:write", agent_id) {
+            if result.allowed {
+                perms.push(ContainerPermission::FsWrite(path.clone()));
+                continue;
+            }
+        }
+        // Check read
+        if let Ok(result) = engine.evaluate_fs(path, "fs:read", agent_id) {
+            if result.allowed {
+                perms.push(ContainerPermission::FsRead(path.clone()));
+            }
+        }
+        // If neither is allowed, path is not mounted
+    }
+    perms
 }
 
 /// Build a resource ID string from host and path.
@@ -1548,5 +1660,262 @@ permit(
         );
         let result = PolicyEngine::load(f.path(), None);
         assert!(result.is_ok(), "namespaced action should not be flagged");
+    }
+
+    // --- evaluate_fs tests ---
+
+    #[test]
+    fn evaluate_fs_read_allowed() {
+        let f = write_policy(
+            r#"
+@id("allow-fs-read")
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:read",
+    resource in Resource::"fs::/project"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let result = engine
+            .evaluate_fs("/project/src/main.rs", "fs:read", "agent")
+            .unwrap();
+        assert!(
+            result.allowed,
+            "fs:read should be allowed for /project/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn evaluate_fs_write_denied() {
+        let f = write_policy(
+            r#"
+@id("allow-fs-read-only")
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:read",
+    resource in Resource::"fs::/project"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let result = engine
+            .evaluate_fs("/project/src", "fs:write", "agent")
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "fs:write should be denied (only read allowed)"
+        );
+    }
+
+    #[test]
+    fn evaluate_fs_write_allowed() {
+        let f = write_policy(
+            r#"
+@id("allow-fs-write")
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:write",
+    resource in Resource::"fs::/project"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let result = engine
+            .evaluate_fs("/project/src", "fs:write", "agent")
+            .unwrap();
+        assert!(
+            result.allowed,
+            "fs:write should be allowed for /project/src"
+        );
+    }
+
+    #[test]
+    fn evaluate_fs_outside_scope_denied() {
+        let f = write_policy(
+            r#"
+@id("allow-project")
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:read",
+    resource in Resource::"fs::/project"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let result = engine
+            .evaluate_fs("/etc/passwd", "fs:read", "agent")
+            .unwrap();
+        assert!(!result.allowed, "fs:read outside /project should be denied");
+    }
+
+    // --- is_host_permitted tests ---
+
+    #[test]
+    fn is_host_permitted_when_policy_allows() {
+        let f = write_policy(
+            r#"
+@id("allow-github")
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource in Resource::"api.github.com"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        assert!(
+            engine.is_host_permitted("api.github.com", "agent").unwrap(),
+            "api.github.com should be permitted"
+        );
+    }
+
+    #[test]
+    fn is_host_not_permitted_when_no_policy() {
+        let f = write_policy(
+            r#"
+@id("allow-github")
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource in Resource::"api.github.com"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        assert!(
+            !engine
+                .is_host_permitted("evil.example.com", "agent")
+                .unwrap(),
+            "evil.example.com should not be permitted"
+        );
+    }
+
+    #[test]
+    fn is_host_permitted_with_post_only_policy() {
+        let f = write_policy(
+            r#"
+@id("allow-post-only")
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:POST",
+    resource in Resource::"api.example.com"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        assert!(
+            engine
+                .is_host_permitted("api.example.com", "agent")
+                .unwrap(),
+            "host with POST-only policy should still be permitted for CONNECT"
+        );
+    }
+
+    // --- extract_fs_permissions tests ---
+
+    #[test]
+    fn extract_fs_permissions_read_only() {
+        use crate::container::ContainerPermission;
+
+        let f = write_policy(
+            r#"
+@id("read-project")
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:read",
+    resource in Resource::"fs::/project"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let paths = vec!["/project".to_string()];
+        let perms = extract_fs_permissions(&engine, &paths, "agent");
+
+        assert_eq!(perms.len(), 1);
+        assert_eq!(
+            perms[0],
+            ContainerPermission::FsRead("/project".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_fs_permissions_read_write() {
+        use crate::container::ContainerPermission;
+
+        let f = write_policy(
+            r#"
+@id("write-project")
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:write",
+    resource in Resource::"fs::/project"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let paths = vec!["/project".to_string()];
+        let perms = extract_fs_permissions(&engine, &paths, "agent");
+
+        assert_eq!(perms.len(), 1);
+        // fs:write should produce FsWrite (not FsRead)
+        assert_eq!(
+            perms[0],
+            ContainerPermission::FsWrite("/project".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_fs_permissions_denied_path_not_mounted() {
+        let f = write_policy(
+            r#"
+@id("allow-project")
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:read",
+    resource in Resource::"fs::/project"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let paths = vec!["/project".to_string(), "/etc".to_string()];
+        let perms = extract_fs_permissions(&engine, &paths, "agent");
+
+        // /etc should not be mounted (no policy permits it)
+        assert_eq!(perms.len(), 1);
+    }
+
+    #[test]
+    fn extract_fs_permissions_empty_policy_denies_all() {
+        // A policy with no fs: permits should produce no mounts
+        let f = write_policy(
+            r#"
+@id("allow-http-only")
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource in Resource::"api.github.com"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let paths = vec!["/project".to_string()];
+        let perms = extract_fs_permissions(&engine, &paths, "agent");
+
+        assert!(
+            perms.is_empty(),
+            "HTTP-only policy should produce no fs mounts"
+        );
     }
 }

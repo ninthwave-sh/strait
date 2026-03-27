@@ -79,6 +79,11 @@ pub fn classify_event(event: &EventKind) -> EventColor {
         | EventKind::ContainerStop { .. }
         | EventKind::Mount { .. } => EventColor::Lifecycle,
         EventKind::FsAccess { .. } | EventKind::ProcExec { .. } => EventColor::Passthrough,
+        EventKind::PolicyViolation { decision, .. } => match decision.as_str() {
+            "deny" => EventColor::Deny,
+            "warn" => EventColor::Warn,
+            _ => EventColor::Warn,
+        },
     }
 }
 
@@ -131,6 +136,7 @@ fn format_event_parts(event: &EventKind) -> (String, String, String) {
             path,
             decision,
             latency_us,
+            enforcement_mode: _,
         } => {
             let action = format!("http:{method}");
             let resource = format!("{host}{path}");
@@ -175,6 +181,16 @@ fn format_event_parts(event: &EventKind) -> (String, String, String) {
         }
         EventKind::ProcExec { command, .. } => {
             ("proc:exec".to_string(), command.clone(), String::new())
+        }
+        EventKind::PolicyViolation {
+            action,
+            resource,
+            decision,
+            reason,
+            ..
+        } => {
+            let detail = format!("{decision}: {reason}");
+            (format!("policy:{action}"), resource.clone(), detail)
         }
     }
 }
@@ -386,6 +402,7 @@ mod tests {
             path: "/repos".into(),
             decision: "allow".into(),
             latency_us: 300,
+            enforcement_mode: String::new(),
         };
         assert_eq!(classify_event(&event), EventColor::Allow);
         assert_eq!(EventColor::Allow.ansi_prefix(), GREEN);
@@ -399,6 +416,7 @@ mod tests {
             path: "/repos/org/repo".into(),
             decision: "deny".into(),
             latency_us: 100,
+            enforcement_mode: String::new(),
         };
         assert_eq!(classify_event(&event), EventColor::Deny);
         assert_eq!(EventColor::Deny.ansi_prefix(), RED);
@@ -412,6 +430,7 @@ mod tests {
             path: "/data".into(),
             decision: "warn".into(),
             latency_us: 200,
+            enforcement_mode: String::new(),
         };
         assert_eq!(classify_event(&event), EventColor::Warn);
         assert_eq!(EventColor::Warn.ansi_prefix(), YELLOW);
@@ -425,6 +444,7 @@ mod tests {
             path: "/".into(),
             decision: "passthrough".into(),
             latency_us: 0,
+            enforcement_mode: String::new(),
         };
         assert_eq!(classify_event(&event), EventColor::Passthrough);
         assert_eq!(EventColor::Passthrough.ansi_prefix(), DIM);
@@ -438,6 +458,7 @@ mod tests {
             path: "/".into(),
             decision: "unknown_value".into(),
             latency_us: 0,
+            enforcement_mode: String::new(),
         };
         assert_eq!(classify_event(&event), EventColor::Passthrough);
     }
@@ -542,6 +563,7 @@ mod tests {
             path: "/repos/org/repo".into(),
             decision: "allow".into(),
             latency_us: 300,
+            enforcement_mode: String::new(),
         });
         let output = format_event(&event, 120);
         assert!(output.contains(GREEN), "should contain green ANSI code");
@@ -562,6 +584,7 @@ mod tests {
             path: "/repos/org/repo".into(),
             decision: "deny".into(),
             latency_us: 100,
+            enforcement_mode: String::new(),
         });
         let output = format_event(&event, 120);
         assert!(output.contains(BOLD), "deny should be bold");
@@ -579,6 +602,7 @@ mod tests {
             path: "/data".into(),
             decision: "warn".into(),
             latency_us: 200,
+            enforcement_mode: String::new(),
         });
         let output = format_event(&event, 120);
         assert!(output.contains(YELLOW));
@@ -646,6 +670,7 @@ mod tests {
             path: "/".into(),
             decision: "passthrough".into(),
             latency_us: 0,
+            enforcement_mode: String::new(),
         });
         let output = format_event(&event, 120);
         assert!(output.contains(DIM));
@@ -686,6 +711,7 @@ mod tests {
             path: long_path,
             decision: "allow".into(),
             latency_us: 100,
+            enforcement_mode: String::new(),
         });
         let output = format_event(&event, 80);
         let width = visible_width(&output);
@@ -704,6 +730,7 @@ mod tests {
             path: "/repos/org/repo".into(),
             decision: "allow".into(),
             latency_us: 300,
+            enforcement_mode: String::new(),
         });
         // Even at absurdly narrow width, it should not panic.
         let output = format_event(&event, 20);
@@ -762,8 +789,6 @@ mod tests {
     #[tokio::test]
     async fn connect_and_stream_receives_events() {
         use crate::observe::ObservationStream;
-        use std::sync::Arc;
-        use tokio::sync::Mutex;
 
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("test.sock");
@@ -784,6 +809,7 @@ mod tests {
             path: "/repos".into(),
             decision: "allow".into(),
             latency_us: 150,
+            enforcement_mode: String::new(),
         });
 
         use tokio::io::AsyncBufReadExt;

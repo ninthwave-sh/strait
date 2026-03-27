@@ -8,14 +8,21 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-/// Check if Docker is available for integration tests.
+/// Check if Docker is available with the required image for integration tests.
 ///
-/// Returns true if we can connect to the Docker daemon and ping it.
+/// Returns true if we can connect to the Docker daemon, ping it, and the
+/// `alpine:latest` image is already pulled. We don't auto-pull images in
+/// tests to keep them fast and avoid network dependencies in CI.
 async fn docker_available() -> bool {
-    match bollard::Docker::connect_with_local_defaults() {
-        Ok(docker) => docker.ping().await.is_ok(),
-        Err(_) => false,
+    let docker = match bollard::Docker::connect_with_local_defaults() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    if docker.ping().await.is_err() {
+        return false;
     }
+    // Check that the required test image is available locally
+    docker.inspect_image("alpine:latest").await.is_ok()
 }
 
 /// Helper to read an observation JSONL file into parsed events.

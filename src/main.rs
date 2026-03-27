@@ -183,6 +183,22 @@ TLS TRUST:
         command: Vec<String>,
     },
 
+    /// Compare two Cedar policy files and show permission-level differences.
+    ///
+    /// Not a text diff — a semantic diff showing which permissions were
+    /// added, removed, or left unchanged. Useful for reviewing policy
+    /// changes during code review.
+    ///
+    /// Exits with code 0 when no changes are found, code 1 when
+    /// permissions differ (like `git diff`).
+    Diff {
+        /// Path to the old (baseline) Cedar policy file.
+        old: PathBuf,
+
+        /// Path to the new (changed) Cedar policy file.
+        new: PathBuf,
+    },
+
     /// Initialize Cedar policies by observing live traffic.
     ///
     /// Starts the proxy in observation mode: all MITM'd requests are allowed
@@ -299,6 +315,13 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             };
             std::process::exit(exit_code);
+        }
+        Commands::Diff { old, new } => {
+            let result = strait::diff::diff(&old, &new)?;
+            print!("{result}");
+            if result.has_changes() {
+                std::process::exit(1);
+            }
         }
         Commands::Init {
             observe: duration_str,
@@ -656,6 +679,10 @@ mod tests {
             subcommand_names.contains(&"explain"),
             "missing 'explain' subcommand"
         );
+        assert!(
+            subcommand_names.contains(&"diff"),
+            "missing 'diff' subcommand"
+        );
     }
 
     #[test]
@@ -666,6 +693,18 @@ mod tests {
                 assert_eq!(policy.to_str().unwrap(), "policy.cedar");
             }
             _ => panic!("expected Explain subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_diff_subcommand_parses() {
+        let cli = Cli::try_parse_from(["strait", "diff", "old.cedar", "new.cedar"]).unwrap();
+        match cli.command {
+            Commands::Diff { old, new } => {
+                assert_eq!(old.to_str().unwrap(), "old.cedar");
+                assert_eq!(new.to_str().unwrap(), "new.cedar");
+            }
+            _ => panic!("expected Diff subcommand"),
         }
     }
 

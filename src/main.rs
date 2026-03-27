@@ -1,6 +1,7 @@
 mod audit;
 mod ca;
 pub mod config;
+pub mod container;
 pub mod credentials;
 pub mod generate;
 mod health;

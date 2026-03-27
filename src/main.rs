@@ -8,6 +8,7 @@ mod health;
 mod mitm;
 pub mod observe;
 pub mod policy;
+pub mod replay;
 pub mod sigv4;
 
 use std::net::SocketAddr;
@@ -70,6 +71,21 @@ TLS TRUST:
         #[arg(long, default_value = "policy.cedarschema")]
         schema: PathBuf,
     },
+
+    /// Test a Cedar policy against an observation log.
+    ///
+    /// Replays every event in the observation log against the specified Cedar
+    /// policy and reports mismatches. Exits 0 when all evaluable events match,
+    /// 1 when any mismatch is found.
+    Test {
+        /// Replay mode: evaluate observations against a policy.
+        #[arg(long)]
+        replay: PathBuf,
+
+        /// Path to the Cedar policy file.
+        #[arg(long)]
+        policy: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -83,6 +99,13 @@ async fn main() -> anyhow::Result<()> {
             schema,
         } => {
             generate::generate(&observations, &output, &schema)?;
+        }
+        Commands::Test { replay, policy } => {
+            let result = replay::replay(&replay, &policy)?;
+            let exit_code = replay::print_results(&result);
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
         }
         Commands::Proxy { config } => {
             run_proxy(config).await?;

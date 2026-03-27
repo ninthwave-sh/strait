@@ -244,7 +244,11 @@ fn build_resource_id(host: &str, path: &str) -> String {
 /// - Resource::"api.github.com" (no parent)
 /// - Agent::"<agent_id>" (no parent)
 /// - Action::"http:GET", Action::"http:POST", … (HTTP method actions)
-fn build_http_entity_hierarchy(host: &str, path: &str, agent_id: &str) -> anyhow::Result<Entities> {
+pub fn build_http_entity_hierarchy(
+    host: &str,
+    path: &str,
+    agent_id: &str,
+) -> anyhow::Result<Entities> {
     let resource_type = EntityTypeName::from_str("Resource").unwrap();
     let mut entities = Vec::new();
 

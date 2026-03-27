@@ -1,0 +1,93 @@
+{
+  "runTimestamp": "2026-03-27T18:27:51.759Z",
+  "wallClockMs": 5700358,
+  "itemsAttempted": 6,
+  "itemsCompleted": 6,
+  "itemsFailed": 0,
+  "mergeStrategy": "asap",
+  "items": [
+    {
+      "id": "M-V2-4",
+      "state": "done",
+      "ciRetryCount": 0,
+      "retryCount": 0,
+      "tool": "claude",
+      "prNumber": 33,
+      "tokensUsed": null,
+      "costUsd": null,
+      "detectionLatencyMs": 0,
+      "startedAt": "2026-03-27T18:28:17.785Z",
+      "endedAt": "2026-03-27T18:43:06.600Z"
+    },
+    {
+      "id": "L-V2-5",
+      "state": "done",
+      "ciRetryCount": 0,
+      "retryCount": 0,
+      "tool": "claude",
+      "prNumber": 34,
+      "tokensUsed": null,
+      "costUsd": null,
+      "detectionLatencyMs": 0,
+      "startedAt": "2026-03-27T18:43:30.717Z",
+      "endedAt": "2026-03-27T18:50:34.398Z"
+    },
+    {
+      "id": "H-CP-1",
+      "state": "done",
+      "ciRetryCount": 0,
+      "retryCount": 0,
+      "tool": "claude",
+      "prNumber": 35,
+      "tokensUsed": null,
+      "costUsd": null,
+      "detectionLatencyMs": 0,
+      "startedAt": "2026-03-27T18:50:56.319Z",
+      "endedAt": "2026-03-27T18:55:57.595Z"
+    },
+    {
+      "id": "H-CP-7",
+      "state": "done",
+      "ciRetryCount": 1,
+      "retryCount": 0,
+      "tool": "claude",
+      "prNumber": 36,
+      "tokensUsed": null,
+      "costUsd": null,
+      "detectionLatencyMs": 0,
+      "startedAt": "2026-03-27T18:56:24.740Z",
+      "endedAt": "2026-03-27T19:24:42.929Z",
+      "exitCode": 1
+    },
+    {
+      "id": "H-CP-12",
+      "state": "done",
+      "ciRetryCount": 0,
+      "retryCount": 0,
+      "tool": "claude",
+      "prNumber": 37,
+      "tokensUsed": null,
+      "costUsd": null,
+      "detectionLatencyMs": 0,
+      "startedAt": "2026-03-27T19:25:07.367Z",
+      "endedAt": "2026-03-27T19:46:27.054Z",
+      "exitCode": 1
+    },
+    {
+      "id": "H-CP-11",
+      "state": "done",
+      "ciRetryCount": 0,
+      "retryCount": 0,
+      "tool": "claude",
+      "prNumber": 38,
+      "tokensUsed": null,
+      "costUsd": null,
+      "detectionLatencyMs": 0,
+      "startedAt": "2026-03-27T19:46:50.299Z",
+      "endedAt": "2026-03-27T20:02:21.066Z"
+    }
+  ],
+  "totalTokensUsed": null,
+  "totalCostUsd": null,
+  "detectionLatency": null
+}

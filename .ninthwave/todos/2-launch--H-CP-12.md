@@ -1,8 +1,8 @@
-# Feat: `strait launch --warn` and `--policy` enforcement modes (H-CP-7b)
+# Feat: `strait launch --warn` and `--policy` enforcement modes (H-CP-12)
 
 **Priority:** High
 **Source:** v0.3 container platform plan
-**Depends on:** H-CP-7a
+**Depends on:** H-CP-7
 **Domain:** launch
 
 Add enforcement modes on top of the observe-mode orchestrator:

@@ -2,7 +2,7 @@
 
 **Priority:** High
 **Source:** v0.3 container platform plan (eng review: shipping gate)
-**Depends on:** H-CP-7b, H-CP-8, M-CP-9
+**Depends on:** H-CP-12, H-CP-8, M-CP-9
 **Domain:** test
 
 Implement the round-trip E2E integration test that is the v0.3 shipping gate. This test proves the entire observe-then-enforce lifecycle works end-to-end:

@@ -1,36 +1,33 @@
-# Feat: `strait launch` orchestrator (H-CP-7)
+# Feat: `strait launch --observe` basic orchestrator (H-CP-7)
 
 **Priority:** High
 **Source:** v0.3 container platform plan
 **Depends on:** H-CP-1, H-CP-4, M-CP-5, M-CP-6
 **Domain:** launch
 
-Implement the `strait launch` subcommand that orchestrates the proxy, container, and observation stream into a unified workflow. Three modes:
-
-- `strait launch --observe ./agent` -- no policy enforcement, log all activity
-- `strait launch --warn policy.cedar ./agent` -- evaluate policy, log violations as warnings, never block
-- `strait launch --policy policy.cedar ./agent` -- enforce policy (deny = container doesn't get the mount / proxy returns 403)
+Implement the `strait launch --observe` subcommand that orchestrates proxy, container, and observation into a unified observe-mode workflow. This is the foundation that H-CP-12 adds enforcement modes on top of.
 
 Startup sequence:
-1. Load Cedar policy (if --warn or --policy)
-2. Start Strait proxy on host (random available port)
-3. Write session CA to temp file
-4. Create container with bind-mounts from policy, HTTPS_PROXY pointing to host proxy, CA trust injection
-5. Start observation stream (JSONL file + Unix socket)
-6. Start container with TTY attached
-7. Wait for agent exit
-8. Stop proxy, clean up container and temp files
+1. Start Strait proxy on host (random available port)
+2. Write session CA to temp file
+3. Create container with bind-mounts (all paths read-write in observe mode -- no policy restricts)
+4. Inject CA into container's system bundle (via M-CP-5 entrypoint)
+5. Set HTTPS_PROXY in container pointing to host proxy
+6. Start observation stream (JSONL file + Unix socket via H-CP-3/M-CP-6)
+7. Migrate proxy audit events to ObservationStream (replace AuditLogger callers)
+8. Start container with TTY attached
+9. Wait for agent exit
+10. Stop proxy, clean up container, close observation stream
 
 Agent gets full terminal control (TTY passthrough for interactive TUI sessions).
 
 **Test plan:**
-- Integration test (requires Docker): `launch --observe` with a test agent that makes one HTTP request and reads one file, verify observation JSONL contains both events
-- Integration test: `launch --policy` with a restrictive policy, verify agent can only access permitted mounts and API endpoints
-- Integration test: `launch --warn` with same restrictive policy, verify agent succeeds but warnings are logged
+- Integration test (requires Docker): `launch --observe echo hello` runs in container, produces observation JSONL, exits cleanly
+- Integration test: observation JSONL contains network events from proxy AND container lifecycle events
 - Edge case: agent exits immediately (bad command) -- clean error with exit code
-- Edge case: agent is killed by signal (Ctrl+C) -- clean container shutdown
-- Edge case: policy file invalid -- fail fast before starting container
+- Edge case: agent killed by signal (Ctrl+C) -- clean container shutdown and temp file cleanup
+- Edge case: Docker not running -- clear error before any operations
 
-Acceptance: `strait launch --observe echo hello` runs in a container, produces observation JSONL, exits cleanly. All three modes (observe/warn/policy) work correctly.
+Acceptance: `strait launch --observe echo hello` runs in a container, produces observation JSONL with both network and container events, exits cleanly. TTY passthrough works for interactive agents.
 
-Key files: `src/launch.rs` (NEW), `src/main.rs` (wire up subcommand)
+Key files: `src/launch.rs` (NEW), `src/main.rs` (wire subcommand), `src/audit.rs` (migrate callers to ObservationStream)

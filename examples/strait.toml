@@ -44,12 +44,21 @@ keepalive_timeout_secs = 30    # Close idle MITM connections after this many sec
 # Every intercepted request is evaluated against this policy set.
 # If no permit policy matches, the request is denied (Cedar default-deny).
 #
+# Two modes (mutually exclusive):
+#   file     — load from a local path (no polling, no hot-reload)
+#   git_url  — clone a git repo, load from it, poll for changes, hot-reload
+#
 # For AWS-only setups, use examples/aws.cedar and examples/aws.cedarschema.
 # For GitHub-only setups, use examples/github.cedar and examples/github.cedarschema.
 # ---------------------------------------------------------------------------
 [policy]
-path = "examples/github.cedar"              # Path to the .cedar policy file
+file = "examples/github.cedar"              # Path to the .cedar policy file
 schema = "examples/github.cedarschema"      # Optional: validates policy at startup
+# --- OR use git-hosted policies: ---
+# git_url = "https://github.com/our-org/strait-policies.git"
+# git_path = "policies/github.cedar"        # Relative to repo root
+# schema = "policies/github.cedarschema"    # Also relative to repo root
+# poll_interval_secs = 60                   # Default: 60 seconds
 
 # ---------------------------------------------------------------------------
 # [[credential]] — Secrets injected into authorized requests.

@@ -173,7 +173,7 @@ ca_cert_path = "/tmp/ca.pem"
 ca_cert_path = "/tmp/ca.pem"
 
 [policy]
-path = "{}"
+file = "{}"
 "#,
             policy_file.path().display()
         );

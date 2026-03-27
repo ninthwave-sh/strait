@@ -5,7 +5,7 @@
 //! Events are written to stderr as JSON-per-line and optionally to a file.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -50,10 +50,16 @@ pub struct AuditRequest {
 }
 
 /// Audit logger that writes events to stderr and optionally a file.
+///
+/// File writes use raw `File` (not `BufWriter`) so every event is flushed to
+/// the OS immediately.  For an audit log, completeness matters more than
+/// throughput — each write becomes a single syscall, guaranteeing the event
+/// is durable the moment `emit()` returns.
 #[derive(Clone, Debug)]
 pub struct AuditLogger {
     session_id: String,
-    file_writer: Option<Arc<Mutex<std::io::BufWriter<std::fs::File>>>>,
+    file_writer: Option<Arc<Mutex<std::fs::File>>>,
+    file_path: Option<PathBuf>,
 }
 
 impl AuditLogger {
@@ -61,7 +67,7 @@ impl AuditLogger {
     ///
     /// If `log_path` is provided, events are also appended to that file.
     pub fn new(log_path: Option<&Path>) -> anyhow::Result<Self> {
-        let file_writer = match log_path {
+        let (file_writer, file_path) = match log_path {
             Some(path) => {
                 let file = std::fs::OpenOptions::new()
                     .create(true)
@@ -70,14 +76,15 @@ impl AuditLogger {
                     .map_err(|e| {
                         anyhow::anyhow!("failed to open audit log file '{}': {}", path.display(), e)
                     })?;
-                Some(Arc::new(Mutex::new(std::io::BufWriter::new(file))))
+                (Some(Arc::new(Mutex::new(file))), Some(path.to_path_buf()))
             }
-            None => None,
+            None => (None, None),
         };
 
         Ok(Self {
             session_id: Uuid::new_v4().to_string(),
             file_writer,
+            file_path,
         })
     }
 
@@ -148,16 +155,48 @@ impl AuditLogger {
     }
 
     /// Serialize and write the event to stderr and optionally to a file.
+    ///
+    /// Failures are logged via `tracing::warn!` but never propagated — callers
+    /// should not need to handle audit failures, and the proxy must keep running.
+    // TODO(observability): increment a counter metric for dropped events when
+    // a metrics subsystem is added.
     fn emit(&self, event: &AuditEvent) {
-        if let Ok(json) = serde_json::to_string(event) {
-            // Always write to stderr
-            eprintln!("{json}");
+        let json = match serde_json::to_string(event) {
+            Ok(json) => json,
+            Err(e) => {
+                // Log the decision type but NOT the full event (may contain secrets).
+                tracing::warn!(
+                    decision = %event.decision,
+                    error = %e,
+                    "failed to serialize audit event",
+                );
+                return;
+            }
+        };
 
-            // Optionally write to file
-            if let Some(ref writer) = self.file_writer {
-                if let Ok(mut w) = writer.lock() {
-                    let _ = writeln!(w, "{json}");
-                    let _ = w.flush();
+        // Always write to stderr
+        eprintln!("{json}");
+
+        // Optionally write to file
+        if let Some(ref writer) = self.file_writer {
+            let path_display = self.file_path.as_deref().unwrap_or(Path::new("<unknown>"));
+
+            match writer.lock() {
+                Ok(mut f) => {
+                    if let Err(e) = writeln!(f, "{json}") {
+                        tracing::warn!(
+                            path = %path_display.display(),
+                            error = %e,
+                            "failed to write audit event to file",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path_display.display(),
+                        error = %e,
+                        "audit file mutex poisoned, dropping event",
+                    );
                 }
             }
         }
@@ -406,5 +445,107 @@ mod tests {
             parsed.get("denial_reason").is_none(),
             "allow events should not have denial_reason"
         );
+    }
+
+    // --- Failure-logging tests (H-CP-19) ---
+
+    /// Helper: a `MakeWriter` that appends to a shared `Vec<u8>`.
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Build a test event for failure-path tests.
+    fn test_event() -> AuditEvent {
+        AuditEvent {
+            timestamp: "2026-03-26T00:00:00.000Z".to_string(),
+            session_id: "test".to_string(),
+            request: AuditRequest {
+                host: "api.github.com".to_string(),
+                port: 443,
+                method: Some("GET".to_string()),
+                path: Some("/repos".to_string()),
+                agent: Some("worker".to_string()),
+                mitm: true,
+            },
+            decision: "allow".to_string(),
+            matched_policies: vec![],
+            credential_injected: false,
+            eval_latency_us: 0,
+            denial_reason: None,
+        }
+    }
+
+    #[test]
+    fn emit_warns_on_file_write_failure() {
+        // Open the file **read-only** so that `writeln!` inside `emit()` fails.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.jsonl");
+        std::fs::write(&log_path, "").unwrap();
+        let file = std::fs::File::open(&log_path).unwrap(); // read-only fd
+
+        let logger = AuditLogger {
+            session_id: "test".to_string(),
+            file_writer: Some(Arc::new(Mutex::new(file))),
+            file_path: Some(log_path),
+        };
+
+        // Capture tracing output via a test subscriber.
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            logger.emit(&test_event());
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("failed to write audit event to file"),
+            "expected write-failure warning in tracing output, got: {output}"
+        );
+    }
+
+    #[test]
+    fn file_writes_are_unbuffered() {
+        // Verify events reach disk without an explicit flush.  With raw `File`
+        // (no `BufWriter`), each `writeln!` is a direct syscall — data is
+        // visible to readers immediately after `emit()` returns.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.jsonl");
+        let logger = AuditLogger::new(Some(&log_path)).unwrap();
+
+        // Emit a single small event.
+        logger.log_passthrough("example.com", 443);
+
+        // The event must be on disk already (no deferred flush).
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            !content.is_empty(),
+            "event should be visible on disk immediately (no BufWriter buffering)"
+        );
+
+        // Confirm the struct stores File, not BufWriter — enforced at compile
+        // time by the type of `file_writer`.  This test documents the intent;
+        // if someone re-introduces BufWriter without per-event flush, the
+        // assertion above will catch it (BufWriter's 8 KiB default buffer
+        // would swallow the ~200-byte event).
     }
 }

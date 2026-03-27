@@ -10,6 +10,7 @@ pub mod observe;
 pub mod policy;
 pub mod replay;
 pub mod sigv4;
+pub mod watch;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -86,6 +87,19 @@ TLS TRUST:
         #[arg(long)]
         policy: PathBuf,
     },
+
+    /// Watch live observation events from a running strait session.
+    ///
+    /// Connects to the Unix socket observation server and renders a colored
+    /// real-time stream of agent activity. Auto-reconnects if the socket
+    /// disconnects. Exits cleanly on Ctrl+C.
+    Watch {
+        /// Path to the observation Unix socket.
+        ///
+        /// If omitted, auto-discovers by looking for /tmp/strait-*.sock.
+        #[arg(short, long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -106,6 +120,9 @@ async fn main() -> anyhow::Result<()> {
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
+        }
+        Commands::Watch { socket } => {
+            watch::run(socket).await?;
         }
         Commands::Proxy { config } => {
             run_proxy(config).await?;

@@ -2651,6 +2651,7 @@ dependencies = [
  "cedar-policy",
  "chrono",
  "clap",
+ "futures-util",
  "hex",
  "http 1.4.0",
  "http-body-util",

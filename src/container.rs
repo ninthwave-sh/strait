@@ -61,6 +61,12 @@ pub struct ContainerConfig {
     pub tty: bool,
     /// Optional entrypoint override (e.g. for CA trust injection wrapper).
     pub entrypoint: Option<Vec<String>>,
+    /// Whether Docker should auto-remove the container after it exits.
+    ///
+    /// Defaults to `true` in `build_config`. Set to `false` when you need
+    /// to inspect the container after exit (e.g., to read the exit code
+    /// reliably via `wait_container`).
+    pub auto_remove: bool,
 }
 
 /// Default graceful shutdown timeout (seconds) before force-killing.
@@ -248,6 +254,7 @@ impl ContainerManager {
             binds,
             tty: true,
             entrypoint,
+            auto_remove: true,
         }
     }
 
@@ -278,7 +285,9 @@ impl ContainerManager {
     /// Create a Docker container from a pre-built `ContainerConfig`.
     ///
     /// This is the lower-level method that actually calls the Docker API.
-    async fn create_container_from_config(
+    /// Use this when you need to modify the config after `build_config`
+    /// (e.g., to disable `auto_remove` for reliable exit code capture).
+    pub async fn create_container_from_config(
         &mut self,
         config: &ContainerConfig,
     ) -> anyhow::Result<String> {
@@ -293,7 +302,7 @@ impl ContainerManager {
             } else {
                 Some(config.binds.clone())
             },
-            auto_remove: Some(true),
+            auto_remove: Some(config.auto_remove),
             ..Default::default()
         };
 
@@ -443,6 +452,21 @@ impl ContainerManager {
     /// Return the container name if a container has been created.
     pub fn container_name(&self) -> Option<&str> {
         self.container_name.as_deref()
+    }
+
+    /// Return a reference to the underlying Docker client.
+    ///
+    /// Used by the launch orchestrator for attach and wait operations.
+    pub fn docker(&self) -> &Docker {
+        &self.docker
+    }
+
+    /// Verify connectivity to the Docker daemon.
+    ///
+    /// Returns a clear error if Docker is not running or the socket is not found.
+    /// Call this early in the workflow to fail fast before setting up other resources.
+    pub async fn verify_connection(&self) -> anyhow::Result<()> {
+        self.ping().await
     }
 
     /// Ping the Docker daemon to verify connectivity.

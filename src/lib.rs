@@ -11,6 +11,7 @@ pub mod container;
 pub mod credentials;
 pub mod generate;
 pub mod health;
+pub mod launch;
 pub mod mitm;
 pub mod observe;
 pub mod policy;

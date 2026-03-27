@@ -1,9 +1,15 @@
-//! Cedar policy evaluation for MITM'd HTTP requests.
+//! Cedar policy evaluation for agent requests.
 //!
-//! Loads a `.cedar` policy file at startup and evaluates each intercepted
-//! request against the policy set. The entity hierarchy is built from the
-//! request's URL path: splitting `/a/b/c` produces `Resource::"a/b/c"` as a
-//! child of `Resource::"a/b"`, which is a child of `Resource::"a"`.
+//! Loads a `.cedar` policy file at startup and evaluates each request
+//! against the policy set. Actions use namespaced identifiers:
+//!
+//! - `Action::"http:GET"`, `Action::"http:POST"`, … — HTTP methods
+//! - `Action::"fs:read"`, `Action::"fs:write"`, … — filesystem operations
+//! - `Action::"proc:exec"`, `Action::"proc:fork"`, … — process operations
+//!
+//! For HTTP requests, the entity hierarchy is built from the URL path:
+//! splitting `/a/b/c` produces `Resource::"host/a/b/c"` as a child of
+//! `Resource::"host/a/b"`, which is a child of `Resource::"host/a"`.
 //!
 //! Default disposition is DENY (Cedar's native behavior when no permit
 //! policy matches).
@@ -46,6 +52,9 @@ impl PolicyEngine {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read policy file: {}", path.display()))?;
 
+        // Check for old-format (pre-v0.3) actions before parsing
+        check_old_format_actions(&text)?;
+
         let policy_set = PolicySet::from_str(&text)
             .map_err(|e| anyhow::anyhow!("invalid Cedar policy file: {e}"))?;
 
@@ -83,14 +92,14 @@ impl PolicyEngine {
     /// Evaluate a request against the loaded policy set.
     ///
     /// - `host`: target hostname (e.g. `api.github.com`)
-    /// - `method`: HTTP method (e.g. `GET`, `POST`)
+    /// - `action`: domain-agnostic action string (e.g. `http:GET`, `fs:read`, `proc:exec`)
     /// - `path`: URL path (e.g. `/repos/org/repo`)
     /// - `headers`: list of (name, value) header pairs
     /// - `agent_id`: identity of the requesting agent (e.g. `"worker"`, `"ci-bot"`)
     pub fn evaluate(
         &self,
         host: &str,
-        method: &str,
+        action: &str,
         path: &str,
         headers: &[(String, String)],
         agent_id: &str,
@@ -98,7 +107,7 @@ impl PolicyEngine {
         // Build entity hierarchy from the path segments.
         // For path "/repos/org/repo", we create:
         //   Resource::"repos/org/repo" in Resource::"repos/org" in Resource::"repos"
-        let entities = build_entity_hierarchy(host, path, agent_id)?;
+        let entities = build_http_entity_hierarchy(host, path, agent_id)?;
 
         // Principal: Agent::"<agent_id>"
         let principal = EntityUid::from_type_name_and_id(
@@ -106,10 +115,10 @@ impl PolicyEngine {
             EntityId::from_str(agent_id).unwrap(),
         );
 
-        // Action: Action::"<METHOD>"
-        let action = EntityUid::from_type_name_and_id(
+        // Action: Action::"<action>" (e.g. "http:GET", "fs:read")
+        let action_uid = EntityUid::from_type_name_and_id(
             EntityTypeName::from_str("Action").unwrap(),
-            EntityId::from_str(method).unwrap(),
+            EntityId::from_str(action).unwrap(),
         );
 
         // Resource: Resource::"<host>/<path_without_leading_slash>"
@@ -118,6 +127,10 @@ impl PolicyEngine {
             EntityTypeName::from_str("Resource").unwrap(),
             EntityId::from_str(&resource_id).unwrap(),
         );
+
+        // Derive raw method from the action for context backward compatibility.
+        // For "http:GET" → "GET"; for non-HTTP actions, use the full action string.
+        let method = action.strip_prefix("http:").unwrap_or(action);
 
         // Context: { host, path, method, headers }
         let header_pairs: Vec<(String, RestrictedExpression)> = headers
@@ -176,7 +189,7 @@ impl PolicyEngine {
         let context =
             Context::from_pairs(context_pairs).context("failed to build Cedar context")?;
 
-        let request = Request::new(principal, action, resource, context, None)
+        let request = Request::new(principal, action_uid, resource, context, None)
             .map_err(|e| anyhow::anyhow!("failed to build Cedar request: {e}"))?;
 
         let response = self
@@ -222,7 +235,7 @@ fn build_resource_id(host: &str, path: &str) -> String {
     }
 }
 
-/// Build the Cedar entity hierarchy from the host and URL path.
+/// Build the Cedar entity hierarchy from the host and URL path (HTTP domain).
 ///
 /// For host="api.github.com" and path="/repos/org/repo", creates:
 /// - Resource::"api.github.com/repos/org/repo" (parent: api.github.com/repos/org)
@@ -230,7 +243,8 @@ fn build_resource_id(host: &str, path: &str) -> String {
 /// - Resource::"api.github.com/repos" (parent: api.github.com)
 /// - Resource::"api.github.com" (no parent)
 /// - Agent::"<agent_id>" (no parent)
-fn build_entity_hierarchy(host: &str, path: &str, agent_id: &str) -> anyhow::Result<Entities> {
+/// - Action::"http:GET", Action::"http:POST", … (HTTP method actions)
+fn build_http_entity_hierarchy(host: &str, path: &str, agent_id: &str) -> anyhow::Result<Entities> {
     let resource_type = EntityTypeName::from_str("Resource").unwrap();
     let mut entities = Vec::new();
 
@@ -281,17 +295,169 @@ fn build_entity_hierarchy(host: &str, path: &str, agent_id: &str) -> anyhow::Res
     );
     entities.push(Entity::new_no_attrs(agent_uid, HashSet::new()));
 
-    // Add action entities for common HTTP methods
+    // Add action entities for namespaced HTTP methods
     for method in &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+        let action_id = format!("http:{method}");
         let action_uid = EntityUid::from_type_name_and_id(
             EntityTypeName::from_str("Action").unwrap(),
-            EntityId::from_str(method).unwrap(),
+            EntityId::from_str(&action_id).unwrap(),
         );
         entities.push(Entity::new_no_attrs(action_uid, HashSet::new()));
     }
 
     Entities::from_entities(entities, None)
         .map_err(|e| anyhow::anyhow!("failed to build entity set: {e}"))
+}
+
+/// Check policy text for old-format (pre-v0.3) action identifiers.
+///
+/// Old format: `Action::"GET"`, `Action::"POST"`, etc.
+/// New format: `Action::"http:GET"`, `Action::"http:POST"`, etc.
+///
+/// Returns an error with migration instructions if old-format actions are detected.
+fn check_old_format_actions(policy_text: &str) -> anyhow::Result<()> {
+    let http_methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
+    let mut found = Vec::new();
+
+    for method in &http_methods {
+        let old_pattern = format!(r#"Action::"{method}""#);
+        if policy_text.contains(&old_pattern) {
+            found.push(format!(
+                "  Action::\"{method}\" → Action::\"http:{method}\""
+            ));
+        }
+    }
+
+    if !found.is_empty() {
+        anyhow::bail!(
+            "Cedar policy uses old-format actions (pre-v0.3). \
+             Actions must be namespaced. Please update:\n\n{}\n\n\
+             All HTTP method actions now require the 'http:' prefix.\n\
+             Example: action == Action::\"http:GET\"",
+            found.join("\n")
+        );
+    }
+    Ok(())
+}
+
+/// Build the Cedar entity set for a filesystem operation.
+///
+/// Creates a resource hierarchy from the filesystem path:
+/// - `Resource::"fs::/project/src/main.rs"` (parent: `fs::/project/src`)
+/// - `Resource::"fs::/project/src"` (parent: `fs::/project`)
+/// - `Resource::"fs::/project"` (parent: `fs::/`)
+/// - `Resource::"fs::/"` (root, no parent)
+///
+/// Also creates action entities for `fs:read`, `fs:write`, `fs:create`, `fs:delete`
+/// and the agent entity.
+pub fn build_fs_entities(path: &str, agent_id: &str) -> anyhow::Result<Entities> {
+    let resource_type = EntityTypeName::from_str("Resource").unwrap();
+    let mut entities = Vec::new();
+
+    // Normalize path: ensure leading slash
+    let normalized = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+
+    // Build resource IDs from most specific to root
+    // e.g. "/project/src" → ["fs::/project/src", "fs::/project", "fs::/"]
+    let mut resource_ids: Vec<String> = Vec::new();
+    let mut current = normalized.as_str();
+    loop {
+        resource_ids.push(format!("fs::{current}"));
+        if current == "/" {
+            break;
+        }
+        // Go up one level
+        match current.rfind('/') {
+            Some(0) => {
+                // Parent is root
+                resource_ids.push("fs::/".to_string());
+                break;
+            }
+            Some(pos) => current = &current[..pos],
+            None => break,
+        }
+    }
+
+    // Create entities with parent relationships
+    for (idx, id) in resource_ids.iter().enumerate() {
+        let uid = EntityUid::from_type_name_and_id(
+            resource_type.clone(),
+            EntityId::from_str(id).unwrap(),
+        );
+
+        let parents: HashSet<EntityUid> = if idx + 1 < resource_ids.len() {
+            let parent_uid = EntityUid::from_type_name_and_id(
+                resource_type.clone(),
+                EntityId::from_str(&resource_ids[idx + 1]).unwrap(),
+            );
+            HashSet::from([parent_uid])
+        } else {
+            HashSet::new()
+        };
+
+        entities.push(Entity::new_no_attrs(uid, parents));
+    }
+
+    // Add the principal entity
+    let agent_uid = EntityUid::from_type_name_and_id(
+        EntityTypeName::from_str("Agent").unwrap(),
+        EntityId::from_str(agent_id).unwrap(),
+    );
+    entities.push(Entity::new_no_attrs(agent_uid, HashSet::new()));
+
+    // Add action entities for filesystem operations
+    for action in &["fs:read", "fs:write", "fs:create", "fs:delete"] {
+        let action_uid = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Action").unwrap(),
+            EntityId::from_str(action).unwrap(),
+        );
+        entities.push(Entity::new_no_attrs(action_uid, HashSet::new()));
+    }
+
+    Entities::from_entities(entities, None)
+        .map_err(|e| anyhow::anyhow!("failed to build fs entity set: {e}"))
+}
+
+/// Build the Cedar entity set for a process operation.
+///
+/// Creates a single resource entity for the command:
+/// - `Resource::"proc::command"` (no hierarchy)
+///
+/// Also creates action entities for `proc:exec`, `proc:fork`, `proc:signal`
+/// and the agent entity.
+pub fn build_proc_entities(command: &str, agent_id: &str) -> anyhow::Result<Entities> {
+    let mut entities = Vec::new();
+
+    // Resource: proc::<command>
+    let resource_id = format!("proc::{command}");
+    let resource_uid = EntityUid::from_type_name_and_id(
+        EntityTypeName::from_str("Resource").unwrap(),
+        EntityId::from_str(&resource_id).unwrap(),
+    );
+    entities.push(Entity::new_no_attrs(resource_uid, HashSet::new()));
+
+    // Add the principal entity
+    let agent_uid = EntityUid::from_type_name_and_id(
+        EntityTypeName::from_str("Agent").unwrap(),
+        EntityId::from_str(agent_id).unwrap(),
+    );
+    entities.push(Entity::new_no_attrs(agent_uid, HashSet::new()));
+
+    // Add action entities for process operations
+    for action in &["proc:exec", "proc:fork", "proc:signal"] {
+        let action_uid = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Action").unwrap(),
+            EntityId::from_str(action).unwrap(),
+        );
+        entities.push(Entity::new_no_attrs(action_uid, HashSet::new()));
+    }
+
+    Entities::from_entities(entities, None)
+        .map_err(|e| anyhow::anyhow!("failed to build proc entity set: {e}"))
 }
 
 /// Escape a string for use in a Cedar string literal.
@@ -349,7 +515,7 @@ mod tests {
 @id("read-repos")
 permit(
   principal == Agent::"worker",
-  action == Action::"GET",
+  action == Action::"http:GET",
   resource in Resource::"api.github.com/repos/our-org"
 );
 
@@ -357,7 +523,7 @@ permit(
 @id("create-prs")
 permit(
   principal == Agent::"worker",
-  action == Action::"POST",
+  action == Action::"http:POST",
   resource in Resource::"api.github.com/repos/our-org"
 ) when { context.path like "*/pulls" };
 
@@ -368,7 +534,7 @@ permit(
 @reason("Direct pushes to main are not allowed; use a pull request")
 forbid(
   principal,
-  action == Action::"POST",
+  action == Action::"http:POST",
   resource in Resource::"api.github.com"
 ) when { context.path like "*/git/refs/heads/main" };
 "#;
@@ -400,7 +566,7 @@ forbid(
     #[test]
     fn entity_hierarchy_structure() {
         let entities =
-            build_entity_hierarchy("api.github.com", "/repos/org/repo", "worker").unwrap();
+            build_http_entity_hierarchy("api.github.com", "/repos/org/repo", "worker").unwrap();
         // Should have: 4 resource entities + 1 agent + 7 action entities = 12
         let count = entities.iter().count();
         assert!(count >= 4, "expected at least 4 entities, got {count}");
@@ -428,7 +594,7 @@ forbid(
         let result = engine
             .evaluate(
                 "api.github.com",
-                "GET",
+                "http:GET",
                 "/repos/our-org/repo",
                 &[],
                 "worker",
@@ -449,7 +615,7 @@ forbid(
         let result = engine
             .evaluate(
                 "api.github.com",
-                "POST",
+                "http:POST",
                 "/repos/our-org/repo/pulls",
                 &[],
                 "worker",
@@ -473,7 +639,7 @@ forbid(
         let result = engine
             .evaluate(
                 "api.github.com",
-                "DELETE",
+                "http:DELETE",
                 "/repos/our-org/repo",
                 &[],
                 "worker",
@@ -492,7 +658,7 @@ forbid(
         let result = engine
             .evaluate(
                 "api.github.com",
-                "POST",
+                "http:POST",
                 "/repos/our-org/repo/git/refs/heads/main",
                 &[],
                 "worker",
@@ -509,7 +675,7 @@ forbid(
         let f = write_policy(GITHUB_POLICY);
         let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
-            .evaluate("api.github.com", "PATCH", "/settings", &[], "worker")
+            .evaluate("api.github.com", "http:PATCH", "/settings", &[], "worker")
             .unwrap();
         assert!(!result.allowed, "PATCH /settings should be denied");
     }
@@ -519,7 +685,7 @@ forbid(
         let f = write_policy(GITHUB_POLICY);
         let engine = PolicyEngine::load(f.path(), None).unwrap();
         let result = engine
-            .evaluate("api.github.com", "GET", "/unknown", &[], "worker")
+            .evaluate("api.github.com", "http:GET", "/unknown", &[], "worker")
             .unwrap();
         assert!(!result.allowed, "GET /unknown should be denied");
     }
@@ -563,7 +729,7 @@ forbid(
 @id("allow-in-parent")
 permit(
     principal == Agent::"worker",
-    action == Action::"GET",
+    action == Action::"http:GET",
     resource in Resource::"example.com/a"
 );
 "#,
@@ -572,7 +738,7 @@ permit(
 
         // a/b/c should be allowed because it's in Resource::"example.com/a"
         let result = engine
-            .evaluate("example.com", "GET", "/a/b/c", &[], "worker")
+            .evaluate("example.com", "http:GET", "/a/b/c", &[], "worker")
             .unwrap();
         assert!(
             result.allowed,
@@ -581,7 +747,7 @@ permit(
 
         // /x should be denied (not in Resource::"example.com/a")
         let result = engine
-            .evaluate("example.com", "GET", "/x", &[], "worker")
+            .evaluate("example.com", "http:GET", "/x", &[], "worker")
             .unwrap();
         assert!(!result.allowed, "GET /x should be denied (not in /a)");
     }
@@ -599,7 +765,7 @@ permit(
     const VALID_SCHEMA: &str = r#"
 entity Agent;
 entity Resource in [Resource];
-action "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
+action "http:GET", "http:POST", "http:PUT", "http:PATCH", "http:DELETE", "http:HEAD", "http:OPTIONS"
     appliesTo { principal: Agent, resource: Resource, context: {} };
 "#;
 
@@ -608,7 +774,7 @@ action "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
 @id("allow-get")
 permit(
     principal == Agent::"worker",
-    action == Action::"GET",
+    action == Action::"http:GET",
     resource in Resource::"example.com/api"
 );
 "#;
@@ -636,7 +802,7 @@ permit(
 @id("bad-principal")
 permit(
     principal == UnknownType::"foo",
-    action == Action::"GET",
+    action == Action::"http:GET",
     resource
 );
 "#;
@@ -689,7 +855,7 @@ permit(
 @id("ci-read")
 permit(
     principal == Agent::"ci-bot",
-    action == Action::"GET",
+    action == Action::"http:GET",
     resource in Resource::"api.github.com"
 );
 "#,
@@ -698,13 +864,25 @@ permit(
 
         // ci-bot should be allowed
         let result = engine
-            .evaluate("api.github.com", "GET", "/repos/org/repo", &[], "ci-bot")
+            .evaluate(
+                "api.github.com",
+                "http:GET",
+                "/repos/org/repo",
+                &[],
+                "ci-bot",
+            )
             .unwrap();
         assert!(result.allowed, "ci-bot should be allowed");
 
         // anonymous should be denied (different principal)
         let result = engine
-            .evaluate("api.github.com", "GET", "/repos/org/repo", &[], "anonymous")
+            .evaluate(
+                "api.github.com",
+                "http:GET",
+                "/repos/org/repo",
+                &[],
+                "anonymous",
+            )
             .unwrap();
         assert!(!result.allowed, "anonymous should be denied");
     }
@@ -717,14 +895,14 @@ permit(
 @id("worker-read")
 permit(
     principal == Agent::"worker",
-    action == Action::"GET",
+    action == Action::"http:GET",
     resource in Resource::"api.github.com"
 );
 
 @id("ci-bot-write")
 permit(
     principal == Agent::"ci-bot",
-    action == Action::"POST",
+    action == Action::"http:POST",
     resource in Resource::"api.github.com"
 );
 "#,
@@ -733,21 +911,45 @@ permit(
 
         // worker can GET, cannot POST
         let result = engine
-            .evaluate("api.github.com", "GET", "/repos/org/repo", &[], "worker")
+            .evaluate(
+                "api.github.com",
+                "http:GET",
+                "/repos/org/repo",
+                &[],
+                "worker",
+            )
             .unwrap();
         assert!(result.allowed, "worker GET should be allowed");
         let result = engine
-            .evaluate("api.github.com", "POST", "/repos/org/repo", &[], "worker")
+            .evaluate(
+                "api.github.com",
+                "http:POST",
+                "/repos/org/repo",
+                &[],
+                "worker",
+            )
             .unwrap();
         assert!(!result.allowed, "worker POST should be denied");
 
         // ci-bot can POST, cannot GET
         let result = engine
-            .evaluate("api.github.com", "POST", "/repos/org/repo", &[], "ci-bot")
+            .evaluate(
+                "api.github.com",
+                "http:POST",
+                "/repos/org/repo",
+                &[],
+                "ci-bot",
+            )
             .unwrap();
         assert!(result.allowed, "ci-bot POST should be allowed");
         let result = engine
-            .evaluate("api.github.com", "GET", "/repos/org/repo", &[], "ci-bot")
+            .evaluate(
+                "api.github.com",
+                "http:GET",
+                "/repos/org/repo",
+                &[],
+                "ci-bot",
+            )
             .unwrap();
         assert!(!result.allowed, "ci-bot GET should be denied");
     }
@@ -763,14 +965,14 @@ permit(
 @reason("Destructive operations are not allowed on production repos")
 forbid(
     principal,
-    action == Action::"DELETE",
+    action == Action::"http:DELETE",
     resource in Resource::"api.github.com"
 );
 
 @id("allow-read")
 permit(
     principal == Agent::"worker",
-    action == Action::"GET",
+    action == Action::"http:GET",
     resource in Resource::"api.github.com"
 );
 "#,
@@ -779,7 +981,13 @@ permit(
 
         // DELETE triggers the forbid with @reason
         let result = engine
-            .evaluate("api.github.com", "DELETE", "/repos/org/repo", &[], "worker")
+            .evaluate(
+                "api.github.com",
+                "http:DELETE",
+                "/repos/org/repo",
+                &[],
+                "worker",
+            )
             .unwrap();
         assert!(!result.allowed);
         assert!(
@@ -793,7 +1001,13 @@ permit(
 
         // GET triggers the permit (no @reason annotation)
         let result = engine
-            .evaluate("api.github.com", "GET", "/repos/org/repo", &[], "worker")
+            .evaluate(
+                "api.github.com",
+                "http:GET",
+                "/repos/org/repo",
+                &[],
+                "worker",
+            )
             .unwrap();
         assert!(result.allowed);
         assert!(
@@ -831,7 +1045,13 @@ forbid(
         let engine = PolicyEngine::load(f.path(), None).unwrap();
 
         let result = engine
-            .evaluate("api.github.com", "GET", "/repos/org/repo", &[], "worker")
+            .evaluate(
+                "api.github.com",
+                "http:GET",
+                "/repos/org/repo",
+                &[],
+                "worker",
+            )
             .unwrap();
         assert!(!result.allowed);
         // No @reason annotation → policy_reasons is empty
@@ -864,7 +1084,7 @@ forbid(
         let result = engine
             .evaluate(
                 "api.github.com",
-                "GET",
+                "http:GET",
                 "/repos/our-org/my-repo",
                 &[],
                 "worker",
@@ -884,7 +1104,7 @@ forbid(
         let result = engine
             .evaluate(
                 "api.github.com",
-                "POST",
+                "http:POST",
                 "/repos/our-org/my-repo/pulls",
                 &[],
                 "worker",
@@ -904,7 +1124,7 @@ forbid(
         let result = engine
             .evaluate(
                 "api.github.com",
-                "POST",
+                "http:POST",
                 "/repos/our-org/my-repo/git/refs/heads/main",
                 &[],
                 "worker",
@@ -924,7 +1144,7 @@ forbid(
         let result = engine
             .evaluate(
                 "api.github.com",
-                "POST",
+                "http:POST",
                 "/repos/our-org/my-repo/git/refs/heads/release/v1.0",
                 &[],
                 "worker",
@@ -944,7 +1164,7 @@ forbid(
         let result = engine
             .evaluate(
                 "api.github.com",
-                "DELETE",
+                "http:DELETE",
                 "/repos/our-org/my-repo",
                 &[],
                 "worker",
@@ -964,7 +1184,7 @@ forbid(
         let result = engine
             .evaluate(
                 "api.github.com",
-                "PATCH",
+                "http:PATCH",
                 "/repos/our-org/my-repo/settings",
                 &[],
                 "worker",
@@ -985,7 +1205,7 @@ forbid(
 @id("allow-s3")
 permit(
     principal == Agent::"worker",
-    action == Action::"GET",
+    action == Action::"http:GET",
     resource
 ) when { context.aws_service == "s3" && context.aws_region == "us-east-1" };
 "#,
@@ -996,7 +1216,7 @@ permit(
         let result = engine
             .evaluate(
                 "s3.us-east-1.amazonaws.com",
-                "GET",
+                "http:GET",
                 "/bucket/key",
                 &[],
                 "worker",
@@ -1008,7 +1228,7 @@ permit(
         let result = engine
             .evaluate(
                 "lambda.us-east-1.amazonaws.com",
-                "GET",
+                "http:GET",
                 "/functions",
                 &[],
                 "worker",
@@ -1018,7 +1238,7 @@ permit(
 
         // Non-AWS request should NOT match (no aws_service in context)
         let result = engine
-            .evaluate("api.github.com", "GET", "/repos", &[], "worker")
+            .evaluate("api.github.com", "http:GET", "/repos", &[], "worker")
             .unwrap();
         assert!(
             !result.allowed,
@@ -1033,7 +1253,7 @@ permit(
 @id("allow-iam-read")
 permit(
     principal == Agent::"worker",
-    action == Action::"GET",
+    action == Action::"http:GET",
     resource
 ) when { context.aws_service == "iam" && context.aws_region == "us-east-1" };
 "#,
@@ -1042,7 +1262,7 @@ permit(
 
         // Global endpoint (iam.amazonaws.com) should default to us-east-1
         let result = engine
-            .evaluate("iam.amazonaws.com", "GET", "/", &[], "worker")
+            .evaluate("iam.amazonaws.com", "http:GET", "/", &[], "worker")
             .unwrap();
         assert!(
             result.allowed,
@@ -1057,7 +1277,7 @@ permit(
 @id("allow-s3-us-east-1")
 permit(
     principal == Agent::"worker",
-    action == Action::"GET",
+    action == Action::"http:GET",
     resource
 ) when { context.aws_service == "s3" && context.aws_region == "us-east-1" };
 "#,
@@ -1068,7 +1288,7 @@ permit(
         let result = engine
             .evaluate(
                 "s3.us-east-1.amazonaws.com",
-                "GET",
+                "http:GET",
                 "/bucket",
                 &[],
                 "worker",
@@ -1080,7 +1300,7 @@ permit(
         let result = engine
             .evaluate(
                 "s3.eu-west-1.amazonaws.com",
-                "GET",
+                "http:GET",
                 "/bucket",
                 &[],
                 "worker",
@@ -1122,7 +1342,7 @@ permit(
         let result = engine
             .evaluate(
                 "s3.us-east-1.amazonaws.com",
-                "PUT",
+                "http:PUT",
                 "/my-bucket/object.txt",
                 &[],
                 "worker",
@@ -1142,7 +1362,7 @@ permit(
         let result = engine
             .evaluate(
                 "s3.us-gov-west-1.amazonaws.com",
-                "GET",
+                "http:GET",
                 "/bucket",
                 &[],
                 "worker",
@@ -1162,7 +1382,7 @@ permit(
         let result = engine
             .evaluate(
                 "api.github.com",
-                "GET",
+                "http:GET",
                 "/repos/other-org/their-repo",
                 &[],
                 "worker",
@@ -1172,5 +1392,157 @@ permit(
             !result.allowed,
             "GET /repos/other-org/their-repo should be denied"
         );
+    }
+
+    // --- Namespaced action entity tests ---
+
+    #[test]
+    fn http_get_action_entity_construction() {
+        // Verify Action::"http:GET" entity is created and usable
+        let f = write_policy(
+            r#"
+@id("allow-http-get")
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+        let result = engine
+            .evaluate("example.com", "http:GET", "/test", &[], "worker")
+            .unwrap();
+        assert!(result.allowed, "http:GET action should match");
+
+        // Bare "GET" (without http: prefix) should NOT match
+        let result = engine
+            .evaluate("example.com", "GET", "/test", &[], "worker")
+            .unwrap();
+        assert!(!result.allowed, "bare GET should not match http:GET policy");
+    }
+
+    #[test]
+    fn fs_read_action_entity_construction() {
+        let entities = build_fs_entities("/project/src", "worker").unwrap();
+        let count = entities.iter().count();
+        // Should have: 3 resource entities (fs::/project/src, fs::/project, fs::/) +
+        //              1 agent + 4 fs action entities = 8
+        assert!(count >= 8, "expected at least 8 fs entities, got {count}");
+    }
+
+    #[test]
+    fn proc_exec_action_entity_construction() {
+        let entities = build_proc_entities("curl", "worker").unwrap();
+        let count = entities.iter().count();
+        // Should have: 1 resource (proc::curl) + 1 agent + 3 proc actions = 5
+        assert_eq!(count, 5, "expected 5 proc entities, got {count}");
+    }
+
+    #[test]
+    fn fs_resource_hierarchy_builds_parent_chain() {
+        // Verify that Resource::"fs::/project/src" has parent fs::/project, which has parent fs::/
+        let f = write_policy(
+            r#"
+@id("allow-fs-read-project")
+permit(
+    principal == Agent::"worker",
+    action == Action::"fs:read",
+    resource in Resource::"fs::/project"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // Build fs entities for /project/src and evaluate
+        let entities = build_fs_entities("/project/src", "worker").unwrap();
+
+        let principal = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Agent").unwrap(),
+            EntityId::from_str("worker").unwrap(),
+        );
+        let action = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Action").unwrap(),
+            EntityId::from_str("fs:read").unwrap(),
+        );
+        let resource = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Resource").unwrap(),
+            EntityId::from_str("fs::/project/src").unwrap(),
+        );
+        let context = Context::empty();
+
+        let request = Request::new(principal, action, resource, context, None).unwrap();
+        let authorizer = Authorizer::new();
+        let response = authorizer.is_authorized(&request, &engine.policy_set, &entities);
+        assert_eq!(
+            response.decision(),
+            Decision::Allow,
+            "fs::/project/src should be in fs::/project (parent chain)"
+        );
+
+        // /other/path should be denied (not in fs::/project)
+        let entities2 = build_fs_entities("/other/path", "worker").unwrap();
+        let resource2 = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Resource").unwrap(),
+            EntityId::from_str("fs::/other/path").unwrap(),
+        );
+        let principal2 = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Agent").unwrap(),
+            EntityId::from_str("worker").unwrap(),
+        );
+        let action2 = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Action").unwrap(),
+            EntityId::from_str("fs:read").unwrap(),
+        );
+        let request2 =
+            Request::new(principal2, action2, resource2, Context::empty(), None).unwrap();
+        let response2 = authorizer.is_authorized(&request2, &engine.policy_set, &entities2);
+        assert_eq!(
+            response2.decision(),
+            Decision::Deny,
+            "fs::/other/path should NOT be in fs::/project"
+        );
+    }
+
+    #[test]
+    fn old_format_policy_triggers_migration_error() {
+        let f = write_policy(
+            r#"
+@id("old-format")
+permit(
+    principal == Agent::"worker",
+    action == Action::"GET",
+    resource
+);
+"#,
+        );
+        let result = PolicyEngine::load(f.path(), None);
+        assert!(result.is_err(), "old-format action should be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("old-format actions"),
+            "error should mention old-format: {err}"
+        );
+        assert!(
+            err.contains("http:GET"),
+            "error should suggest http:GET migration: {err}"
+        );
+    }
+
+    #[test]
+    fn old_format_detection_does_not_flag_namespaced_actions() {
+        // Policy using correct namespaced format should load fine
+        let f = write_policy(
+            r#"
+@id("namespaced")
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource
+);
+"#,
+        );
+        let result = PolicyEngine::load(f.path(), None);
+        assert!(result.is_ok(), "namespaced action should not be flagged");
     }
 }

@@ -16,8 +16,8 @@ entity Agent;
 // Resource::"s3.us-east-1.amazonaws.com", and so on up to the bare host.
 entity Resource in [Resource];
 
-// HTTP methods. strait creates action entities for each standard method.
-action "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
+// Namespaced HTTP methods. strait creates action entities for each standard method.
+action "http:GET", "http:POST", "http:PUT", "http:PATCH", "http:DELETE", "http:HEAD", "http:OPTIONS"
     appliesTo {
         principal: Agent,
         resource: Resource,

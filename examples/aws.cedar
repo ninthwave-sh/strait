@@ -2,7 +2,7 @@
 //
 // Entity model (built automatically by strait from each HTTP request):
 //   Principal: Agent::"worker"           — the calling process
-//   Action:    Action::"GET", "PUT", …   — HTTP method
+//   Action:    Action::"http:GET", "http:PUT", …   — namespaced HTTP method
 //   Resource:  Resource::"s3.us-east-1.amazonaws.com/bucket/key"
 //              — host + path segments, forming a hierarchy via Cedar `in`
 //
@@ -38,7 +38,7 @@ permit(
 @id("allow-lambda-invoke")
 permit(
     principal == Agent::"worker",
-    action == Action::"POST",
+    action == Action::"http:POST",
     resource
 ) when {
     context.aws_service == "lambda" &&
@@ -50,7 +50,7 @@ permit(
 @id("allow-dynamodb-read")
 permit(
     principal == Agent::"worker",
-    action == Action::"POST",
+    action == Action::"http:POST",
     resource
 ) when {
     context.aws_service == "dynamodb"
@@ -78,7 +78,7 @@ forbid(
 @reason("IAM modifications must go through the organization's SSO workflow")
 forbid(
     principal,
-    action == Action::"POST",
+    action == Action::"http:POST",
     resource
 ) when {
     context.aws_service == "iam"

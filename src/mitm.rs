@@ -133,7 +133,8 @@ pub async fn handle_mitm(
 
     // Evaluate Cedar policy (if configured)
     if let Some(engine) = policy {
-        let decision = engine.evaluate(host, &method, &path, &headers, &agent_id)?;
+        let action = format!("http:{method}");
+        let decision = engine.evaluate(host, &action, &path, &headers, &agent_id)?;
 
         let policy_display = if decision.policy_names.is_empty() {
             "default-deny".to_string()

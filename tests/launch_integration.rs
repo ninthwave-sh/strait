@@ -1,7 +1,8 @@
 //! Integration tests for `strait launch` (observe, warn, and enforce modes).
 //!
-//! These tests require Docker to be running. They are skipped gracefully
-//! if Docker is not available (no test failure).
+//! These tests require Docker to be running with `alpine:latest` pulled.
+//! - **CI**: the workflow pulls alpine:latest before tests; missing Docker panics.
+//! - **Local dev**: tests skip gracefully if Docker is not available.
 //!
 //! Run explicitly with: `cargo test --test launch_integration`
 
@@ -23,6 +24,25 @@ async fn docker_available() -> bool {
     }
     // Check that the required test image is available locally
     docker.inspect_image("alpine:latest").await.is_ok()
+}
+
+/// Require Docker for an integration test.
+///
+/// - **CI** (`CI` env var set): panics if Docker+alpine is unavailable, since
+///   the CI workflow pulls `alpine:latest` before running tests.
+/// - **Developer machines**: returns `false` so the test can skip gracefully.
+async fn require_docker() -> bool {
+    if docker_available().await {
+        return true;
+    }
+    if std::env::var("CI").is_ok() {
+        panic!(
+            "Docker with alpine:latest is required in CI but not available. \
+             Ensure the CI workflow runs `docker pull alpine:latest` before tests."
+        );
+    }
+    eprintln!("Skipping: Docker not available (run `docker pull alpine:latest` to enable)");
+    false
 }
 
 /// Helper to read an observation JSONL file into parsed events.
@@ -57,8 +77,7 @@ fn events_of_type<'a>(
 /// and exits cleanly with exit code 0.
 #[tokio::test]
 async fn launch_observe_echo_hello() {
-    if !docker_available().await {
-        eprintln!("Skipping: Docker not available");
+    if !require_docker().await {
         return;
     }
 
@@ -105,8 +124,7 @@ async fn launch_observe_echo_hello() {
 /// lifecycle events.
 #[tokio::test]
 async fn launch_observe_contains_lifecycle_events() {
-    if !docker_available().await {
-        eprintln!("Skipping: Docker not available");
+    if !require_docker().await {
         return;
     }
 
@@ -150,8 +168,7 @@ async fn launch_observe_contains_lifecycle_events() {
 /// Agent exits immediately with bad command — clean error with exit code.
 #[tokio::test]
 async fn launch_observe_bad_command_exit_code() {
-    if !docker_available().await {
-        eprintln!("Skipping: Docker not available");
+    if !require_docker().await {
         return;
     }
 
@@ -276,8 +293,7 @@ async fn launch_policy_missing_file_fails_fast() {
 /// The agent sees only the permitted mounts.
 #[tokio::test]
 async fn launch_policy_restricts_mounts() {
-    if !docker_available().await {
-        eprintln!("Skipping: Docker not available");
+    if !require_docker().await {
         return;
     }
 
@@ -340,8 +356,7 @@ permit(
 /// `launch --warn` with restrictive policy still allows the agent to succeed.
 #[tokio::test]
 async fn launch_warn_allows_agent_to_succeed() {
-    if !docker_available().await {
-        eprintln!("Skipping: Docker not available");
+    if !require_docker().await {
         return;
     }
 

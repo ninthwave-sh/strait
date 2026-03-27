@@ -19,7 +19,7 @@ use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
-use crate::config::{ProxyContext, StraitConfig};
+use crate::config::{git_policy_poll_task, ProxyContext, StraitConfig};
 use crate::mitm::{handle_mitm, should_mitm};
 
 #[derive(Parser)]
@@ -121,6 +121,14 @@ async fn run_proxy(config_path: PathBuf) -> anyhow::Result<()> {
 
     // Print port to stderr for programmatic consumption
     eprintln!("PORT={}", local_addr.port());
+
+    // Start git policy poll task if configured
+    if ctx.git_policy.is_some() {
+        let poll_ctx = ctx.clone();
+        tokio::spawn(async move {
+            git_policy_poll_task(poll_ctx).await;
+        });
+    }
 
     // Start health check server if configured
     if let Some(ref health_config) = config.health {

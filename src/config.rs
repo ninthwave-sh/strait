@@ -10,8 +10,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use arc_swap::ArcSwap;
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
@@ -122,13 +123,49 @@ fn default_keepalive_timeout_secs() -> u64 {
     DEFAULT_KEEPALIVE_TIMEOUT_SECS
 }
 
-/// `[policy]` section — path to a Cedar policy file and optional schema.
+/// `[policy]` section — Cedar policy source (local file or git repository).
+///
+/// Exactly one of `file` or `git_url` must be set:
+/// - `file`: load a `.cedar` policy from a local path (no polling, no hot-reload).
+/// - `git_url`: clone a git repository and load the policy from it. The repo is
+///   polled at `poll_interval_secs` for changes and hot-reloaded atomically.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PolicyConfig {
-    /// Path to a `.cedar` policy file.
-    pub path: PathBuf,
-    /// Optional path to a `.cedarschema` file for policy validation at startup.
+    /// Path to a local `.cedar` policy file (mutually exclusive with `git_url`).
+    pub file: Option<PathBuf>,
+    /// Git repository URL to clone policies from (mutually exclusive with `file`).
+    pub git_url: Option<String>,
+    /// Relative path to the `.cedar` file within the git repo.
+    /// When omitted, auto-detects a single `.cedar` file in the repo root.
+    pub git_path: Option<String>,
+    /// Optional path to a `.cedarschema` file for policy validation.
+    /// In file mode: local filesystem path. In git mode: relative to repo root.
     pub schema: Option<PathBuf>,
+    /// Polling interval (seconds) for git-hosted policies (default: 60).
+    /// Only used when `git_url` is set; ignored for file mode.
+    pub poll_interval_secs: Option<u64>,
+}
+
+impl PolicyConfig {
+    /// Validate that the policy configuration is consistent.
+    fn validate(&self) -> anyhow::Result<()> {
+        match (&self.file, &self.git_url) {
+            (Some(_), Some(_)) => {
+                anyhow::bail!("[policy] `file` and `git_url` are mutually exclusive")
+            }
+            (None, None) => {
+                anyhow::bail!("[policy] requires either `file` or `git_url`")
+            }
+            _ => {}
+        }
+        if self.file.is_some() && self.git_path.is_some() {
+            anyhow::bail!("[policy] `git_path` is only valid with `git_url`");
+        }
+        if self.file.is_some() && self.poll_interval_secs.is_some() {
+            anyhow::bail!("[policy] `poll_interval_secs` is only valid with `git_url`");
+        }
+        Ok(())
+    }
 }
 
 /// `[[credential]]` array entry — a single credential for header injection.
@@ -238,6 +275,23 @@ impl StraitConfig {
 // ProxyContext — bundles all shared state for connection handlers
 // ---------------------------------------------------------------------------
 
+/// State for git-hosted policy polling.
+///
+/// Created at startup when `[policy].git_url` is set. Holds the cloned repo
+/// directory and paths needed by the background poll task.
+pub struct GitPolicyState {
+    /// Temp directory holding the cloned repo (kept alive for cleanup on drop).
+    _temp_dir: tempfile::TempDir,
+    /// Path to the cloned git repository.
+    pub repo_dir: PathBuf,
+    /// Absolute path to the `.cedar` policy file within the cloned repo.
+    pub policy_path: PathBuf,
+    /// Absolute path to the `.cedarschema` file within the cloned repo (if any).
+    pub schema_path: Option<PathBuf>,
+    /// Polling interval for git fetch.
+    pub poll_interval: Duration,
+}
+
 /// All shared state needed by connection handlers.
 ///
 /// Built once at startup from [`StraitConfig`] and passed (via `Arc`) to every
@@ -245,8 +299,12 @@ impl StraitConfig {
 pub struct ProxyContext {
     /// Session-local CA for issuing per-host leaf certificates.
     pub session_ca: SessionCa,
-    /// Cedar policy engine (if a policy file is configured).
-    pub policy_engine: Option<Arc<PolicyEngine>>,
+    /// Cedar policy engine, wrapped in [`ArcSwap`] for atomic hot-reload.
+    ///
+    /// In git mode, the background poll task swaps in a new engine when the
+    /// upstream repo changes. In-flight requests hold the old `Arc` until they
+    /// complete — no partial policy states are ever visible.
+    pub policy_engine: Option<ArcSwap<PolicyEngine>>,
     /// Credential store for header injection (if credentials are configured).
     pub credential_store: Option<Arc<CredentialStore>>,
     /// Structured JSON audit logger.
@@ -263,27 +321,69 @@ pub struct ProxyContext {
     pub identity_header: String,
     /// Default agent identity when the identity header is absent.
     pub identity_default: String,
+    /// Git policy state for the background poll task (`None` for file mode).
+    pub git_policy: Option<GitPolicyState>,
 }
 
 impl ProxyContext {
     /// Build a [`ProxyContext`] from a parsed [`StraitConfig`].
     ///
-    /// This generates the session CA, loads the Cedar policy file, resolves
-    /// credentials, and initializes the audit logger.
+    /// This generates the session CA, loads the Cedar policy file (from disk or
+    /// git), resolves credentials, and initializes the audit logger. If
+    /// `[policy].git_url` is set, the repository is cloned at startup.
     pub fn from_config(config: &StraitConfig) -> anyhow::Result<Self> {
         // Generate session CA
         let session_ca = SessionCa::generate()?;
         info!("session CA generated");
 
         // Load Cedar policy (if configured)
-        let policy_engine = match &config.policy {
+        let (policy_engine, git_policy) = match &config.policy {
             Some(policy_config) => {
-                let engine =
-                    PolicyEngine::load(&policy_config.path, policy_config.schema.as_deref())?;
-                info!(path = %policy_config.path.display(), "Cedar policy loaded");
-                Some(Arc::new(engine))
+                policy_config.validate()?;
+
+                if let Some(ref git_url) = policy_config.git_url {
+                    // Git mode: clone repo and load policy from it
+                    let temp_dir = tempfile::TempDir::new()
+                        .context("failed to create temp directory for git clone")?;
+                    let repo_dir = temp_dir.path().join("repo");
+
+                    git_clone(git_url, &repo_dir)
+                        .with_context(|| format!("failed to clone policy repo: {git_url}"))?;
+                    info!(url = git_url, "policy git repo cloned");
+
+                    let policy_path = match &policy_config.git_path {
+                        Some(p) => repo_dir.join(p),
+                        None => find_cedar_file(&repo_dir)?,
+                    };
+
+                    let schema_path = policy_config.schema.as_ref().map(|s| repo_dir.join(s));
+
+                    let engine = PolicyEngine::load(&policy_path, schema_path.as_deref())?;
+                    info!(path = %policy_path.display(), "Cedar policy loaded from git");
+
+                    let poll_interval =
+                        Duration::from_secs(policy_config.poll_interval_secs.unwrap_or(60));
+
+                    let git_state = GitPolicyState {
+                        _temp_dir: temp_dir,
+                        repo_dir,
+                        policy_path,
+                        schema_path,
+                        poll_interval,
+                    };
+
+                    (Some(ArcSwap::from_pointee(engine)), Some(git_state))
+                } else if let Some(ref file) = policy_config.file {
+                    // File mode: load from local path (no polling, no hot-reload)
+                    let engine = PolicyEngine::load(file, policy_config.schema.as_deref())?;
+                    info!(path = %file.display(), "Cedar policy loaded");
+                    (Some(ArcSwap::from_pointee(engine)), None)
+                } else {
+                    // Unreachable: validate() ensures one of file/git_url is set
+                    unreachable!("PolicyConfig validation should have caught this")
+                }
             }
-            None => None,
+            None => (None, None),
         };
 
         // Build credential store (if credentials are present)
@@ -317,7 +417,182 @@ impl ProxyContext {
             startup_instant: Instant::now(),
             identity_header: identity.header,
             identity_default: identity.default,
+            git_policy,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Git operations
+// ---------------------------------------------------------------------------
+
+/// Clone a git repository to the given destination path.
+fn git_clone(url: &str, dest: &Path) -> anyhow::Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["clone", "--quiet", url])
+        .arg(dest)
+        .output()
+        .context("failed to execute `git clone`")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git clone failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+/// Get the current HEAD commit SHA from a git repository.
+fn git_head_sha(repo_dir: &Path) -> anyhow::Result<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .context("failed to execute `git rev-parse HEAD`")?;
+
+    if !output.status.success() {
+        anyhow::bail!("git rev-parse HEAD failed");
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Find a single `.cedar` policy file in the given directory.
+///
+/// Returns an error if zero or more than one `.cedar` file is found.
+fn find_cedar_file(dir: &Path) -> anyhow::Result<PathBuf> {
+    let entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read directory: {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "cedar"))
+        .collect();
+
+    match entries.len() {
+        0 => anyhow::bail!(
+            "no .cedar policy files found in {}; set `git_path` in [policy]",
+            dir.display()
+        ),
+        1 => Ok(entries.into_iter().next().unwrap()),
+        n => anyhow::bail!(
+            "{n} .cedar files found in {}; set `git_path` to specify which one",
+            dir.display()
+        ),
+    }
+}
+
+/// Background task that polls a git repository for policy changes.
+///
+/// Runs `git fetch` + `git reset --hard origin/HEAD` at the configured interval.
+/// When a change is detected (by comparing HEAD SHA), the policy is reloaded and
+/// atomically swapped via [`ArcSwap`]. In-flight requests see the old policy until
+/// the swap completes.
+pub async fn git_policy_poll_task(ctx: Arc<ProxyContext>) {
+    let git_state = match &ctx.git_policy {
+        Some(s) => s,
+        None => return,
+    };
+
+    let repo_dir = &git_state.repo_dir;
+    let mut last_sha = git_head_sha(repo_dir).unwrap_or_default();
+
+    info!(
+        interval_secs = git_state.poll_interval.as_secs(),
+        sha = %last_sha,
+        "git policy poll task started"
+    );
+
+    let mut interval = tokio::time::interval(git_state.poll_interval);
+    interval.tick().await; // skip first immediate tick
+
+    loop {
+        interval.tick().await;
+
+        // Fetch updates from origin
+        let fetch = tokio::process::Command::new("git")
+            .args(["fetch", "origin", "--quiet"])
+            .current_dir(repo_dir)
+            .output()
+            .await;
+
+        match fetch {
+            Ok(ref output) if output.status.success() => {}
+            Ok(ref output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(error = %stderr.trim(), "git fetch failed, retrying next interval");
+                continue;
+            }
+            Err(ref e) => {
+                warn!(error = %e, "git fetch execution failed, retrying next interval");
+                continue;
+            }
+        }
+
+        // Reset to latest origin/HEAD
+        let reset = tokio::process::Command::new("git")
+            .args(["reset", "--hard", "origin/HEAD", "--quiet"])
+            .current_dir(repo_dir)
+            .output()
+            .await;
+
+        match reset {
+            Ok(ref output) if output.status.success() => {}
+            Ok(ref output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!(error = %stderr.trim(), "git reset failed, retrying next interval");
+                continue;
+            }
+            Err(ref e) => {
+                warn!(error = %e, "git reset execution failed, retrying next interval");
+                continue;
+            }
+        }
+
+        // Check if HEAD changed
+        let new_sha = match git_head_sha(repo_dir) {
+            Ok(sha) => sha,
+            Err(e) => {
+                warn!(error = %e, "failed to read git HEAD after fetch");
+                continue;
+            }
+        };
+
+        if new_sha == last_sha {
+            continue;
+        }
+
+        // Policy changed — reload and swap atomically
+        info!(
+            old_sha = %&last_sha[..last_sha.len().min(8)],
+            new_sha = %&new_sha[..new_sha.len().min(8)],
+            "git policy change detected, reloading"
+        );
+
+        let policy_path = git_state.policy_path.clone();
+        let schema_path = git_state.schema_path.clone();
+
+        let load_result = tokio::task::spawn_blocking(move || {
+            PolicyEngine::load(&policy_path, schema_path.as_deref())
+        })
+        .await;
+
+        match load_result {
+            Ok(Ok(new_engine)) => {
+                if let Some(ref swap) = ctx.policy_engine {
+                    swap.store(Arc::new(new_engine));
+                    info!(sha = %new_sha, "git policy hot-reloaded successfully");
+                    last_sha = new_sha;
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    error = %e,
+                    "failed to load updated git policy, keeping previous version"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "policy reload task panicked");
+            }
+        }
     }
 }
 
@@ -352,7 +627,7 @@ port = 8080
 hosts = ["api.github.com", "api.stripe.com"]
 
 [policy]
-path = "policy.cedar"
+file = "policy.cedar"
 
 [[credential]]
 host = "api.github.com"
@@ -379,8 +654,8 @@ port = 9090
         assert_eq!(config.listen.port, 8080);
         assert_eq!(config.mitm.hosts, vec!["api.github.com", "api.stripe.com"]);
         assert_eq!(
-            config.policy.as_ref().unwrap().path,
-            PathBuf::from("policy.cedar")
+            config.policy.as_ref().unwrap().file,
+            Some(PathBuf::from("policy.cedar"))
         );
         assert_eq!(config.credential.len(), 1);
         assert_eq!(
@@ -586,7 +861,9 @@ ca_cert_path = "/tmp/ca.pem"
                 "lambda.us-east-1.amazonaws.com",
             ]
         );
-        assert!(config.policy.is_some());
+        let policy = config.policy.as_ref().unwrap();
+        assert_eq!(policy.file, Some(PathBuf::from("examples/github.cedar")));
+        assert!(policy.git_url.is_none());
         // Two credentials: GitHub bearer + AWS SigV4
         assert_eq!(config.credential.len(), 2);
         assert_eq!(
@@ -600,5 +877,468 @@ ca_cert_path = "/tmp/ca.pem"
         );
         assert_eq!(config.credential[1].credential_type, "aws-sigv4");
         assert_eq!(config.health.as_ref().unwrap().port, 9090);
+    }
+
+    // --- Policy config validation tests ---
+
+    #[test]
+    fn policy_git_url_mode_parses() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+[policy]
+git_url = "https://example.com/policies.git"
+git_path = "policies/main.cedar"
+schema = "policies/schema.cedarschema"
+poll_interval_secs = 30
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        let policy = config.policy.unwrap();
+        assert!(policy.file.is_none());
+        assert_eq!(
+            policy.git_url.as_deref(),
+            Some("https://example.com/policies.git")
+        );
+        assert_eq!(policy.git_path.as_deref(), Some("policies/main.cedar"));
+        assert_eq!(
+            policy.schema,
+            Some(PathBuf::from("policies/schema.cedarschema"))
+        );
+        assert_eq!(policy.poll_interval_secs, Some(30));
+    }
+
+    #[test]
+    fn policy_file_mode_parses() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+[policy]
+file = "policy.cedar"
+schema = "policy.cedarschema"
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        let policy = config.policy.unwrap();
+        assert_eq!(policy.file, Some(PathBuf::from("policy.cedar")));
+        assert!(policy.git_url.is_none());
+        assert!(policy.git_path.is_none());
+        assert_eq!(policy.schema, Some(PathBuf::from("policy.cedarschema")));
+        assert!(policy.poll_interval_secs.is_none());
+    }
+
+    #[test]
+    fn policy_file_and_git_url_both_set_errors() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+[policy]
+file = "policy.cedar"
+git_url = "https://example.com/policies.git"
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        let result = config.policy.unwrap().validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn policy_neither_file_nor_git_url_errors() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+[policy]
+schema = "policy.cedarschema"
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        let result = config.policy.unwrap().validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("requires either"), "got: {err}");
+    }
+
+    #[test]
+    fn policy_git_path_invalid_with_file_mode() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+[policy]
+file = "policy.cedar"
+git_path = "some/path.cedar"
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        let result = config.policy.unwrap().validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("git_path"),
+            "error should mention git_path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn policy_poll_interval_invalid_with_file_mode() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+[policy]
+file = "policy.cedar"
+poll_interval_secs = 30
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        let result = config.policy.unwrap().validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("poll_interval_secs"),
+            "error should mention poll_interval_secs, got: {err}"
+        );
+    }
+
+    // --- ArcSwap verification ---
+
+    #[test]
+    fn arcswap_policy_engine_load_and_store() {
+        let permit_all = r#"permit(principal, action, resource);"#;
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(permit_all.as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"",
+            pf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(decision.allowed, "permit-all policy should allow");
+
+        let deny_all = r#"forbid(principal, action, resource);"#;
+        let mut df = NamedTempFile::new().unwrap();
+        df.write_all(deny_all.as_bytes()).unwrap();
+        df.flush().unwrap();
+        let new_engine = PolicyEngine::load(df.path(), None).unwrap();
+        ctx.policy_engine
+            .as_ref()
+            .unwrap()
+            .store(Arc::new(new_engine));
+
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(!decision.allowed, "deny-all policy should deny");
+    }
+
+    // --- Git clone integration tests ---
+
+    fn setup_bare_repo(
+        policy_content: &str,
+        schema_content: Option<&str>,
+    ) -> (tempfile::TempDir, String) {
+        use std::process::Command as Cmd;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare_path = dir.path().join("policies.git");
+        let work_path = dir.path().join("work");
+
+        let out = Cmd::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git init --bare failed");
+
+        let out = Cmd::new("git")
+            .args(["clone"])
+            .arg(&bare_path)
+            .arg(&work_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git clone failed");
+
+        std::fs::write(work_path.join("policy.cedar"), policy_content).unwrap();
+        if let Some(schema) = schema_content {
+            std::fs::write(work_path.join("policy.cedarschema"), schema).unwrap();
+        }
+
+        let out = Cmd::new("git")
+            .args(["add", "."])
+            .current_dir(&work_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let out = Cmd::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "initial policy",
+            ])
+            .current_dir(&work_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git commit failed");
+
+        let out = Cmd::new("git")
+            .args(["push"])
+            .current_dir(&work_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git push failed");
+
+        let url = format!("file://{}", bare_path.display());
+        (dir, url)
+    }
+
+    fn push_policy_update(bare_dir: &Path, policy_content: &str) {
+        use std::process::Command as Cmd;
+
+        let work_path = bare_dir.join("work_update");
+        let bare_path = bare_dir.join("policies.git");
+
+        let out = Cmd::new("git")
+            .args(["clone"])
+            .arg(&bare_path)
+            .arg(&work_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        std::fs::write(work_path.join("policy.cedar"), policy_content).unwrap();
+
+        let out = Cmd::new("git")
+            .args(["add", "."])
+            .current_dir(&work_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let out = Cmd::new("git")
+            .args([
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "update policy",
+            ])
+            .current_dir(&work_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+
+        let out = Cmd::new("git")
+            .args(["push"])
+            .current_dir(&work_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    #[test]
+    fn git_clone_loads_policy() {
+        let policy = r#"permit(principal, action, resource);"#;
+        let (_bare_dir, url) = setup_bare_repo(policy, None);
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\ngit_url = \"{}\"",
+            url
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        assert!(ctx.policy_engine.is_some());
+        assert!(ctx.git_policy.is_some());
+
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("example.com", "http:GET", "/test", &[], "worker")
+            .unwrap();
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn git_clone_with_explicit_git_path() {
+        use std::process::Command as Cmd;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare_path = dir.path().join("policies.git");
+        let work_path = dir.path().join("work");
+
+        Cmd::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare_path)
+            .output()
+            .unwrap();
+        Cmd::new("git")
+            .args(["clone"])
+            .arg(&bare_path)
+            .arg(&work_path)
+            .output()
+            .unwrap();
+
+        std::fs::create_dir_all(work_path.join("policies")).unwrap();
+        std::fs::write(
+            work_path.join("policies/main.cedar"),
+            r#"permit(principal, action, resource);"#,
+        )
+        .unwrap();
+
+        Cmd::new("git")
+            .args(["add", "."])
+            .current_dir(&work_path)
+            .output()
+            .unwrap();
+        Cmd::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=T",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(&work_path)
+            .output()
+            .unwrap();
+        Cmd::new("git")
+            .args(["push"])
+            .current_dir(&work_path)
+            .output()
+            .unwrap();
+
+        let url = format!("file://{}", bare_path.display());
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n\
+             [policy]\n\
+             git_url = \"{}\"\n\
+             git_path = \"policies/main.cedar\"",
+            url
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("example.com", "http:GET", "/", &[], "worker")
+            .unwrap();
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn git_clone_with_schema_validation() {
+        let policy = r#"permit(principal, action, resource);"#;
+        let schema = r#"
+entity Agent;
+entity Resource;
+action "http:GET", "http:POST", "http:PUT", "http:PATCH", "http:DELETE", "http:HEAD", "http:OPTIONS"
+  appliesTo { principal: Agent, resource: Resource };
+"#;
+        let (_bare_dir, url) = setup_bare_repo(policy, Some(schema));
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n\
+             [policy]\n\
+             git_url = \"{}\"\n\
+             schema = \"policy.cedarschema\"",
+            url
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("example.com", "http:GET", "/test", &[], "worker")
+            .unwrap();
+        assert!(decision.allowed);
+    }
+
+    #[tokio::test]
+    async fn git_poll_detects_change_and_hot_reloads() {
+        let policy_v1 = r#"
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource
+);
+"#;
+        let (bare_dir, url) = setup_bare_repo(policy_v1, None);
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n\
+             [policy]\n\
+             git_url = \"{}\"\n\
+             poll_interval_secs = 1",
+            url
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = Arc::new(ProxyContext::from_config(&config).unwrap());
+
+        let poll_ctx = ctx.clone();
+        let handle = tokio::spawn(async move {
+            git_policy_poll_task(poll_ctx).await;
+        });
+
+        // V1: GET allowed, POST denied
+        {
+            let engine = ctx.policy_engine.as_ref().unwrap().load();
+            let d = engine
+                .evaluate("example.com", "http:GET", "/test", &[], "worker")
+                .unwrap();
+            assert!(d.allowed, "GET should be allowed in v1");
+            let d = engine
+                .evaluate("example.com", "http:POST", "/test", &[], "worker")
+                .unwrap();
+            assert!(!d.allowed, "POST should be denied in v1");
+        }
+
+        // Push v2: also allow POST
+        let policy_v2 = r#"
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource
+);
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:POST",
+    resource
+);
+"#;
+        push_policy_update(bare_dir.path(), policy_v2);
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // V2: POST now allowed
+        {
+            let engine = ctx.policy_engine.as_ref().unwrap().load();
+            let d = engine
+                .evaluate("example.com", "http:POST", "/test", &[], "worker")
+                .unwrap();
+            assert!(d.allowed, "POST should be allowed after hot-reload");
+        }
+
+        handle.abort();
     }
 }

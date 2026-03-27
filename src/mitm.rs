@@ -170,14 +170,14 @@ pub async fn handle_mitm(
         // Start timing policy evaluation
         let eval_start = Instant::now();
 
-        let policy = ctx.policy_engine.as_deref();
+        let policy_guard = ctx.policy_engine.as_ref().map(|swap| swap.load());
         let credentials = ctx.credential_store.as_deref();
         let audit = &ctx.audit_logger;
 
         // --- Policy evaluation ---
         let mut denied = false;
 
-        if let Some(engine) = policy {
+        if let Some(ref engine) = policy_guard {
             let action = format!("http:{method}");
             let decision = engine.evaluate(host, &action, &path, &headers, &agent_id)?;
 

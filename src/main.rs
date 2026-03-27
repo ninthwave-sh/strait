@@ -19,6 +19,8 @@ use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
+#[cfg(unix)]
+use crate::config::sighup_reload_task;
 use crate::config::{git_policy_poll_task, ProxyContext, StraitConfig};
 use crate::mitm::{handle_mitm, should_mitm};
 
@@ -136,6 +138,15 @@ async fn run_proxy(config_path: PathBuf) -> anyhow::Result<()> {
         let health_port = health_config.port;
         tokio::spawn(async move {
             health::start_health_server(health_port, health_ctx).await;
+        });
+    }
+
+    // Start SIGHUP reload handler (Unix only — covers Linux and macOS)
+    #[cfg(unix)]
+    if ctx.policy_engine.is_some() {
+        let sighup_ctx = ctx.clone();
+        tokio::spawn(async move {
+            sighup_reload_task(sighup_ctx).await;
         });
     }
 

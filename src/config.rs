@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
@@ -323,6 +323,8 @@ pub struct ProxyContext {
     pub identity_default: String,
     /// Git policy state for the background poll task (`None` for file mode).
     pub git_policy: Option<GitPolicyState>,
+    /// Original policy configuration for SIGHUP-triggered reloads.
+    pub policy_config: Option<PolicyConfig>,
 }
 
 impl ProxyContext {
@@ -418,6 +420,7 @@ impl ProxyContext {
             identity_header: identity.header,
             identity_default: identity.default,
             git_policy,
+            policy_config: config.policy.clone(),
         })
     }
 }
@@ -591,6 +594,115 @@ pub async fn git_policy_poll_task(ctx: Arc<ProxyContext>) {
             }
             Err(e) => {
                 warn!(error = %e, "policy reload task panicked");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SIGHUP policy reload
+// ---------------------------------------------------------------------------
+
+/// Reload the policy from its configured source (file or git).
+///
+/// On success, atomically swaps the policy in `ProxyContext.policy_engine` via
+/// [`ArcSwap`] and returns `Ok(())`. On failure, the previous policy is retained
+/// and the error is returned (caller should log it).
+///
+/// This is called by the SIGHUP handler task and can also be used for
+/// programmatic reload.
+pub fn reload_policy(ctx: &ProxyContext) -> anyhow::Result<()> {
+    let policy_config = ctx
+        .policy_config
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no policy configured, nothing to reload"))?;
+
+    let swap = ctx
+        .policy_engine
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no policy engine initialized, nothing to reload"))?;
+
+    let new_engine = if let Some(git_state) = &ctx.git_policy {
+        // Git mode: fetch latest, then reload from the local clone
+        let repo_dir = &git_state.repo_dir;
+
+        // Fetch from origin
+        let fetch = std::process::Command::new("git")
+            .args(["fetch", "origin", "--quiet"])
+            .current_dir(repo_dir)
+            .output()
+            .context("failed to execute `git fetch`")?;
+
+        if !fetch.status.success() {
+            let stderr = String::from_utf8_lossy(&fetch.stderr);
+            anyhow::bail!("git fetch failed: {}", stderr.trim());
+        }
+
+        // Reset to latest origin/HEAD
+        let reset = std::process::Command::new("git")
+            .args(["reset", "--hard", "origin/HEAD", "--quiet"])
+            .current_dir(repo_dir)
+            .output()
+            .context("failed to execute `git reset`")?;
+
+        if !reset.status.success() {
+            let stderr = String::from_utf8_lossy(&reset.stderr);
+            anyhow::bail!("git reset failed: {}", stderr.trim());
+        }
+
+        PolicyEngine::load(&git_state.policy_path, git_state.schema_path.as_deref())?
+    } else if let Some(ref file) = policy_config.file {
+        // File mode: re-read from disk
+        PolicyEngine::load(file, policy_config.schema.as_deref())?
+    } else {
+        anyhow::bail!("policy configuration has no file or git source");
+    };
+
+    swap.store(Arc::new(new_engine));
+    Ok(())
+}
+
+/// Background task that listens for `SIGHUP` and triggers a policy reload.
+///
+/// On Unix (Linux and macOS), registers a `SIGHUP` signal handler using
+/// `tokio::signal::unix`. Each received signal triggers an immediate policy
+/// reload via [`reload_policy`]. On success, the new policy takes effect for
+/// all subsequent requests. On failure, the previous policy is retained and
+/// the error is logged — the process never crashes.
+#[cfg(unix)]
+pub async fn sighup_reload_task(ctx: Arc<ProxyContext>) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut stream = match signal(SignalKind::hangup()) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "failed to register SIGHUP handler");
+            return;
+        }
+    };
+
+    info!("SIGHUP reload handler registered");
+
+    loop {
+        stream.recv().await;
+        info!("SIGHUP received, reloading policy");
+
+        // Run the (potentially blocking) reload on the blocking pool
+        let reload_ctx = ctx.clone();
+        let result = tokio::task::spawn_blocking(move || reload_policy(&reload_ctx)).await;
+
+        match result {
+            Ok(Ok(())) => {
+                info!("policy reloaded successfully via SIGHUP");
+            }
+            Ok(Err(e)) => {
+                error!(
+                    error = %e,
+                    "SIGHUP policy reload failed, keeping previous policy"
+                );
+            }
+            Err(e) => {
+                error!(error = %e, "SIGHUP policy reload task panicked");
             }
         }
     }
@@ -1338,6 +1450,303 @@ permit(
                 .unwrap();
             assert!(d.allowed, "POST should be allowed after hot-reload");
         }
+
+        handle.abort();
+    }
+
+    // --- SIGHUP reload tests ---
+
+    #[test]
+    fn reload_policy_file_mode_swaps_engine() {
+        // Start with permit-all
+        let permit_all = r#"permit(principal, action, resource);"#;
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(permit_all.as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"",
+            pf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        // Verify initial permit-all
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(decision.allowed, "initial policy should allow");
+
+        // Overwrite the policy file with forbid-all
+        std::fs::write(pf.path(), r#"forbid(principal, action, resource);"#).unwrap();
+
+        // Reload via reload_policy
+        reload_policy(&ctx).unwrap();
+
+        // Verify deny-all is now active
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(!decision.allowed, "reloaded policy should deny");
+    }
+
+    #[test]
+    fn reload_policy_invalid_file_keeps_old_policy() {
+        // Start with permit-all
+        let permit_all = r#"permit(principal, action, resource);"#;
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(permit_all.as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"",
+            pf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        // Overwrite with invalid Cedar syntax
+        std::fs::write(pf.path(), "this is not valid cedar {{{}}}").unwrap();
+
+        // Reload should fail
+        let result = reload_policy(&ctx);
+        assert!(result.is_err(), "reload with invalid syntax should fail");
+
+        // Old permit-all policy should still be active
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(
+            decision.allowed,
+            "old policy should be retained on reload failure"
+        );
+    }
+
+    #[test]
+    fn reload_policy_no_config_returns_error() {
+        // ProxyContext with no policy configured
+        let cf = write_config("ca_cert_path = \"/tmp/ca.pem\"");
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        let result = reload_policy(&ctx);
+        assert!(result.is_err(), "reload with no policy config should fail");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no policy configured"),
+            "error should mention no policy configured"
+        );
+    }
+
+    #[test]
+    fn reload_policy_schema_validation_failure_keeps_old() {
+        // Create a schema file matching strait's entity model
+        let schema_text = r#"
+entity Agent;
+entity Resource in [Resource];
+action "http:GET"
+    appliesTo {
+        principal: Agent,
+        resource: Resource,
+        context: {
+            "host": String,
+            "path": String,
+            "method": String,
+        },
+    };
+"#;
+        let mut sf = NamedTempFile::with_suffix(".cedarschema").unwrap();
+        sf.write_all(schema_text.as_bytes()).unwrap();
+        sf.flush().unwrap();
+
+        // Start with a valid policy that matches the schema
+        let valid_policy = "permit(principal, action == Action::\"http:GET\", resource);";
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(valid_policy.as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"\nschema = \"{}\"",
+            pf.path().display(),
+            sf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        // Verify initial policy allows GET
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(decision.allowed, "initial policy should allow GET");
+
+        // Overwrite with a policy that references an action not in the schema
+        std::fs::write(
+            pf.path(),
+            "permit(principal, action == Action::\"http:INVALID_NOT_IN_SCHEMA\", resource);",
+        )
+        .unwrap();
+
+        // Reload should fail due to schema validation
+        let result = reload_policy(&ctx);
+        assert!(result.is_err(), "reload should fail with schema violation");
+
+        // Old policy should still be active
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(
+            decision.allowed,
+            "old policy retained after schema validation failure"
+        );
+    }
+
+    #[test]
+    fn reload_policy_no_sighup_policy_unchanged() {
+        // Verify that without calling reload_policy, the engine stays the same
+        let permit_all = r#"permit(principal, action, resource);"#;
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(permit_all.as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"",
+            pf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        // Overwrite file on disk but DON'T reload
+        std::fs::write(pf.path(), r#"forbid(principal, action, resource);"#).unwrap();
+
+        // Policy should still be permit-all (no reload happened)
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(
+            decision.allowed,
+            "policy should be unchanged without reload"
+        );
+    }
+
+    // --- SIGHUP signal handler integration tests ---
+
+    /// Send SIGHUP to ourselves → sighup_reload_task picks it up, reloads the
+    /// policy, new policy takes effect on next eval. No external network access.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sighup_signal_reloads_policy() {
+        let permit_all = r#"permit(principal, action, resource);"#;
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(permit_all.as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"",
+            pf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = Arc::new(ProxyContext::from_config(&config).unwrap());
+
+        // Verify initial permit-all
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(decision.allowed, "initial policy should allow");
+        drop(engine);
+
+        // Spawn SIGHUP reload task
+        let sighup_ctx = ctx.clone();
+        let handle = tokio::spawn(async move {
+            sighup_reload_task(sighup_ctx).await;
+        });
+
+        // Give the signal handler a moment to register
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Overwrite with forbid-all
+        std::fs::write(pf.path(), "forbid(principal, action, resource);").unwrap();
+
+        // Send SIGHUP to ourselves
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGHUP);
+        }
+
+        // Wait for the reload to complete
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // New deny-all policy should be in effect
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(!decision.allowed, "policy should deny after SIGHUP reload");
+
+        handle.abort();
+    }
+
+    /// SIGHUP with invalid policy → old policy retained, task stays alive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sighup_invalid_policy_keeps_old_stays_alive() {
+        let permit_all = r#"permit(principal, action, resource);"#;
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(permit_all.as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"",
+            pf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = Arc::new(ProxyContext::from_config(&config).unwrap());
+
+        // Spawn SIGHUP reload task
+        let sighup_ctx = ctx.clone();
+        let handle = tokio::spawn(async move {
+            sighup_reload_task(sighup_ctx).await;
+        });
+
+        // Give the signal handler time to register
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Overwrite with invalid Cedar
+        std::fs::write(pf.path(), "this is NOT valid cedar {{{}}}").unwrap();
+
+        // Send SIGHUP
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGHUP);
+        }
+
+        // Wait for reload attempt
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Old policy retained
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(
+            decision.allowed,
+            "old policy should be retained when reload fails"
+        );
+
+        // Task still running (process didn't crash)
+        assert!(!handle.is_finished(), "reload task should still be running");
 
         handle.abort();
     }

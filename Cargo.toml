@@ -39,6 +39,8 @@ hex = "0.4"
 arc-swap = "1"
 tempfile = "3"
 terminal_size = "0.4"
+futures-util = "0.3"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

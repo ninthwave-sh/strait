@@ -125,13 +125,28 @@ TLS TRUST:
     /// Runs the specified command inside a container with filesystem and network
     /// access controlled by Cedar policies. Three modes:
     ///
-    /// - No policy flag: observe mode (allow all, record activity)
-    /// - `--warn`: evaluate policy, allow all, log violations as warnings
-    /// - `--policy`: enforce policy, deny disallowed access
+    /// - `--observe`: observe mode (allow all, record activity)
+    /// - `--warn`: evaluate policy, allow all, log violations as warnings (future)
+    /// - `--policy`: enforce policy, deny disallowed access (future)
     ///
     /// Network traffic routes through the built-in proxy. Filesystem access is
     /// controlled via bind-mount restrictions derived from Cedar `fs:` policies.
     Launch {
+        /// Run in observation mode: allow all activity, record to JSONL.
+        ///
+        /// All filesystem and network access is permitted. Activity is recorded
+        /// to an observation log for later policy generation with `strait generate`.
+        #[arg(long)]
+        observe: bool,
+
+        /// Docker image to use for the container.
+        #[arg(long, default_value = "alpine:latest")]
+        image: String,
+
+        /// Output path for the observation JSONL file.
+        #[arg(long, default_value = "observations.jsonl")]
+        output: PathBuf,
+
         /// The command and arguments to run inside the container.
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -198,9 +213,27 @@ async fn main() -> anyhow::Result<()> {
         Commands::Proxy { config } => {
             run_proxy(config).await?;
         }
-        Commands::Launch { .. } => {
-            eprintln!("strait launch: not yet implemented");
-            std::process::exit(1);
+        Commands::Launch {
+            observe,
+            image,
+            output,
+            command,
+        } => {
+            if !observe {
+                eprintln!("strait launch requires --observe (enforce mode not yet implemented)");
+                eprintln!("Usage: strait launch --observe <command> [args...]");
+                std::process::exit(1);
+            }
+
+            tracing_subscriber::fmt()
+                .json()
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .init();
+
+            let exit_code =
+                strait::launch::run_launch_observe(command, Some(&image), Some(output)).await?;
+            std::process::exit(exit_code);
         }
         Commands::Init {
             observe: duration_str,
@@ -554,8 +587,52 @@ mod tests {
     fn test_launch_subcommand_parses() {
         let cli = Cli::try_parse_from(["strait", "launch", "node", "server.js"]).unwrap();
         match cli.command {
-            Commands::Launch { command } => {
+            Commands::Launch { command, .. } => {
                 assert_eq!(command, vec!["node", "server.js"]);
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_observe_flag_parses() {
+        let cli = Cli::try_parse_from(["strait", "launch", "--observe", "echo", "hello"]).unwrap();
+        match cli.command {
+            Commands::Launch {
+                observe, command, ..
+            } => {
+                assert!(observe, "observe should be true");
+                assert_eq!(command, vec!["echo", "hello"]);
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_with_image_and_output_parses() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--observe",
+            "--image",
+            "ubuntu:24.04",
+            "--output",
+            "/tmp/obs.jsonl",
+            "npm",
+            "test",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Launch {
+                observe,
+                image,
+                output,
+                command,
+            } => {
+                assert!(observe);
+                assert_eq!(image, "ubuntu:24.04");
+                assert_eq!(output.to_str().unwrap(), "/tmp/obs.jsonl");
+                assert_eq!(command, vec!["npm", "test"]);
             }
             _ => panic!("expected Launch subcommand"),
         }

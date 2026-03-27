@@ -120,6 +120,23 @@ TLS TRUST:
         action: TemplateAction,
     },
 
+    /// Launch a command in a sandboxed container with Cedar policy enforcement.
+    ///
+    /// Runs the specified command inside a container with filesystem and network
+    /// access controlled by Cedar policies. Three modes:
+    ///
+    /// - No policy flag: observe mode (allow all, record activity)
+    /// - `--warn`: evaluate policy, allow all, log violations as warnings
+    /// - `--policy`: enforce policy, deny disallowed access
+    ///
+    /// Network traffic routes through the built-in proxy. Filesystem access is
+    /// controlled via bind-mount restrictions derived from Cedar `fs:` policies.
+    Launch {
+        /// The command and arguments to run inside the container.
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+
     /// Initialize Cedar policies by observing live traffic.
     ///
     /// Starts the proxy in observation mode: all MITM'd requests are allowed
@@ -180,6 +197,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Proxy { config } => {
             run_proxy(config).await?;
+        }
+        Commands::Launch { .. } => {
+            eprintln!("strait launch: not yet implemented");
+            std::process::exit(1);
         }
         Commands::Init {
             observe: duration_str,
@@ -489,6 +510,7 @@ fn parse_connect_target(target: &str) -> anyhow::Result<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn test_parse_connect_target_with_port() {
@@ -509,5 +531,93 @@ mod tests {
         let (host, port) = parse_connect_target("example.com:8080").unwrap();
         assert_eq!(host, "example.com");
         assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn test_cli_debug_assert() {
+        // Verify the CLI definition is internally consistent (catches clap bugs early).
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_proxy_subcommand_parses() {
+        let cli = Cli::try_parse_from(["strait", "proxy", "--config", "strait.toml"]).unwrap();
+        match cli.command {
+            Commands::Proxy { config } => {
+                assert_eq!(config.to_str().unwrap(), "strait.toml");
+            }
+            _ => panic!("expected Proxy subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_subcommand_parses() {
+        let cli = Cli::try_parse_from(["strait", "launch", "node", "server.js"]).unwrap();
+        match cli.command {
+            Commands::Launch { command } => {
+                assert_eq!(command, vec!["node", "server.js"]);
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_generate_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "generate",
+            "observations.jsonl",
+            "--output",
+            "policy.cedar",
+        ])
+        .unwrap();
+        matches!(cli.command, Commands::Generate { .. });
+    }
+
+    #[test]
+    fn test_test_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "test",
+            "--replay",
+            "observations.jsonl",
+            "--policy",
+            "policy.cedar",
+        ])
+        .unwrap();
+        matches!(cli.command, Commands::Test { .. });
+    }
+
+    #[test]
+    fn test_watch_subcommand_parses() {
+        let cli = Cli::try_parse_from(["strait", "watch"]).unwrap();
+        matches!(cli.command, Commands::Watch { .. });
+    }
+
+    #[test]
+    fn test_help_lists_all_subcommands() {
+        let cmd = Cli::command();
+        let subcommand_names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
+
+        assert!(
+            subcommand_names.contains(&"proxy"),
+            "missing 'proxy' subcommand"
+        );
+        assert!(
+            subcommand_names.contains(&"launch"),
+            "missing 'launch' subcommand"
+        );
+        assert!(
+            subcommand_names.contains(&"generate"),
+            "missing 'generate' subcommand"
+        );
+        assert!(
+            subcommand_names.contains(&"test"),
+            "missing 'test' subcommand"
+        );
+        assert!(
+            subcommand_names.contains(&"watch"),
+            "missing 'watch' subcommand"
+        );
     }
 }

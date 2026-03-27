@@ -15,7 +15,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Pull Docker images for integration tests
+        run: docker pull alpine:latest
       - run: cargo test --all-features
+      - name: Verify launch integration tests actually ran
+        run: |
+          output=$(cargo test --test launch_integration 2>&1)
+          echo "$output"
+          # Fail if any test printed the skip message (docker should be available in CI)
+          if echo "$output" | grep -q "Skipping: Docker not available"; then
+            echo "::error::Launch integration tests were skipped — Docker should be available in CI"
+            exit 1
+          fi
+          # Verify expected test count (currently 8 tests in launch_integration)
+          if ! echo "$output" | grep -qE "test result: ok\. [0-9]+ passed"; then
+            echo "::error::Launch integration tests did not report passing results"
+            exit 1
+          fi
       - run: cargo clippy --all-features -- -D warnings
       - run: cargo fmt --check
 

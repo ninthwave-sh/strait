@@ -22,7 +22,10 @@ The `test` job is a required status check on `main` — PRs cannot merge until i
 
 ## Architecture
 
-- `src/main.rs` — CLI entry point (clap), CONNECT handler, MITM/passthrough routing
+- `src/lib.rs` — library crate root, re-exports public modules for integration tests
+- `src/main.rs` — CLI entry point (clap subcommands: proxy, generate, init), CONNECT handler, observation mode
+- `src/observe.rs` — unified observation events, traffic recording, Cedar policy generation from observed traffic
+- `src/generate.rs` — Cedar policy generation from JSONL observation log files
 - `src/ca.rs` — session-local CA cert generation (rcgen)
 - `src/policy.rs` — Cedar policy engine: entity hierarchy from URL paths, per-request eval
 - `src/credentials.rs` — TOML credential store, env-var source, header injection

@@ -1366,6 +1366,240 @@ async fn keepalive_deny_mid_loop_continues() {
     let _ = read_http_response(&mut reader).await;
 }
 
+// ---------------------------------------------------------------------------
+// Observation mode tests
+// ---------------------------------------------------------------------------
+
+/// Integration test: observation log records requests, and generated policy
+/// covers observed request patterns. Uses a loopback TLS echo server to
+/// simulate the upstream API.
+#[tokio::test]
+async fn observe_mode_generates_policy_covering_observed_requests() {
+    use cedar_policy::PolicySet;
+    use std::str::FromStr;
+    use strait::observe::ObservationLog;
+
+    let log = ObservationLog::new();
+
+    // Simulate observed requests (as if they came through the proxy)
+    log.record("GET", "api.github.com", "/repos/my-org/my-repo");
+    log.record("GET", "api.github.com", "/repos/my-org/my-repo/pulls");
+    log.record("GET", "api.github.com", "/repos/my-org/my-repo/pulls/42");
+    log.record("GET", "api.github.com", "/repos/my-org/my-repo/pulls/99");
+    log.record("POST", "api.github.com", "/repos/my-org/my-repo/pulls");
+    log.record("GET", "api.github.com", "/repos/other-org/other-repo/pulls");
+
+    let policy_text = log.generate_policy();
+    let schema_text = log.generate_schema();
+
+    // Verify the generated policy is valid Cedar syntax
+    let policy_set = PolicySet::from_str(&policy_text);
+    assert!(
+        policy_set.is_ok(),
+        "Generated policy is not valid Cedar:\n{policy_text}\nError: {:?}",
+        policy_set.unwrap_err()
+    );
+
+    // Verify the policy text contains expected patterns
+    assert!(
+        policy_text.contains("Action::\"GET\""),
+        "Policy should contain GET action:\n{policy_text}"
+    );
+    assert!(
+        policy_text.contains("Action::\"POST\""),
+        "Policy should contain POST action:\n{policy_text}"
+    );
+    assert!(
+        policy_text.contains("Resource::\"api.github.com/repos\""),
+        "Policy should reference api.github.com/repos:\n{policy_text}"
+    );
+
+    // Numeric IDs (42, 99) should be collapsed to wildcards
+    assert!(
+        !policy_text.contains("/42"),
+        "Policy should not contain literal /42:\n{policy_text}"
+    );
+    assert!(
+        !policy_text.contains("/99"),
+        "Policy should not contain literal /99:\n{policy_text}"
+    );
+    assert!(
+        policy_text.contains("pulls/*"),
+        "Policy should contain pulls/* wildcard:\n{policy_text}"
+    );
+
+    // Variable positions (org names) should be collapsed
+    assert!(
+        policy_text.contains("repos/*"),
+        "Policy should collapse variable org/repo names:\n{policy_text}"
+    );
+
+    // Verify request counts in comments
+    assert!(
+        policy_text.contains("Observed"),
+        "Policy should include observation count comments:\n{policy_text}"
+    );
+
+    // Verify schema contains expected entity types
+    assert!(
+        schema_text.contains("entity Agent"),
+        "Schema should define Agent entity:\n{schema_text}"
+    );
+    assert!(
+        schema_text.contains("entity Resource in [Resource]"),
+        "Schema should define Resource hierarchy:\n{schema_text}"
+    );
+    assert!(
+        schema_text.contains("\"GET\""),
+        "Schema should include GET action:\n{schema_text}"
+    );
+    assert!(
+        schema_text.contains("\"POST\""),
+        "Schema should include POST action:\n{schema_text}"
+    );
+    assert!(
+        schema_text.contains("\"host\": String"),
+        "Schema should declare host context attribute:\n{schema_text}"
+    );
+}
+
+/// Integration test: observation mode with loopback echo server verifies
+/// that the proxy can MITM a connection and record the request.
+#[tokio::test]
+async fn observe_mode_with_loopback_echo_server() {
+    use strait::observe::ObservationLog;
+
+    let ca = strait_test_helpers::generate_ca();
+    let log = Arc::new(ObservationLog::new());
+
+    // Start TLS echo server
+    let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
+
+    // Start a mini observation proxy
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ca_clone = ca.clone();
+    let log_clone = log.clone();
+    tokio::spawn(async move {
+        let (client, _peer) = proxy_listener.accept().await.unwrap();
+
+        // Simulate observation mode MITM handler
+        strait_test_helpers::handle_observe_connection(client, &ca_clone, echo_addr, &log_clone)
+            .await;
+    });
+
+    // Connect to the proxy and send a CONNECT request
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
+        .await
+        .unwrap();
+
+    // Read the 200 response
+    let mut buf = BufReader::new(&mut client);
+    let mut response_line = String::new();
+    buf.read_line(&mut response_line).await.unwrap();
+    assert!(
+        response_line.contains("200"),
+        "Expected 200, got: {}",
+        response_line.trim()
+    );
+    // Drain response headers
+    loop {
+        let mut line = String::new();
+        buf.read_line(&mut line).await.unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+
+    // TLS handshake with the proxy
+    let mut root_store = rustls::RootCertStore::empty();
+    let ca_pem_bytes = ca.ca_cert_pem.as_bytes();
+    let mut cursor = std::io::Cursor::new(ca_pem_bytes);
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let server_name = ServerName::try_from("api.github.com").unwrap();
+    let client_inner = buf.into_inner();
+    let mut tls = connector.connect(server_name, client_inner).await.unwrap();
+
+    // Send an HTTP request through the TLS tunnel
+    tls.write_all(b"GET /repos/my-org/my-repo/pulls/42 HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+        .await
+        .unwrap();
+
+    // Read the echo response
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+    assert!(
+        response_str.contains("200 OK"),
+        "Expected 200 OK: {}",
+        response_str
+    );
+
+    // Verify the observation log recorded the request
+    assert_eq!(log.len(), 1, "Should have recorded 1 request");
+
+    // Generate and verify the policy covers the observed request
+    let policy = log.generate_policy();
+    assert!(
+        policy.contains("Action::\"GET\""),
+        "Generated policy should cover GET:\n{policy}"
+    );
+    assert!(
+        policy.contains("api.github.com"),
+        "Generated policy should reference the host:\n{policy}"
+    );
+}
+
+/// Integration test: output-dir mode writes .cedar and .cedarschema files.
+#[tokio::test]
+async fn observe_mode_output_dir_writes_files() {
+    use strait::observe::ObservationLog;
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = ObservationLog::new();
+
+    log.record("GET", "api.github.com", "/repos/org/repo");
+    log.record("POST", "api.github.com", "/repos/org/repo/pulls");
+
+    let policy = log.generate_policy();
+    let schema = log.generate_schema();
+
+    let policy_path = dir.path().join("policy.cedar");
+    let schema_path = dir.path().join("policy.cedarschema");
+    std::fs::write(&policy_path, &policy).unwrap();
+    std::fs::write(&schema_path, &schema).unwrap();
+
+    // Verify files exist and have content
+    let policy_content = std::fs::read_to_string(&policy_path).unwrap();
+    let schema_content = std::fs::read_to_string(&schema_path).unwrap();
+
+    assert!(
+        !policy_content.is_empty(),
+        "Policy file should not be empty"
+    );
+    assert!(
+        !schema_content.is_empty(),
+        "Schema file should not be empty"
+    );
+    assert!(
+        policy_content.contains("permit("),
+        "Policy file should contain permit statements"
+    );
+    assert!(
+        schema_content.contains("entity Agent"),
+        "Schema file should define Agent entity"
+    );
+}
+
 /// Test helper module exposed for integration tests.
 mod strait_test_helpers {
     use super::*;
@@ -2222,6 +2456,111 @@ mod strait_test_helpers {
         }
 
         let _ = write_half.shutdown().await;
+    }
+
+    /// Simulate an observation mode MITM handler for testing.
+    /// Like handle_mitm_connection but also records to an ObservationLog.
+    pub async fn handle_observe_connection(
+        mut client: TcpStream,
+        ca: &TestCa,
+        upstream_addr: std::net::SocketAddr,
+        log: &strait::observe::ObservationLog,
+    ) {
+        let mut buf = BufReader::new(&mut client);
+        // Read CONNECT line
+        let mut line = String::new();
+        buf.read_line(&mut line).await.unwrap();
+        // Drain headers
+        loop {
+            let mut l = String::new();
+            buf.read_line(&mut l).await.unwrap();
+            if l.trim().is_empty() {
+                break;
+            }
+        }
+        drop(buf);
+
+        // Send 200
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+
+        // Accept TLS from client using session CA
+        let (cert_chain, key) = ca.issue_leaf_cert("api.github.com");
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let mut tls_client = acceptor.accept(client).await.unwrap();
+
+        // Read inner HTTP request
+        let mut buf = BufReader::new(&mut tls_client);
+        let mut request_line = String::new();
+        buf.read_line(&mut request_line).await.unwrap();
+        let mut headers = Vec::new();
+        let mut content_length: Option<usize> = None;
+        loop {
+            let mut h = String::new();
+            buf.read_line(&mut h).await.unwrap();
+            if h.trim().is_empty() {
+                break;
+            }
+            let trimmed = h.trim().to_string();
+            if let Some((k, v)) = trimmed.split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = v.trim().parse().ok();
+                }
+            }
+            headers.push(trimmed);
+        }
+
+        // Extract method and path from request line
+        let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+        if parts.len() >= 2 {
+            log.record(parts[0], "api.github.com", parts[1]);
+        }
+
+        // Read request body if Content-Length present
+        let mut request_body = Vec::new();
+        if let Some(len) = content_length {
+            request_body.resize(len, 0);
+            buf.read_exact(&mut request_body).await.unwrap();
+        }
+
+        // Connect to upstream (echo server)
+        let upstream_tcp = TcpStream::connect(upstream_addr).await.unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut tls_upstream = connector.connect(server_name, upstream_tcp).await.unwrap();
+
+        // Forward the request
+        let mut req = request_line.clone();
+        for h in &headers {
+            req.push_str(h);
+            req.push_str("\r\n");
+        }
+        req.push_str("\r\n");
+        tls_upstream.write_all(req.as_bytes()).await.unwrap();
+        if !request_body.is_empty() {
+            tls_upstream.write_all(&request_body).await.unwrap();
+        }
+
+        // Read upstream response and relay back
+        let mut upstream_response = Vec::new();
+        tls_upstream
+            .read_to_end(&mut upstream_response)
+            .await
+            .unwrap();
+
+        let tls_client_inner = buf.into_inner();
+        let _ = tls_client_inner.write_all(&upstream_response).await;
+        let _ = tls_client_inner.shutdown().await;
     }
 
     /// Certificate verifier that accepts any certificate (for test echo server).

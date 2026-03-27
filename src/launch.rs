@@ -448,6 +448,8 @@ fn build_launch_proxy_context(
         observation_stream: Some(obs_stream),
         mitm_all: true,
         warn_only,
+        upstream_addr_override: None,
+        upstream_tls_override: None,
     })
 }
 

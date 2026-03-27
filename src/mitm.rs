@@ -534,16 +534,26 @@ pub async fn handle_mitm(
         }
 
         // --- Forward to upstream ---
-        let upstream_tcp = TcpStream::connect(format!("{host}:{port}")).await?;
+        let upstream_addr = match ctx.upstream_addr_override {
+            Some(addr) => addr.to_string(),
+            None => format!("{host}:{port}"),
+        };
+        let upstream_tcp = TcpStream::connect(&upstream_addr).await?;
 
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let tls_config = match ctx.upstream_tls_override {
+            Some(ref cfg) => cfg.clone(),
+            None => {
+                let mut root_store = rustls::RootCertStore::empty();
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                Arc::new(
+                    rustls::ClientConfig::builder()
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth(),
+                )
+            }
+        };
 
-        let client_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let connector = tokio_rustls::TlsConnector::from(tls_config);
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string())?;
         let tls_upstream = connector.connect(server_name, upstream_tcp).await?;
 
@@ -1205,7 +1215,7 @@ mod tests {
     fn connection_header_not_injected_on_outbound() {
         // Verify that handle_mitm no longer force-injects Connection: close.
         // The client's Connection header should be forwarded as-is.
-        let headers = vec![
+        let headers = [
             ("Host".to_string(), "api.github.com".to_string()),
             ("Accept".to_string(), "application/json".to_string()),
         ];
@@ -1219,7 +1229,7 @@ mod tests {
 
     #[test]
     fn client_keepalive_header_preserved() {
-        let headers = vec![
+        let headers = [
             ("Host".to_string(), "api.github.com".to_string()),
             ("Connection".to_string(), "keep-alive".to_string()),
         ];

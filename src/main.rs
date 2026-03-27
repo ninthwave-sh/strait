@@ -1,17 +1,3 @@
-mod audit;
-mod ca;
-pub mod config;
-pub mod container;
-pub mod credentials;
-pub mod generate;
-mod health;
-mod mitm;
-pub mod observe;
-pub mod policy;
-pub mod replay;
-pub mod sigv4;
-pub mod watch;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,10 +7,14 @@ use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
+use strait::config;
+use strait::generate;
+use strait::watch;
+
 #[cfg(unix)]
-use crate::config::sighup_reload_task;
-use crate::config::{git_policy_poll_task, ProxyContext, StraitConfig};
-use crate::mitm::{handle_mitm, should_mitm};
+use strait::config::sighup_reload_task;
+use strait::config::{git_policy_poll_task, ProxyContext, StraitConfig};
+use strait::mitm::{handle_mitm, should_mitm};
 
 #[derive(Parser)]
 #[command(
@@ -102,6 +92,33 @@ TLS TRUST:
         #[arg(short, long, value_name = "PATH")]
         socket: Option<PathBuf>,
     },
+
+    /// Initialize Cedar policies by observing live traffic.
+    ///
+    /// Starts the proxy in observation mode: all MITM'd requests are allowed
+    /// (no policy enforcement), credentials are injected, and every request is
+    /// recorded. After the observation period expires, a starter Cedar policy
+    /// and schema covering all observed activity are generated.
+    ///
+    /// Dynamic path segments (UUIDs, long numeric IDs, SHA hashes) are
+    /// automatically collapsed to wildcards with annotation comments.
+    Init {
+        /// Duration to observe traffic (e.g. "5m", "30s", "1h").
+        #[arg(long, value_name = "DURATION")]
+        observe: String,
+
+        /// Path to the strait.toml configuration file.
+        ///
+        /// The `[policy]` section is ignored in observation mode.
+        #[arg(short, long, value_name = "FILE")]
+        config: PathBuf,
+
+        /// Output directory for generated .cedar and .cedarschema files.
+        ///
+        /// If omitted, both files are printed to stdout.
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -117,8 +134,8 @@ async fn main() -> anyhow::Result<()> {
             generate::generate(&observations, &output, &schema)?;
         }
         Commands::Test { replay, policy } => {
-            let result = replay::replay(&replay, &policy)?;
-            let exit_code = replay::print_results(&result);
+            let result = strait::replay::replay(&replay, &policy)?;
+            let exit_code = strait::replay::print_results(&result);
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
@@ -128,6 +145,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Proxy { config } => {
             run_proxy(config).await?;
+        }
+        Commands::Init {
+            observe: duration_str,
+            config,
+            output_dir,
+        } => {
+            run_observe(config, &duration_str, output_dir).await?;
         }
     }
 
@@ -177,7 +201,7 @@ async fn run_proxy(config_path: PathBuf) -> anyhow::Result<()> {
         let health_ctx = ctx.clone();
         let health_port = health_config.port;
         tokio::spawn(async move {
-            health::start_health_server(health_port, health_ctx).await;
+            strait::health::start_health_server(health_port, health_ctx).await;
         });
     }
 
@@ -199,6 +223,140 @@ async fn run_proxy(config_path: PathBuf) -> anyhow::Result<()> {
             }
         });
     }
+}
+
+/// Run the proxy in observation mode for a fixed duration, then generate policy.
+///
+/// This is the implementation of `strait init --observe <duration>`. It:
+/// 1. Loads config but ignores the `[policy]` section (no enforcement).
+/// 2. Starts the proxy with an `ObservationStream` that records to a temp JSONL file.
+/// 3. Accepts connections for `duration`, logging all MITM'd requests.
+/// 4. Generates a Cedar policy + schema from the observation log.
+/// 5. Writes to `--output-dir` or prints to stdout.
+async fn run_observe(
+    config_path: PathBuf,
+    duration_str: &str,
+    output_dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use strait::observe::{parse_duration, ObservationStream};
+
+    let duration = parse_duration(duration_str)?;
+
+    tracing_subscriber::fmt()
+        .json()
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+
+    // Load configuration, ignoring the policy section
+    let mut config = config::StraitConfig::load(&config_path)?;
+    config.policy = None;
+    info!(
+        path = %config_path.display(),
+        "configuration loaded (observation mode — policy enforcement disabled)"
+    );
+
+    // Create observation stream with JSONL persistence
+    let temp_dir = tempfile::TempDir::new()?;
+    let obs_log_path = temp_dir.path().join("observations.jsonl");
+    let mut obs_stream = ObservationStream::new();
+    obs_stream.persist_to_file(&obs_log_path)?;
+    info!(path = %obs_log_path.display(), "observation log created");
+
+    // Build proxy context (no policy engine)
+    let mut ctx = config::ProxyContext::from_config(&config)?;
+    ctx.observation_stream = Some(obs_stream);
+    let ctx = Arc::new(ctx);
+
+    // Write CA cert PEM
+    std::fs::write(&config.ca_cert_path, &ctx.session_ca.ca_cert_pem)?;
+    info!(path = %config.ca_cert_path.display(), "CA cert written");
+
+    let listen_addr: std::net::SocketAddr =
+        format!("{}:{}", config.listen.address, config.listen.port)
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid listen address: {e}"))?;
+
+    let listener = TcpListener::bind(listen_addr).await?;
+    let local_addr = listener.local_addr()?;
+    info!(
+        port = local_addr.port(),
+        "strait listening (observation mode)"
+    );
+
+    // Print port to stderr for programmatic consumption
+    eprintln!("PORT={}", local_addr.port());
+    eprintln!(
+        "Observation mode: recording traffic for {}. Send requests through the proxy.",
+        duration_str
+    );
+
+    // Run the proxy for the specified duration
+    let accept_loop = async {
+        loop {
+            let (client, peer) = listener.accept().await?;
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(client, peer, &ctx).await {
+                    warn!(error = %e, "connection error");
+                }
+            });
+        }
+        // Type annotation for the async block to satisfy the compiler
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::select! {
+        result = accept_loop => {
+            result?;
+        }
+        _ = tokio::time::sleep(duration) => {
+            info!("observation period complete");
+        }
+    }
+
+    // Give in-flight requests a moment to complete
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Drop the context to flush the observation stream
+    drop(ctx);
+
+    eprintln!("Observation complete. Generating policy...");
+
+    // Generate policy from observations
+    match generate::generate_from_file(&obs_log_path)? {
+        Some((policy_text, schema_text, wildcard_count)) => {
+            if let Some(ref dir) = output_dir {
+                std::fs::create_dir_all(dir)?;
+                let policy_path = dir.join("policy.cedar");
+                let schema_path = dir.join("policy.cedarschema");
+                std::fs::write(&policy_path, &policy_text)?;
+                std::fs::write(&schema_path, &schema_text)?;
+                eprintln!("Policy written to {}", policy_path.display());
+                eprintln!("Schema written to {}", schema_path.display());
+            } else {
+                // Print to stdout
+                println!("# policy.cedar");
+                print!("{policy_text}");
+                println!();
+                println!("# policy.cedarschema");
+                print!("{schema_text}");
+            }
+
+            if wildcard_count > 0 {
+                eprintln!(
+                    "{wildcard_count} path segments collapsed to wildcards — review carefully"
+                );
+            }
+        }
+        None => {
+            eprintln!("No actionable requests observed during the observation period.");
+            eprintln!("Make sure your application sends requests through the proxy.");
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle a single client connection.

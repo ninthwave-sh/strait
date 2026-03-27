@@ -300,6 +300,18 @@ pub async fn handle_mitm(
             );
         }
 
+        // Emit observation event (for `init --observe` and live watchers)
+        if let Some(ref obs) = ctx.observation_stream {
+            let decision_str = if denied { "deny" } else { "allow" };
+            obs.emit(crate::observe::EventKind::NetworkRequest {
+                method: method.clone(),
+                host: host.to_string(),
+                path: path.clone(),
+                decision: decision_str.to_string(),
+                latency_us: eval_start.elapsed().as_micros() as u64,
+            });
+        }
+
         if denied {
             // After deny, continue the loop unless client requested close
             if client_wants_close {

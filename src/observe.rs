@@ -11,6 +11,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -158,6 +159,46 @@ impl ObservationStream {
     /// it receives `RecvError::Lagged(n)` indicating `n` events were dropped.
     pub fn subscribe(&self) -> broadcast::Receiver<ObservationEvent> {
         self.tx.subscribe()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Duration parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a human-readable duration string like `"5m"`, `"30s"`, or `"1h"`.
+///
+/// Supported suffixes:
+/// - `s` — seconds
+/// - `m` — minutes
+/// - `h` — hours
+///
+/// The numeric part must be a positive integer. Whitespace is trimmed.
+pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("duration cannot be empty");
+    }
+    if s.len() < 2 {
+        anyhow::bail!("invalid duration '{s}': expected format like '5m', '30s', or '1h'");
+    }
+
+    let (num_str, unit) = s.split_at(s.len() - 1);
+    let num: u64 = num_str.parse().map_err(|_| {
+        anyhow::anyhow!("invalid duration '{s}': expected format like '5m', '30s', or '1h'")
+    })?;
+
+    if num == 0 {
+        anyhow::bail!("duration must be greater than zero");
+    }
+
+    match unit {
+        "s" => Ok(Duration::from_secs(num)),
+        "m" => Ok(Duration::from_secs(num * 60)),
+        "h" => Ok(Duration::from_secs(num * 3600)),
+        _ => anyhow::bail!(
+            "invalid duration unit '{unit}': expected 's' (seconds), 'm' (minutes), or 'h' (hours)"
+        ),
     }
 }
 
@@ -823,5 +864,64 @@ mod tests {
             "socket path should contain PID, got: {}",
             path.display()
         );
+    }
+
+    // -- Duration parsing tests -----------------------------------------------
+
+    #[test]
+    fn parse_duration_seconds() {
+        let d = super::parse_duration("30s").unwrap();
+        assert_eq!(d, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_duration_minutes() {
+        let d = super::parse_duration("5m").unwrap();
+        assert_eq!(d, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn parse_duration_hours() {
+        let d = super::parse_duration("1h").unwrap();
+        assert_eq!(d, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn parse_duration_trims_whitespace() {
+        let d = super::parse_duration("  10s  ").unwrap();
+        assert_eq!(d, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn parse_duration_rejects_empty() {
+        let err = super::parse_duration("").unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_duration_rejects_zero() {
+        let err = super::parse_duration("0m").unwrap_err();
+        assert!(err.to_string().contains("greater than zero"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_duration_rejects_invalid_unit() {
+        let err = super::parse_duration("5x").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid duration unit"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_duration_rejects_non_numeric() {
+        let err = super::parse_duration("abcm").unwrap_err();
+        assert!(err.to_string().contains("invalid duration"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_duration_rejects_single_char() {
+        let err = super::parse_duration("m").unwrap_err();
+        assert!(err.to_string().contains("invalid duration"), "got: {err}");
     }
 }

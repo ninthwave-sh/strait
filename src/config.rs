@@ -17,6 +17,7 @@ use tracing::{error, info, warn};
 use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
 use crate::credentials::CredentialStore;
+use crate::observe::ObservationStream;
 use crate::policy::PolicyEngine;
 
 // ---------------------------------------------------------------------------
@@ -325,6 +326,11 @@ pub struct ProxyContext {
     pub git_policy: Option<GitPolicyState>,
     /// Original policy configuration for SIGHUP-triggered reloads.
     pub policy_config: Option<PolicyConfig>,
+    /// Optional observation stream for recording proxy activity.
+    ///
+    /// When set (e.g. during `init --observe`), every MITM'd request emits
+    /// a `NetworkRequest` event through this stream.
+    pub observation_stream: Option<ObservationStream>,
 }
 
 impl ProxyContext {
@@ -421,6 +427,7 @@ impl ProxyContext {
             identity_default: identity.default,
             git_policy,
             policy_config: config.policy.clone(),
+            observation_stream: None,
         })
     }
 }

@@ -1666,6 +1666,659 @@ fn duration_parsing_integration() {
     assert!(parse_duration("0m").is_err());
 }
 
+// ============================================================================
+// E2E Round-Trip Integration Tests (H-CP-11)
+//
+// These tests prove the entire observe-then-enforce lifecycle works
+// end-to-end at the library level. They exercise:
+//   1. Observe: emit events to a JSONL file
+//   2. Generate: produce a Cedar policy from observations
+//   3. Replay: verify the generated policy matches all observations
+//   4. Enforce (denial): verify unauthorized events are denied
+//
+// No Docker required — these use the library APIs directly with
+// synthesized observation events.
+// ============================================================================
+
+/// Full round-trip: observe → generate → replay → verify consistency.
+///
+/// Synthesizes observation events (network + mount) as produced by
+/// `strait launch --observe`, generates a Cedar policy, then replays
+/// the observations and verifies every event matches the policy.
+#[test]
+fn e2e_roundtrip_observe_generate_replay() {
+    use strait::observe::{EventKind, ObservationStream};
+
+    let dir = tempfile::tempdir().unwrap();
+    let obs_log_path = dir.path().join("observations.jsonl");
+    let policy_path = dir.path().join("generated.cedar");
+    let schema_path = dir.path().join("generated.cedarschema");
+
+    // --- Phase 1: Observe ---
+    // Simulate `strait launch --observe ./test-agent` recording activity.
+    let mut obs = ObservationStream::new();
+    obs.persist_to_file(&obs_log_path).unwrap();
+
+    // Container lifecycle events (skipped by generate/replay but part of the log)
+    obs.emit(EventKind::ContainerStart {
+        container_id: "e2e-test-container".to_string(),
+        image: "alpine:latest".to_string(),
+    });
+
+    // Mount events (recorded when container starts)
+    obs.emit(EventKind::Mount {
+        path: "/workspace".to_string(),
+        mode: "read-write".to_string(),
+    });
+
+    // Network activity: test agent makes a GET request to a loopback echo server
+    obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "api.example.com".to_string(),
+        path: "/data/items".to_string(),
+        decision: "allow".to_string(),
+        latency_us: 50,
+        enforcement_mode: String::new(),
+    });
+
+    // Filesystem activity: test agent reads a file
+    obs.emit(EventKind::FsAccess {
+        path: "/workspace/config.json".to_string(),
+        operation: "read".to_string(),
+    });
+
+    // Container stop
+    obs.emit(EventKind::ContainerStop {
+        container_id: "e2e-test-container".to_string(),
+        exit_code: Some(0),
+    });
+
+    // Flush and close the observation stream
+    drop(obs);
+
+    // Verify JSONL has all 5 events
+    let obs_content = std::fs::read_to_string(&obs_log_path).unwrap();
+    let line_count = obs_content.lines().count();
+    assert_eq!(line_count, 5, "observation log should have 5 events");
+
+    // Verify both network and mount events are present
+    assert!(
+        obs_content.contains("\"type\":\"network_request\""),
+        "observation log should contain network_request events"
+    );
+    assert!(
+        obs_content.contains("\"type\":\"mount\""),
+        "observation log should contain mount events"
+    );
+
+    // --- Phase 2: Generate ---
+    // Run `strait generate observations.jsonl` to produce a Cedar policy.
+    let wildcard_count =
+        strait::generate::generate(&obs_log_path, &policy_path, &schema_path).unwrap();
+
+    assert!(policy_path.exists(), "generated policy file should exist");
+    assert!(schema_path.exists(), "generated schema file should exist");
+
+    let policy_text = std::fs::read_to_string(&policy_path).unwrap();
+    let schema_text = std::fs::read_to_string(&schema_path).unwrap();
+
+    // Policy should cover both network and filesystem observed activity
+    assert!(
+        policy_text.contains(r#"action == Action::"http:GET""#),
+        "policy should contain http:GET action: {policy_text}"
+    );
+    assert!(
+        policy_text.contains(r#"action == Action::"fs:read""#),
+        "policy should contain fs:read action: {policy_text}"
+    );
+    assert!(
+        policy_text.contains(r#"action == Action::"fs:mount""#),
+        "policy should contain fs:mount action: {policy_text}"
+    );
+
+    // Schema should contain all observed actions
+    assert!(
+        schema_text.contains(r#"action "http:GET""#),
+        "schema should declare http:GET: {schema_text}"
+    );
+    assert!(
+        schema_text.contains(r#"action "fs:read""#),
+        "schema should declare fs:read: {schema_text}"
+    );
+    assert!(
+        schema_text.contains(r#"action "fs:mount""#),
+        "schema should declare fs:mount: {schema_text}"
+    );
+
+    // Verify generated policy is valid Cedar
+    use cedar_policy::{PolicySet, Schema, ValidationMode, Validator};
+    use std::str::FromStr;
+
+    let policy_set =
+        PolicySet::from_str(&policy_text).expect("generated policy should parse as valid Cedar");
+    let (cedar_schema, _warnings) = Schema::from_cedarschema_str(&schema_text)
+        .expect("generated schema should parse as valid Cedar schema");
+    let validator = Validator::new(cedar_schema);
+    let result = validator.validate(&policy_set, ValidationMode::Strict);
+    assert!(
+        result.validation_passed(),
+        "generated policy should pass schema validation: {:?}",
+        result
+            .validation_errors()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+
+    // --- Phase 3: Replay ---
+    // Run `strait test --replay observations.jsonl --policy generated.cedar`
+    // to verify all observed events match the generated policy (exit 0).
+    let replay_result = strait::replay::replay(&obs_log_path, &policy_path).unwrap();
+
+    assert!(
+        replay_result.mismatches.is_empty(),
+        "replay should have zero mismatches — observe/generate/enforce must be consistent. \
+         Mismatches: {:?}",
+        replay_result
+            .mismatches
+            .iter()
+            .map(|m| format!(
+                "line {}: observed={}, policy={}",
+                m.line, m.observed, m.policy_decision
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    // Evaluable events = network_request + fs_access + mount = 3
+    // Skipped events = container_start + container_stop = 2
+    assert_eq!(
+        replay_result.matches, 3,
+        "should match all 3 evaluable events"
+    );
+    assert_eq!(replay_result.skipped, 2, "should skip 2 lifecycle events");
+    assert_eq!(
+        strait::replay::print_results(&replay_result),
+        0,
+        "exit code should be 0 when all events match"
+    );
+
+    // No wildcards expected for these simple paths
+    assert_eq!(
+        wildcard_count, 0,
+        "simple paths should not produce wildcards"
+    );
+}
+
+/// E2E: enforce mode denies actions not in the generated policy.
+///
+/// Synthesizes a set of "authorized" observations, generates a policy,
+/// then replays a DIFFERENT set of observations (unauthorized activity)
+/// and verifies the policy denies them.
+#[test]
+fn e2e_enforce_denies_unauthorized_actions() {
+    use strait::observe::{EventKind, ObservationStream};
+
+    let dir = tempfile::tempdir().unwrap();
+    let obs_log_path = dir.path().join("observations.jsonl");
+    let bad_obs_log_path = dir.path().join("unauthorized.jsonl");
+    let policy_path = dir.path().join("generated.cedar");
+    let schema_path = dir.path().join("generated.cedarschema");
+
+    // --- Phase 1: Generate policy from authorized observations ---
+    let mut obs = ObservationStream::new();
+    obs.persist_to_file(&obs_log_path).unwrap();
+
+    // Authorized activity: GET to api.example.com and read /workspace/config.json
+    obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "api.example.com".to_string(),
+        path: "/data/items".to_string(),
+        decision: "allow".to_string(),
+        latency_us: 50,
+        enforcement_mode: String::new(),
+    });
+    obs.emit(EventKind::Mount {
+        path: "/workspace".to_string(),
+        mode: "read-only".to_string(),
+    });
+    obs.emit(EventKind::FsAccess {
+        path: "/workspace/config.json".to_string(),
+        operation: "read".to_string(),
+    });
+    drop(obs);
+
+    strait::generate::generate(&obs_log_path, &policy_path, &schema_path).unwrap();
+
+    // Verify the authorized observations replay cleanly
+    let authorized_result = strait::replay::replay(&obs_log_path, &policy_path).unwrap();
+    assert!(
+        authorized_result.mismatches.is_empty(),
+        "authorized observations should replay cleanly"
+    );
+
+    // --- Phase 2: Replay unauthorized observations against the same policy ---
+    let mut bad_obs = ObservationStream::new();
+    bad_obs.persist_to_file(&bad_obs_log_path).unwrap();
+
+    // Unauthorized: POST to the same host (only GET was observed)
+    bad_obs.emit(EventKind::NetworkRequest {
+        method: "POST".to_string(),
+        host: "api.example.com".to_string(),
+        path: "/data/items".to_string(),
+        decision: "allow".to_string(),
+        latency_us: 50,
+        enforcement_mode: String::new(),
+    });
+
+    // Unauthorized: GET to a different host entirely
+    bad_obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "evil.example.com".to_string(),
+        path: "/exfiltrate".to_string(),
+        decision: "allow".to_string(),
+        latency_us: 50,
+        enforcement_mode: String::new(),
+    });
+
+    // Unauthorized: write to a path (only read was in the policy)
+    bad_obs.emit(EventKind::FsAccess {
+        path: "/workspace/secret.txt".to_string(),
+        operation: "write".to_string(),
+    });
+
+    // Unauthorized: read from an unexpected path outside /workspace
+    bad_obs.emit(EventKind::FsAccess {
+        path: "/etc/shadow".to_string(),
+        operation: "read".to_string(),
+    });
+
+    drop(bad_obs);
+
+    let bad_result = strait::replay::replay(&bad_obs_log_path, &policy_path).unwrap();
+
+    // All unauthorized events should be mismatches (policy denies them)
+    assert_eq!(
+        bad_result.mismatches.len(),
+        4,
+        "all 4 unauthorized events should be denied by the policy. \
+         Matches: {}, Mismatches: {}",
+        bad_result.matches,
+        bad_result.mismatches.len()
+    );
+
+    for m in &bad_result.mismatches {
+        assert_eq!(
+            m.observed, "allow",
+            "unauthorized events were observed as 'allow'"
+        );
+        assert_eq!(
+            m.policy_decision, "deny",
+            "policy should deny unauthorized events"
+        );
+    }
+
+    assert_eq!(
+        strait::replay::print_results(&bad_result),
+        1,
+        "exit code should be 1 when mismatches are found"
+    );
+}
+
+/// Edge case: round-trip with filesystem-only activity (no network).
+///
+/// Tests that the observe/generate/replay pipeline works correctly
+/// when the agent only accesses the filesystem with no network activity.
+#[test]
+fn e2e_roundtrip_filesystem_only() {
+    use strait::observe::{EventKind, ObservationStream};
+
+    let dir = tempfile::tempdir().unwrap();
+    let obs_log_path = dir.path().join("observations.jsonl");
+    let policy_path = dir.path().join("generated.cedar");
+    let schema_path = dir.path().join("generated.cedarschema");
+
+    let mut obs = ObservationStream::new();
+    obs.persist_to_file(&obs_log_path).unwrap();
+
+    // Only filesystem activity, no network
+    obs.emit(EventKind::Mount {
+        path: "/workspace".to_string(),
+        mode: "read-write".to_string(),
+    });
+    obs.emit(EventKind::FsAccess {
+        path: "/workspace/src/main.rs".to_string(),
+        operation: "read".to_string(),
+    });
+    obs.emit(EventKind::FsAccess {
+        path: "/workspace/build/output.o".to_string(),
+        operation: "write".to_string(),
+    });
+
+    drop(obs);
+
+    // Generate policy
+    strait::generate::generate(&obs_log_path, &policy_path, &schema_path).unwrap();
+
+    let policy_text = std::fs::read_to_string(&policy_path).unwrap();
+
+    // Policy should only contain fs: actions, no http: actions
+    assert!(
+        policy_text.contains(r#"Action::"fs:read""#),
+        "policy should contain fs:read"
+    );
+    assert!(
+        policy_text.contains(r#"Action::"fs:write""#),
+        "policy should contain fs:write"
+    );
+    assert!(
+        policy_text.contains(r#"Action::"fs:mount""#),
+        "policy should contain fs:mount"
+    );
+    assert!(
+        !policy_text.contains("http:"),
+        "filesystem-only policy should not contain http: actions"
+    );
+
+    // Replay should match all events
+    let result = strait::replay::replay(&obs_log_path, &policy_path).unwrap();
+    assert!(
+        result.mismatches.is_empty(),
+        "filesystem-only round-trip should be consistent"
+    );
+    assert_eq!(result.matches, 3, "should match all 3 fs events");
+}
+
+/// Edge case: round-trip with network-only activity (no filesystem).
+///
+/// Tests that the observe/generate/replay pipeline works correctly
+/// when the agent only makes network requests with no filesystem activity.
+#[test]
+fn e2e_roundtrip_network_only() {
+    use strait::observe::{EventKind, ObservationStream};
+
+    let dir = tempfile::tempdir().unwrap();
+    let obs_log_path = dir.path().join("observations.jsonl");
+    let policy_path = dir.path().join("generated.cedar");
+    let schema_path = dir.path().join("generated.cedarschema");
+
+    let mut obs = ObservationStream::new();
+    obs.persist_to_file(&obs_log_path).unwrap();
+
+    // Only network activity, no filesystem
+    obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "api.github.com".to_string(),
+        path: "/repos/org/repo".to_string(),
+        decision: "allow".to_string(),
+        latency_us: 100,
+        enforcement_mode: String::new(),
+    });
+    obs.emit(EventKind::NetworkRequest {
+        method: "POST".to_string(),
+        host: "api.github.com".to_string(),
+        path: "/repos/org/repo/issues".to_string(),
+        decision: "allow".to_string(),
+        latency_us: 200,
+        enforcement_mode: String::new(),
+    });
+
+    drop(obs);
+
+    // Generate policy
+    strait::generate::generate(&obs_log_path, &policy_path, &schema_path).unwrap();
+
+    let policy_text = std::fs::read_to_string(&policy_path).unwrap();
+
+    // Policy should only contain http: actions, no fs: actions
+    assert!(
+        policy_text.contains(r#"Action::"http:GET""#),
+        "policy should contain http:GET"
+    );
+    assert!(
+        policy_text.contains(r#"Action::"http:POST""#),
+        "policy should contain http:POST"
+    );
+    assert!(
+        !policy_text.contains("fs:"),
+        "network-only policy should not contain fs: actions"
+    );
+
+    // Replay should match all events
+    let result = strait::replay::replay(&obs_log_path, &policy_path).unwrap();
+    assert!(
+        result.mismatches.is_empty(),
+        "network-only round-trip should be consistent"
+    );
+    assert_eq!(result.matches, 2, "should match both network events");
+}
+
+/// E2E: wildcard collapsing generates valid Cedar with annotations.
+///
+/// Tests that observations with UUIDs, long numbers, and SHA hashes
+/// produce correctly collapsed wildcard policies. The wildcards are
+/// for human review — Cedar doesn't do glob matching, so wildcard
+/// resources are intentionally more restrictive than the original
+/// concrete paths. Users are expected to review and adjust.
+///
+/// The annotation comments preserve the original values for reference.
+#[test]
+fn e2e_wildcard_collapsing_produces_valid_annotated_policy() {
+    use strait::observe::{EventKind, ObservationStream};
+
+    let dir = tempfile::tempdir().unwrap();
+    let obs_log_path = dir.path().join("observations.jsonl");
+    let policy_path = dir.path().join("generated.cedar");
+    let schema_path = dir.path().join("generated.cedarschema");
+
+    let mut obs = ObservationStream::new();
+    obs.persist_to_file(&obs_log_path).unwrap();
+
+    // UUID in path
+    obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "api.example.com".to_string(),
+        path: "/users/550e8400-e29b-41d4-a716-446655440000/profile".to_string(),
+        decision: "allow".to_string(),
+        latency_us: 50,
+        enforcement_mode: String::new(),
+    });
+
+    // Different UUID in same path pattern
+    obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "api.example.com".to_string(),
+        path: "/users/660e8400-e29b-41d4-a716-446655440001/profile".to_string(),
+        decision: "allow".to_string(),
+        latency_us: 50,
+        enforcement_mode: String::new(),
+    });
+
+    // Long numeric ID in path
+    obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "api.github.com".to_string(),
+        path: "/repos/org/repo/pulls/12345".to_string(),
+        decision: "allow".to_string(),
+        latency_us: 50,
+        enforcement_mode: String::new(),
+    });
+
+    // SHA hash in path
+    obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "github.com".to_string(),
+        path: "/org/repo/commit/da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string(),
+        decision: "allow".to_string(),
+        latency_us: 50,
+        enforcement_mode: String::new(),
+    });
+
+    drop(obs);
+
+    // Generate policy with wildcards
+    let wildcard_count =
+        strait::generate::generate(&obs_log_path, &policy_path, &schema_path).unwrap();
+
+    assert!(
+        wildcard_count > 0,
+        "should have collapsed dynamic path segments to wildcards"
+    );
+
+    let policy_text = std::fs::read_to_string(&policy_path).unwrap();
+    let schema_text = std::fs::read_to_string(&schema_path).unwrap();
+
+    // Wildcards should appear in the policy resources
+    assert!(
+        policy_text.contains("users/*/profile"),
+        "UUID segments should be collapsed to wildcard: {policy_text}"
+    );
+
+    // Annotation comments should contain the original values
+    assert!(
+        policy_text.contains("550e8400-e29b-41d4-a716-446655440000"),
+        "annotation should list first UUID: {policy_text}"
+    );
+    assert!(
+        policy_text.contains("660e8400-e29b-41d4-a716-446655440001"),
+        "annotation should list second UUID: {policy_text}"
+    );
+    assert!(
+        policy_text.contains("12345"),
+        "annotation should list numeric ID: {policy_text}"
+    );
+    assert!(
+        policy_text.contains("da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+        "annotation should list SHA hash: {policy_text}"
+    );
+
+    // Deduplicated: two UUIDs → one permit statement for that pattern
+    // (UUIDs are different but collapse to same pattern)
+    let uuid_permit_count = policy_text.matches("users/*/profile").count();
+    assert_eq!(
+        uuid_permit_count, 1,
+        "two UUIDs in same pattern should deduplicate to one permit: {policy_text}"
+    );
+
+    // Generated policy should be valid Cedar
+    use cedar_policy::{PolicySet, Schema, ValidationMode, Validator};
+    use std::str::FromStr;
+
+    let policy_set =
+        PolicySet::from_str(&policy_text).expect("wildcard policy should be valid Cedar syntax");
+    let (cedar_schema, _warnings) =
+        Schema::from_cedarschema_str(&schema_text).expect("schema should be valid");
+    let validator = Validator::new(cedar_schema);
+    let result = validator.validate(&policy_set, ValidationMode::Strict);
+    assert!(
+        result.validation_passed(),
+        "wildcard policy should pass schema validation"
+    );
+}
+
+/// E2E: mixed activity round-trip with container lifecycle events.
+///
+/// Tests the full lifecycle as it would appear in a real
+/// `strait launch --observe` session, including container start/stop
+/// events that are correctly skipped during generate and replay.
+#[test]
+fn e2e_roundtrip_full_lifecycle_mixed_events() {
+    use strait::observe::{EventKind, ObservationStream};
+
+    let dir = tempfile::tempdir().unwrap();
+    let obs_log_path = dir.path().join("observations.jsonl");
+    let policy_path = dir.path().join("generated.cedar");
+    let schema_path = dir.path().join("generated.cedarschema");
+
+    let mut obs = ObservationStream::new();
+    obs.persist_to_file(&obs_log_path).unwrap();
+
+    // Full lifecycle: start → mounts → network → fs → stop
+    obs.emit(EventKind::ContainerStart {
+        container_id: "abc123".to_string(),
+        image: "alpine:latest".to_string(),
+    });
+    obs.emit(EventKind::Mount {
+        path: "/workspace".to_string(),
+        mode: "read-write".to_string(),
+    });
+    obs.emit(EventKind::Mount {
+        path: "/data".to_string(),
+        mode: "read-only".to_string(),
+    });
+    obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "api.example.com".to_string(),
+        path: "/health".to_string(),
+        decision: "allow".to_string(),
+        latency_us: 30,
+        enforcement_mode: String::new(),
+    });
+    obs.emit(EventKind::FsAccess {
+        path: "/workspace/output.txt".to_string(),
+        operation: "write".to_string(),
+    });
+    obs.emit(EventKind::FsAccess {
+        path: "/data/input.csv".to_string(),
+        operation: "read".to_string(),
+    });
+    obs.emit(EventKind::ContainerStop {
+        container_id: "abc123".to_string(),
+        exit_code: Some(0),
+    });
+
+    drop(obs);
+
+    // Generate
+    strait::generate::generate(&obs_log_path, &policy_path, &schema_path).unwrap();
+
+    // Replay
+    let result = strait::replay::replay(&obs_log_path, &policy_path).unwrap();
+
+    assert_eq!(result.total, 7, "total events in log");
+    assert_eq!(result.skipped, 2, "container start/stop should be skipped");
+    assert_eq!(
+        result.matches, 5,
+        "5 evaluable events (2 mounts + 1 network + 2 fs) should match"
+    );
+    assert!(
+        result.mismatches.is_empty(),
+        "full lifecycle round-trip must be consistent"
+    );
+    assert_eq!(strait::replay::print_results(&result), 0);
+
+    // --- Verify enforcement denies different agent ---
+    // A different agent trying to write to /data (read-only) or
+    // hit a different host should be denied.
+    let bad_obs_path = dir.path().join("bad-agent.jsonl");
+    let mut bad_obs = ObservationStream::new();
+    bad_obs.persist_to_file(&bad_obs_path).unwrap();
+
+    // Unauthorized: write to read-only /data path
+    bad_obs.emit(EventKind::FsAccess {
+        path: "/data/tampered.csv".to_string(),
+        operation: "write".to_string(),
+    });
+
+    // Unauthorized: hit a different API
+    bad_obs.emit(EventKind::NetworkRequest {
+        method: "POST".to_string(),
+        host: "evil.example.com".to_string(),
+        path: "/exfiltrate".to_string(),
+        decision: "allow".to_string(),
+        latency_us: 50,
+        enforcement_mode: String::new(),
+    });
+
+    drop(bad_obs);
+
+    let bad_result = strait::replay::replay(&bad_obs_path, &policy_path).unwrap();
+    assert_eq!(
+        bad_result.mismatches.len(),
+        2,
+        "both unauthorized actions should be denied"
+    );
+    assert_eq!(strait::replay::print_results(&bad_result), 1);
+}
+
 /// Test helper module exposed for integration tests.
 mod strait_test_helpers {
     use super::*;

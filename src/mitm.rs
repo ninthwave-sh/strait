@@ -6,12 +6,13 @@
 //! either returns a 403 or forwards it upstream with credential injection.
 //! For all other hosts the connection is tunneled transparently without any decryption.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
 use rustls::ServerConfig;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{copy_bidirectional, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
@@ -22,6 +23,102 @@ use crate::credentials::CredentialStore;
 /// Returns true if the given host should be MITM'd.
 pub fn should_mitm(host: &str, mitm_hosts: &[String]) -> bool {
     mitm_hosts.iter().any(|h| h == host)
+}
+
+/// Handle a single client connection from an HTTP CONNECT proxy.
+///
+/// For CONNECT requests: check if the target host should be MITM'd.
+/// - When `ctx.mitm_all` is true: always MITM (used by `launch` modes).
+/// - When the host is in `ctx.mitm_hosts`: MITM for policy inspection.
+/// - All other hosts: transparent TCP tunnel (no decryption).
+pub async fn handle_connection(
+    mut client: TcpStream,
+    peer: SocketAddr,
+    ctx: &ProxyContext,
+) -> anyhow::Result<()> {
+    let mut buf_client = BufReader::new(&mut client);
+    let mut request_line = String::new();
+    buf_client.read_line(&mut request_line).await?;
+
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Ok(());
+    }
+
+    let method = parts[0];
+    let target = parts[1];
+
+    if method.eq_ignore_ascii_case("CONNECT") {
+        // Parse host:port from CONNECT target
+        let (host, port) = parse_connect_target(target)?;
+
+        // Drain remaining headers (up to empty line)
+        loop {
+            let mut line = String::new();
+            buf_client.read_line(&mut line).await?;
+            if line.trim().is_empty() {
+                break;
+            }
+        }
+
+        // Drop the BufReader so we get back sole ownership of client
+        drop(buf_client);
+
+        if ctx.mitm_all || should_mitm(&host, &ctx.mitm_hosts) {
+            // MITM path: send 200, then terminate TLS with session CA
+            info!(
+                host = host.as_str(),
+                port = port,
+                peer = %peer,
+                "CONNECT: MITM path"
+            );
+
+            // Send 200 Connection Established before starting TLS handshake
+            client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await?;
+
+            // Hand off to MITM handler
+            handle_mitm(client, &host, port, ctx).await?;
+        } else {
+            // Passthrough path: transparent TCP tunnel
+            let mut upstream = TcpStream::connect(format!("{host}:{port}")).await?;
+
+            // Log passthrough event
+            ctx.audit_logger.log_passthrough(&host, port);
+
+            info!(
+                host = host.as_str(),
+                port = port,
+                peer = %peer,
+                "CONNECT: passthrough (no MITM)"
+            );
+
+            // Send 200 Connection Established
+            client
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await?;
+
+            // Tunnel bytes bidirectionally
+            let _ = copy_bidirectional(&mut client, &mut upstream).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a CONNECT target like `"host:port"` into `(host, port)`.
+///
+/// Defaults to port 443 when no port is specified.
+pub fn parse_connect_target(target: &str) -> anyhow::Result<(String, u16)> {
+    if let Some((host, port_str)) = target.rsplit_once(':') {
+        let port: u16 = port_str
+            .parse()
+            .with_context(|| format!("invalid port in CONNECT target: {target}"))?;
+        Ok((host.to_string(), port))
+    } else {
+        Ok((target.to_string(), 443))
+    }
 }
 
 /// Perform MITM on the client connection with HTTP/1.1 keep-alive.
@@ -176,6 +273,7 @@ pub async fn handle_mitm(
 
         // --- Policy evaluation ---
         let mut denied = false;
+        let mut warned = false;
 
         if let Some(ref engine) = policy_guard {
             let action = format!("http:{method}");
@@ -187,7 +285,7 @@ pub async fn handle_mitm(
                 decision.policy_names.join(", ")
             };
 
-            if !decision.allowed {
+            if !decision.allowed && !ctx.warn_only {
                 // Build a human-readable denial reason. If the matching policy has
                 // a @reason("...") annotation, use that; otherwise use a generic format.
                 let denial_reason = if !decision.policy_reasons.is_empty() {
@@ -231,6 +329,61 @@ pub async fn handle_mitm(
                 write_half.flush().await?;
 
                 denied = true;
+            } else if !decision.allowed {
+                // Warn mode: policy denied but we allow through and log a warning
+                let denial_reason = if !decision.policy_reasons.is_empty() {
+                    decision.policy_reasons.join("; ")
+                } else {
+                    format!(
+                        "Request would be denied by policy '{}': {} {} on {}",
+                        policy_display, method, path, host
+                    )
+                };
+
+                warn!(
+                    host = host,
+                    method = method.as_str(),
+                    path = path.as_str(),
+                    agent = agent_id.as_str(),
+                    policy = policy_display.as_str(),
+                    "WARN: request would be denied by Cedar policy (allowing in warn mode)"
+                );
+
+                // Emit PolicyViolation observation event
+                if let Some(ref obs) = ctx.observation_stream {
+                    obs.emit(crate::observe::EventKind::PolicyViolation {
+                        enforcement_mode: "warn".to_string(),
+                        action: format!("http:{method}"),
+                        resource: format!("{host}{path}"),
+                        decision: "warn".to_string(),
+                        reason: denial_reason,
+                    });
+                }
+
+                // Inject credentials and forward (same as allow path)
+                let credential_injected = inject_credential(
+                    host,
+                    &method,
+                    &path,
+                    &mut headers,
+                    body.as_deref(),
+                    credentials,
+                );
+
+                audit.log_decision(
+                    host,
+                    port,
+                    &method,
+                    &path,
+                    &agent_id,
+                    "warn",
+                    &decision.policy_names,
+                    credential_injected,
+                    None,
+                    eval_start,
+                );
+
+                warned = true;
             } else {
                 // ALLOW path — check for credential injection
                 let credential_injected = inject_credential(
@@ -302,7 +455,13 @@ pub async fn handle_mitm(
 
         // Emit observation event (for `init --observe` and live watchers)
         if let Some(ref obs) = ctx.observation_stream {
-            let decision_str = if denied { "deny" } else { "allow" };
+            let decision_str = if denied {
+                "deny"
+            } else if warned {
+                "warn"
+            } else {
+                "allow"
+            };
             obs.emit(crate::observe::EventKind::NetworkRequest {
                 method: method.clone(),
                 host: host.to_string(),
@@ -587,6 +746,37 @@ fn inject_credential(
 mod tests {
     use super::*;
     use crate::config::CredentialEntryConfig;
+
+    // -- parse_connect_target tests ------------------------------------------
+
+    #[test]
+    fn parse_connect_target_with_port() {
+        let (host, port) = parse_connect_target("api.github.com:443").unwrap();
+        assert_eq!(host, "api.github.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn parse_connect_target_without_port() {
+        let (host, port) = parse_connect_target("api.github.com").unwrap();
+        assert_eq!(host, "api.github.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn parse_connect_target_custom_port() {
+        let (host, port) = parse_connect_target("example.com:8080").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn parse_connect_target_invalid_port() {
+        let result = parse_connect_target("example.com:notaport");
+        assert!(result.is_err());
+    }
+
+    // -- should_mitm tests ----------------------------------------------------
 
     #[test]
     fn github_api_is_inspected() {

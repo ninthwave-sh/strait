@@ -46,21 +46,21 @@ strait evaluates a `.cedar` policy file against every MITM'd request. The entity
 // Allow read access to org repos
 permit(
   principal == Agent::"worker",
-  action == Action::"GET",
+  action == Action::"http:GET",
   resource in Resource::"api.github.com/repos/our-org"
 );
 
 // Allow PR creation
 permit(
   principal == Agent::"worker",
-  action == Action::"POST",
+  action == Action::"http:POST",
   resource in Resource::"api.github.com/repos/our-org"
 ) when { context.path like "*/pulls" };
 
 // Deny push to main
 forbid(
   principal,
-  action == Action::"POST",
+  action == Action::"http:POST",
   resource in Resource::"api.github.com/repos"
 ) when { context.path like "*/git/refs/heads/main" };
 ```

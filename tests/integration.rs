@@ -3166,9 +3166,8 @@ mod strait_test_helpers {
             }
             // Replace Transfer-Encoding with Content-Length in headers
             headers.retain(|h| {
-                !h.split_once(':').is_some_and(|(k, _)| {
-                    k.trim().eq_ignore_ascii_case("transfer-encoding")
-                })
+                !h.split_once(':')
+                    .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("transfer-encoding"))
             });
             headers.push(format!("Content-Length: {}", request_body.len()));
         } else if let Some(len) = content_length {

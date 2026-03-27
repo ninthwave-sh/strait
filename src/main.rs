@@ -9,6 +9,7 @@ use tracing::{info, warn};
 
 use strait::config;
 use strait::generate;
+use strait::templates;
 use strait::watch;
 
 #[cfg(unix)]
@@ -25,6 +26,23 @@ use strait::mitm::{handle_mitm, should_mitm};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Subcommand)]
+enum TemplateAction {
+    /// List all available policy templates.
+    List,
+    /// Apply a template — write .cedar + .cedarschema files.
+    Apply {
+        /// Template name (e.g. "github-org-readonly").
+        name: String,
+
+        /// Output directory for the generated files.
+        ///
+        /// If omitted, both files are printed to stdout.
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -93,6 +111,15 @@ TLS TRUST:
         socket: Option<PathBuf>,
     },
 
+    /// Manage built-in Cedar policy templates.
+    ///
+    /// List available templates or apply one to get a starting Cedar policy
+    /// and schema for common access patterns (GitHub orgs, AWS S3, etc.).
+    Template {
+        #[command(subcommand)]
+        action: TemplateAction,
+    },
+
     /// Initialize Cedar policies by observing live traffic.
     ///
     /// Starts the proxy in observation mode: all MITM'd requests are allowed
@@ -133,6 +160,14 @@ async fn main() -> anyhow::Result<()> {
         } => {
             generate::generate(&observations, &output, &schema)?;
         }
+        Commands::Template { action } => match action {
+            TemplateAction::List => {
+                templates::list();
+            }
+            TemplateAction::Apply { name, output_dir } => {
+                templates::apply(&name, output_dir.as_deref())?;
+            }
+        },
         Commands::Test { replay, policy } => {
             let result = strait::replay::replay(&replay, &policy)?;
             let exit_code = strait::replay::print_results(&result);

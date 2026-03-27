@@ -1,0 +1,27 @@
+// VALIDATED: 2026-03-27 strait init --observe
+// aws-s3-readonly — Cedar schema for read-only S3 access.
+//
+// Entity model:
+//   Agent    — the calling process (e.g. Agent::"worker")
+//   Resource — URL path hierarchy: Resource::"s3.us-east-1.amazonaws.com/bucket/key"
+//   Action   — namespaced HTTP methods
+//
+// AWS context attributes are set automatically by strait when the target
+// host matches *.amazonaws.com.
+
+entity Agent;
+
+entity Resource in [Resource];
+
+action "http:GET", "http:POST", "http:PUT", "http:PATCH", "http:DELETE", "http:HEAD", "http:OPTIONS"
+    appliesTo {
+        principal: Agent,
+        resource: Resource,
+        context: {
+            "host": String,
+            "path": String,
+            "method": String,
+            "aws_service": String,
+            "aws_region": String,
+        },
+    };

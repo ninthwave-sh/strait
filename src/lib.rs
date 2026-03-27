@@ -16,4 +16,5 @@ pub mod observe;
 pub mod policy;
 pub mod replay;
 pub mod sigv4;
+pub mod templates;
 pub mod watch;

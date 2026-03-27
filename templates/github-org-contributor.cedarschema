@@ -1,0 +1,22 @@
+// VALIDATED: 2026-03-27 strait init --observe
+// github-org-contributor — Cedar schema for GitHub contributor access.
+//
+// Entity model:
+//   Agent    — the calling process (e.g. Agent::"worker")
+//   Resource — URL path hierarchy: Resource::"api.github.com/repos/org/repo"
+//   Action   — namespaced HTTP methods: Action::"http:GET", etc.
+
+entity Agent;
+
+entity Resource in [Resource];
+
+action "http:GET", "http:POST", "http:PUT", "http:PATCH", "http:DELETE", "http:HEAD", "http:OPTIONS"
+    appliesTo {
+        principal: Agent,
+        resource: Resource,
+        context: {
+            "host": String,
+            "path": String,
+            "method": String,
+        },
+    };

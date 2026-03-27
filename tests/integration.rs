@@ -2348,6 +2348,8 @@ fn build_test_proxy_context() -> strait::config::ProxyContext {
         git_policy: None,
         policy_config: None,
         observation_stream: None,
+        mitm_all: false,
+        warn_only: false,
     }
 }
 

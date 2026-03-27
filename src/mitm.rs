@@ -229,13 +229,66 @@ pub async fn handle_mitm(
         // --- Body buffering ---
         // Read the request body *before* credential injection so that signing
         // schemes (e.g. SigV4) have access to the body hash. Requests without
-        // Content-Length pass None; oversized bodies are rejected with 413.
-        let content_length: Option<usize> = headers
+        // Content-Length or Transfer-Encoding pass None; oversized bodies are
+        // rejected with 413.
+        let has_chunked = headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("transfer-encoding")
+                && v.to_ascii_lowercase().contains("chunked")
+        });
+
+        let raw_content_length: Option<&str> = headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-            .and_then(|(_, v)| v.parse().ok());
+            .map(|(_, v)| v.as_str());
 
-        let body: Option<Vec<u8>> = if let Some(len) = content_length {
+        // Validate Content-Length: malformed values (non-numeric, negative) → 400
+        let content_length: Option<usize> = match raw_content_length {
+            Some(raw) => match raw.trim().parse::<usize>() {
+                Ok(len) => Some(len),
+                Err(_) => {
+                    let response =
+                        build_bad_request_response(&format!("Malformed Content-Length: {raw}"));
+                    write_half.write_all(response.as_bytes()).await?;
+                    write_half.flush().await?;
+                    // Connection: close in response — cannot continue
+                    break;
+                }
+            },
+            None => None,
+        };
+
+        let body: Option<Vec<u8>> = if has_chunked {
+            // Decode chunked Transfer-Encoding into a buffered body
+            match read_chunked_body(&mut buf_reader, ctx.max_body_size).await {
+                Ok(decoded) => {
+                    // Replace Transfer-Encoding: chunked with Content-Length
+                    // so upstream receives a simple fixed-length body.
+                    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("transfer-encoding"));
+                    // Update or add Content-Length header
+                    if let Some((_, v)) = headers
+                        .iter_mut()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                    {
+                        *v = decoded.len().to_string();
+                    } else {
+                        headers.push(("Content-Length".to_string(), decoded.len().to_string()));
+                    }
+                    Some(decoded)
+                }
+                Err(ChunkedError::TooLarge) => {
+                    let response = build_payload_too_large_response(0, ctx.max_body_size);
+                    write_half.write_all(response.as_bytes()).await?;
+                    write_half.flush().await?;
+                    break;
+                }
+                Err(ChunkedError::Malformed(msg)) => {
+                    let response = build_bad_request_response(&msg);
+                    write_half.write_all(response.as_bytes()).await?;
+                    write_half.flush().await?;
+                    break;
+                }
+            }
+        } else if let Some(len) = content_length {
             if len > ctx.max_body_size {
                 let response = build_payload_too_large_response(len, ctx.max_body_size);
                 write_half.write_all(response.as_bytes()).await?;
@@ -666,6 +719,101 @@ where
     Ok(ResponseInfo {
         upstream_wants_close: connection_close,
     })
+}
+
+/// Errors that can occur while decoding a chunked request body.
+#[derive(Debug)]
+enum ChunkedError {
+    /// The accumulated body exceeds the configured maximum.
+    TooLarge,
+    /// The chunked encoding is structurally invalid.
+    Malformed(String),
+}
+
+/// Decode a `Transfer-Encoding: chunked` request body into a single buffer.
+///
+/// Reads chunk-size lines (hex), chunk data, and trailing CRLFs until the
+/// terminal `0\r\n` chunk. Enforces `max_body_size` on the accumulated output.
+async fn read_chunked_body<R>(
+    reader: &mut BufReader<R>,
+    max_body_size: usize,
+) -> Result<Vec<u8>, ChunkedError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut body = Vec::new();
+
+    loop {
+        // Read the chunk-size line (e.g. "1a\r\n" or "0\r\n")
+        let mut size_line = String::new();
+        reader
+            .read_line(&mut size_line)
+            .await
+            .map_err(|e| ChunkedError::Malformed(format!("failed to read chunk size: {e}")))?;
+
+        // Parse hex chunk size (ignore optional chunk extensions after ';')
+        let size_str = size_line.trim().split(';').next().unwrap_or("0");
+        let chunk_size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| ChunkedError::Malformed(format!("invalid chunk size: {size_str}")))?;
+
+        if chunk_size == 0 {
+            // Terminal chunk — consume trailers + final CRLF
+            loop {
+                let mut trailer = String::new();
+                reader
+                    .read_line(&mut trailer)
+                    .await
+                    .map_err(|e| ChunkedError::Malformed(format!("failed to read trailer: {e}")))?;
+                if trailer.trim().is_empty() {
+                    break;
+                }
+            }
+            break;
+        }
+
+        // Enforce max body size before allocating
+        if body.len() + chunk_size > max_body_size {
+            return Err(ChunkedError::TooLarge);
+        }
+
+        // Read the chunk data
+        let mut chunk = vec![0u8; chunk_size];
+        AsyncReadExt::read_exact(reader, &mut chunk)
+            .await
+            .map_err(|e| ChunkedError::Malformed(format!("failed to read chunk data: {e}")))?;
+        body.extend_from_slice(&chunk);
+
+        // Read and discard the trailing CRLF after chunk data
+        let mut crlf = [0u8; 2];
+        AsyncReadExt::read_exact(reader, &mut crlf)
+            .await
+            .map_err(|e| ChunkedError::Malformed(format!("missing CRLF after chunk: {e}")))?;
+    }
+
+    Ok(body)
+}
+
+/// Build an HTTP 400 Bad Request response string.
+///
+/// Returned when a request has a malformed Content-Length or invalid chunked
+/// encoding. Includes `Connection: close` because the stream state may be
+/// indeterminate.
+fn build_bad_request_response(reason: &str) -> String {
+    let body = serde_json::json!({
+        "error": "bad_request",
+        "message": reason,
+    });
+    let body_bytes = serde_json::to_string(&body).expect("JSON serialization cannot fail");
+    format!(
+        "HTTP/1.1 400 Bad Request\r\n\
+Content-Type: application/json\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\
+\r\n\
+{}",
+        body_bytes.len(),
+        body_bytes
+    )
 }
 
 /// Build the HTTP 413 Payload Too Large response string.
@@ -1222,5 +1370,124 @@ mod tests {
             claimed_length,
             actual_body.len()
         );
+    }
+
+    // --- Bad request response tests ---
+
+    #[test]
+    fn bad_request_response_format() {
+        let response = build_bad_request_response("Malformed Content-Length: abc");
+
+        let lines: Vec<&str> = response.split("\r\n").collect();
+        assert_eq!(lines[0], "HTTP/1.1 400 Bad Request");
+        assert_eq!(lines[1], "Content-Type: application/json");
+        assert!(lines[2].starts_with("Content-Length: "));
+        assert_eq!(lines[3], "Connection: close");
+        assert_eq!(lines[4], "");
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let body = &response[body_start..];
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["error"], "bad_request");
+        assert!(parsed["message"]
+            .as_str()
+            .unwrap()
+            .contains("Malformed Content-Length"));
+    }
+
+    #[test]
+    fn bad_request_content_length_matches_body() {
+        let response = build_bad_request_response("test error");
+
+        let content_length_line = response
+            .split("\r\n")
+            .find(|line| line.starts_with("Content-Length:"))
+            .expect("Content-Length header must be present");
+        let claimed_length: usize = content_length_line
+            .strip_prefix("Content-Length: ")
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let actual_body = &response[body_start..];
+
+        assert_eq!(
+            claimed_length,
+            actual_body.len(),
+            "Content-Length ({}) must match actual body length ({})",
+            claimed_length,
+            actual_body.len()
+        );
+    }
+
+    // --- Chunked body decoding tests ---
+
+    #[tokio::test]
+    async fn read_chunked_body_single_chunk() {
+        let chunked = b"5\r\nhello\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(&chunked[..]);
+        let body = read_chunked_body(&mut reader, 1024).await.unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_chunked_body_multiple_chunks() {
+        let chunked = b"5\r\nhello\r\n7\r\n, world\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(&chunked[..]);
+        let body = read_chunked_body(&mut reader, 1024).await.unwrap();
+        assert_eq!(body, b"hello, world");
+    }
+
+    #[tokio::test]
+    async fn read_chunked_body_empty() {
+        let chunked = b"0\r\n\r\n";
+        let mut reader = BufReader::new(&chunked[..]);
+        let body = read_chunked_body(&mut reader, 1024).await.unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_chunked_body_hex_sizes() {
+        // 0a = 10, 0f = 15
+        let chunked = b"a\r\n0123456789\r\nf\r\n0123456789abcde\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(&chunked[..]);
+        let body = read_chunked_body(&mut reader, 1024).await.unwrap();
+        assert_eq!(body.len(), 25);
+        assert_eq!(&body[..10], b"0123456789");
+        assert_eq!(&body[10..], b"0123456789abcde");
+    }
+
+    #[tokio::test]
+    async fn read_chunked_body_too_large() {
+        let chunked = b"5\r\nhello\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(&chunked[..]);
+        let result = read_chunked_body(&mut reader, 3).await;
+        assert!(matches!(result, Err(ChunkedError::TooLarge)));
+    }
+
+    #[tokio::test]
+    async fn read_chunked_body_malformed_size() {
+        let chunked = b"xyz\r\nhello\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(&chunked[..]);
+        let result = read_chunked_body(&mut reader, 1024).await;
+        assert!(matches!(result, Err(ChunkedError::Malformed(_))));
+    }
+
+    #[tokio::test]
+    async fn read_chunked_body_with_chunk_extensions() {
+        // Chunk extensions (after ';') should be ignored
+        let chunked = b"5;ext=val\r\nhello\r\n0\r\n\r\n";
+        let mut reader = BufReader::new(&chunked[..]);
+        let body = read_chunked_body(&mut reader, 1024).await.unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_chunked_body_with_trailers() {
+        let chunked = b"5\r\nhello\r\n0\r\nTrailer: value\r\n\r\n";
+        let mut reader = BufReader::new(&chunked[..]);
+        let body = read_chunked_body(&mut reader, 1024).await.unwrap();
+        assert_eq!(body, b"hello");
     }
 }

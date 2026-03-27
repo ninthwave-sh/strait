@@ -9,6 +9,7 @@ mod mitm;
 pub mod observe;
 pub mod policy;
 pub mod sigv4;
+pub mod templates;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -70,6 +71,33 @@ TLS TRUST:
         #[arg(long, default_value = "policy.cedarschema")]
         schema: PathBuf,
     },
+
+    /// List or apply built-in Cedar policy templates.
+    ///
+    /// Templates provide ready-to-use Cedar policies for common access
+    /// patterns (GitHub, AWS S3). Each includes a policy file and a
+    /// matching Cedar schema.
+    Template {
+        #[command(subcommand)]
+        action: TemplateAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TemplateAction {
+    /// List available built-in policy templates.
+    List,
+
+    /// Copy a built-in template to disk or print to stdout.
+    Apply {
+        /// Name of the template to apply.
+        name: String,
+
+        /// Write .cedar and .cedarschema files to this directory.
+        /// If omitted, both are printed to stdout.
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -87,9 +115,28 @@ async fn main() -> anyhow::Result<()> {
         Commands::Proxy { config } => {
             run_proxy(config).await?;
         }
+        Commands::Template { action } => {
+            run_template_command(action)?;
+        }
     }
 
     Ok(())
+}
+
+/// Run a `strait template` subcommand (list or apply).
+fn run_template_command(action: TemplateAction) -> anyhow::Result<()> {
+    match action {
+        TemplateAction::List => {
+            let templates = crate::templates::list();
+            for t in templates {
+                println!("  {:<30} {}", t.name, t.description);
+            }
+            Ok(())
+        }
+        TemplateAction::Apply { name, output_dir } => {
+            crate::templates::apply(&name, output_dir.as_deref())
+        }
+    }
 }
 
 /// Run the HTTPS proxy server.

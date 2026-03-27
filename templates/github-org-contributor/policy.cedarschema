@@ -1,0 +1,22 @@
+// Cedar schema for strait's GitHub entity model.
+// # VALIDATED: 2026-03-27 cedar-validate
+//
+// Entity types:
+//   Agent    — the calling process (currently always Agent::"worker")
+//   Resource — URL hierarchy: Resource::"host/path/segments"
+//   Action   — HTTP method: Action::"GET", Action::"POST", etc.
+
+entity Agent;
+
+entity Resource in [Resource];
+
+action "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
+    appliesTo {
+        principal: Agent,
+        resource: Resource,
+        context: {
+            "host": String,
+            "path": String,
+            "method": String,
+        },
+    };

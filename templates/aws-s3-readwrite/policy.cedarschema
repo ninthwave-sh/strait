@@ -1,0 +1,21 @@
+// Cedar schema for strait's AWS entity model.
+// # VALIDATED: 2026-03-27 cedar-validate
+//
+// Extends the base entity model with AWS-specific context attributes.
+
+entity Agent;
+
+entity Resource in [Resource];
+
+action "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"
+    appliesTo {
+        principal: Agent,
+        resource: Resource,
+        context: {
+            "host": String,
+            "path": String,
+            "method": String,
+            "aws_service": String,
+            "aws_region": String,
+        },
+    };

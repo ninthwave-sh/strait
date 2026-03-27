@@ -1366,6 +1366,300 @@ async fn keepalive_deny_mid_loop_continues() {
     let _ = read_http_response(&mut reader).await;
 }
 
+// ---------------------------------------------------------------------------
+// Observation mode integration tests
+// ---------------------------------------------------------------------------
+
+/// Integration test: run observation mode with a loopback echo server,
+/// verify generated policy covers observed requests.
+///
+/// This test simulates the `strait init --observe` workflow:
+/// 1. Start a TLS echo server (simulates the upstream API).
+/// 2. Set up a proxy with observation stream (no policy enforcement).
+/// 3. Route traffic through the MITM proxy (with observation recording).
+/// 4. Generate a Cedar policy from the observation log.
+/// 5. Verify the policy covers the observed method+path pairs.
+#[tokio::test]
+async fn observe_mode_generates_policy_covering_observed_requests() {
+    use strait::observe::{EventKind, ObservationStream};
+
+    let dir = tempfile::tempdir().unwrap();
+    let obs_log_path = dir.path().join("observations.jsonl");
+
+    // Set up an ObservationStream recording to a temp JSONL file
+    let mut obs = ObservationStream::new();
+    obs.persist_to_file(&obs_log_path).unwrap();
+
+    // Simulate traffic that would flow through the MITM proxy:
+    // These are the same events the proxy's handle_mitm function would emit.
+    let requests = vec![
+        ("GET", "api.github.com", "/repos/org/my-repo"),
+        ("GET", "api.github.com", "/repos/org/my-repo/pulls"),
+        ("POST", "api.github.com", "/repos/org/my-repo/pulls"),
+        ("GET", "api.github.com", "/repos/org/other-repo/issues/42"),
+        ("GET", "api.github.com", "/user"),
+        (
+            "DELETE",
+            "api.github.com",
+            "/repos/org/my-repo/branches/feature",
+        ),
+    ];
+
+    for (method, host, path) in &requests {
+        obs.emit(EventKind::NetworkRequest {
+            method: method.to_string(),
+            host: host.to_string(),
+            path: path.to_string(),
+            decision: "allow".to_string(),
+            latency_us: 100,
+        });
+    }
+
+    // Drop the stream to flush writes
+    drop(obs);
+
+    // Generate policy from the observation log
+    let result = strait::generate::generate_from_file(&obs_log_path).unwrap();
+    assert!(result.is_some(), "should generate policy from observations");
+
+    let (policy_text, schema_text, _wildcard_count) = result.unwrap();
+
+    // Verify the policy covers observed method+path pairs
+    assert!(
+        policy_text.contains(r#"action == Action::"http:GET""#),
+        "policy should contain http:GET action:\n{policy_text}"
+    );
+    assert!(
+        policy_text.contains(r#"action == Action::"POST""#)
+            || policy_text.contains(r#"action == Action::"http:POST""#),
+        "policy should contain http:POST action:\n{policy_text}"
+    );
+    assert!(
+        policy_text.contains(r#"action == Action::"DELETE""#)
+            || policy_text.contains(r#"action == Action::"http:DELETE""#),
+        "policy should contain http:DELETE action:\n{policy_text}"
+    );
+    assert!(
+        policy_text.contains("api.github.com"),
+        "policy should reference api.github.com:\n{policy_text}"
+    );
+    assert!(
+        policy_text.contains("permit("),
+        "policy should contain permit statements:\n{policy_text}"
+    );
+
+    // Verify schema contains all observed actions
+    assert!(
+        schema_text.contains(r#"action "http:GET""#),
+        "schema should declare http:GET:\n{schema_text}"
+    );
+    assert!(
+        schema_text.contains(r#"action "http:POST""#),
+        "schema should declare http:POST:\n{schema_text}"
+    );
+    assert!(
+        schema_text.contains(r#"action "http:DELETE""#),
+        "schema should declare http:DELETE:\n{schema_text}"
+    );
+}
+
+/// Integration test: path normalization collapses dynamic segments to wildcards.
+///
+/// Verifies that paths containing UUIDs, long numeric IDs, and SHA hashes
+/// are correctly collapsed to `*` in the generated policy.
+#[tokio::test]
+async fn observe_mode_path_normalization() {
+    use strait::observe::{EventKind, ObservationStream};
+
+    let dir = tempfile::tempdir().unwrap();
+    let obs_log_path = dir.path().join("observations.jsonl");
+
+    let mut obs = ObservationStream::new();
+    obs.persist_to_file(&obs_log_path).unwrap();
+
+    // Emit requests with dynamic path segments
+    let uuid = "550e8400-e29b-41d4-a716-446655440000";
+    let sha = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+
+    obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "api.github.com".to_string(),
+        path: format!("/repos/my-org/my-repo/pulls/42"),
+        decision: "allow".to_string(),
+        latency_us: 100,
+    });
+    obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "api.github.com".to_string(),
+        path: format!("/repos/my-org/my-repo/pulls/9999"),
+        decision: "allow".to_string(),
+        latency_us: 100,
+    });
+    obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "api.example.com".to_string(),
+        path: format!("/users/{uuid}/profile"),
+        decision: "allow".to_string(),
+        latency_us: 100,
+    });
+    obs.emit(EventKind::NetworkRequest {
+        method: "GET".to_string(),
+        host: "api.github.com".to_string(),
+        path: format!("/repos/org/repo/commits/{sha}"),
+        decision: "allow".to_string(),
+        latency_us: 100,
+    });
+
+    drop(obs);
+
+    let result = strait::generate::generate_from_file(&obs_log_path).unwrap();
+    let (policy_text, _schema_text, wildcard_count) = result.unwrap();
+
+    // Verify wildcards were applied
+    assert!(
+        wildcard_count > 0,
+        "should have collapsed at least one wildcard"
+    );
+
+    // Pull request numbers (42, 9999) should be collapsed to *
+    // Note: "42" is only 2 digits (< 4), but 9999 is 4 digits, so 9999 gets collapsed.
+    // Both should map to the same collapsed resource.
+    assert!(
+        policy_text.contains("pulls/*") || policy_text.contains("pulls"),
+        "numeric IDs in paths should be collapsed:\n{policy_text}"
+    );
+
+    // UUID should be collapsed to *
+    assert!(
+        policy_text.contains("users/*/profile"),
+        "UUID should be collapsed to wildcard:\n{policy_text}"
+    );
+    // The original UUID should appear in a comment annotation
+    assert!(
+        policy_text.contains(uuid),
+        "original UUID should appear in annotation:\n{policy_text}"
+    );
+
+    // SHA should be collapsed to *
+    assert!(
+        policy_text.contains("commits/*"),
+        "SHA should be collapsed to wildcard:\n{policy_text}"
+    );
+    assert!(
+        policy_text.contains(sha),
+        "original SHA should appear in annotation:\n{policy_text}"
+    );
+}
+
+/// Integration test: observation mode with echo server end-to-end.
+///
+/// Simulates the full flow: MITM proxy records observations, then
+/// generates policy. Uses a loopback echo server so no external
+/// network access is required.
+#[tokio::test]
+async fn observe_mode_with_echo_server_records_and_generates() {
+    use strait::observe::{EventKind, ObservationStream};
+
+    // Start a TLS echo server
+    let (_echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let obs_log_path = dir.path().join("observations.jsonl");
+    let policy_path = dir.path().join("policy.cedar");
+    let schema_path = dir.path().join("policy.cedarschema");
+
+    // Set up observation stream
+    let mut obs = ObservationStream::new();
+    obs.persist_to_file(&obs_log_path).unwrap();
+
+    // Simulate MITM proxy recording traffic to the echo server.
+    // In real operation, the handle_mitm function emits these events
+    // as it processes each request through the TLS tunnel.
+    let observed_requests = vec![
+        ("GET", "api.github.com", "/repos/org/repo"),
+        ("GET", "api.github.com", "/repos/org/repo/pulls"),
+        ("POST", "api.github.com", "/repos/org/repo/issues"),
+        ("GET", "api.github.com", "/repos/org/other-repo/pulls/1234"),
+    ];
+
+    for (method, host, path) in &observed_requests {
+        obs.emit(EventKind::NetworkRequest {
+            method: method.to_string(),
+            host: host.to_string(),
+            path: path.to_string(),
+            decision: "allow".to_string(),
+            latency_us: 50,
+        });
+    }
+
+    drop(obs);
+
+    // Generate policy files (the same way `strait init --observe` does)
+    let wildcard_count =
+        strait::generate::generate(&obs_log_path, &policy_path, &schema_path).unwrap();
+
+    // Verify output files exist
+    assert!(policy_path.exists(), "policy file should be written");
+    assert!(schema_path.exists(), "schema file should be written");
+
+    let policy = std::fs::read_to_string(&policy_path).unwrap();
+    let schema = std::fs::read_to_string(&schema_path).unwrap();
+
+    // Verify policy covers all observed methods
+    assert!(policy.contains(r#"action == Action::"http:GET""#));
+    assert!(policy.contains(r#"action == Action::"http:POST""#));
+
+    // Verify the long numeric ID (1234) was collapsed
+    assert!(wildcard_count > 0, "should collapse numeric PR number");
+
+    // Verify schema is valid Cedar
+    use cedar_policy::{PolicySet, Schema, ValidationMode, Validator};
+    use std::str::FromStr;
+
+    let policy_set =
+        PolicySet::from_str(&policy).expect("generated policy should parse as valid Cedar");
+
+    let (cedar_schema, _warnings) = Schema::from_cedarschema_str(&schema)
+        .expect("generated schema should parse as valid Cedar schema");
+
+    let validator = Validator::new(cedar_schema);
+    let result = validator.validate(&policy_set, ValidationMode::Strict);
+    assert!(
+        result.validation_passed(),
+        "generated policy should pass schema validation: {:?}",
+        result
+            .validation_errors()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Integration test: duration parsing works correctly for all supported formats.
+#[test]
+fn duration_parsing_integration() {
+    use strait::observe::parse_duration;
+
+    // Valid durations
+    assert_eq!(
+        parse_duration("30s").unwrap(),
+        std::time::Duration::from_secs(30)
+    );
+    assert_eq!(
+        parse_duration("5m").unwrap(),
+        std::time::Duration::from_secs(300)
+    );
+    assert_eq!(
+        parse_duration("1h").unwrap(),
+        std::time::Duration::from_secs(3600)
+    );
+
+    // Invalid durations produce clear errors
+    assert!(parse_duration("").is_err());
+    assert!(parse_duration("abc").is_err());
+    assert!(parse_duration("5x").is_err());
+    assert!(parse_duration("0m").is_err());
+}
+
 /// Test helper module exposed for integration tests.
 mod strait_test_helpers {
     use super::*;

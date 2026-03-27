@@ -20,6 +20,25 @@ use crate::observe::{EventKind, ObservationEvent};
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Generate Cedar policy and schema text from an observation JSONL log file.
+///
+/// Returns `Some((policy_text, schema_text, wildcard_count))` if actionable
+/// observations were found, or `None` if the file is empty or contains only
+/// non-actionable events (e.g. container lifecycle).
+pub fn generate_from_file(input: &Path) -> anyhow::Result<Option<(String, String, usize)>> {
+    let events = read_observations(input)?;
+    if events.is_empty() {
+        return Ok(None);
+    }
+    let (rules, wildcard_count) = extract_rules(&events);
+    if rules.is_empty() {
+        return Ok(None);
+    }
+    let policy_text = generate_policy(&rules);
+    let schema_text = generate_schema(&rules);
+    Ok(Some((policy_text, schema_text, wildcard_count)))
+}
+
 /// Generate Cedar policy and schema files from an observation JSONL log.
 ///
 /// Returns the number of wildcard collapses performed.

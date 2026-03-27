@@ -1,8 +1,8 @@
-# Feat: `strait explain policy.cedar` (P2-V4-1)
+# Feat: `strait explain policy.cedar` (M-V4-1)
 
-**Priority:** P2
+**Priority:** medium
 **Source:** CEO plan review — delight opportunity
-**Depends on:** v0.3 namespaced entity model
+**Depends on:** none
 **Domain:** cli
 
 Add `strait explain <policy-file>` subcommand that prints a human-readable English summary of what a Cedar policy allows and denies. Walks the policy set, groups by action namespace (http, fs, proc), and produces plain-English descriptions.

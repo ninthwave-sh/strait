@@ -1,8 +1,8 @@
-# Feat: `strait diff old.cedar new.cedar` (P2-V4-2)
+# Feat: `strait diff old.cedar new.cedar` (M-V4-2)
 
-**Priority:** P2
+**Priority:** medium
 **Source:** CEO plan review — delight opportunity
-**Depends on:** v0.3 namespaced entity model
+**Depends on:** none
 **Domain:** cli
 
 Add `strait diff <old-policy> <new-policy>` subcommand that shows permission-level differences between two Cedar policy files. Not a text diff — a semantic diff showing what access changed.

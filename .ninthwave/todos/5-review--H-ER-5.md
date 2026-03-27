@@ -1,8 +1,8 @@
-# Engineering Review: Observation Pipeline (P1-ER-5)
+# Engineering Review: Observation Pipeline (H-ER-5)
 
-**Priority:** P1
+**Priority:** high
 **Source:** Post-v0.3 engineering review
-**Depends on:** ER-4 (MITM review — observations originate from the proxy pipeline)
+**Depends on:** H-ER-4
 **Domain:** review
 **Sequence:** 5 of 8
 

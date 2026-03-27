@@ -1,8 +1,8 @@
-# Engineering Review: Templates & Integration Tests (P1-ER-8)
+# Engineering Review: Templates & Integration Tests (H-ER-8)
 
-**Priority:** P1
+**Priority:** high
 **Source:** Post-v0.3 engineering review
-**Depends on:** ER-1 through ER-7 (all findings inform test coverage assessment)
+**Depends on:** H-ER-1, H-ER-2, H-ER-3, H-ER-4, H-ER-5, H-ER-6, H-ER-7
 **Domain:** review
 **Sequence:** 8 of 8
 

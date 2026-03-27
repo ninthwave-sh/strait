@@ -1,8 +1,8 @@
-# Engineering Review: Container Platform (P1-ER-7)
+# Engineering Review: Container Platform (H-ER-7)
 
-**Priority:** P1
+**Priority:** high
 **Source:** Post-v0.3 engineering review
-**Depends on:** ER-1 through ER-6 (container orchestrates all subsystems)
+**Depends on:** H-ER-1, H-ER-2, H-ER-3, H-ER-4, H-ER-5, H-ER-6
 **Domain:** review
 **Sequence:** 7 of 8
 

@@ -1,8 +1,8 @@
-# Engineering Review: Credentials (P1-ER-3)
+# Engineering Review: Credentials (H-ER-3)
 
-**Priority:** P1
+**Priority:** high
 **Source:** Post-v0.3 engineering review
-**Depends on:** ER-2 (policy review — credential injection is policy-gated)
+**Depends on:** H-ER-2
 **Domain:** review
 **Sequence:** 3 of 8
 

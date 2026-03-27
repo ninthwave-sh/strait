@@ -1,8 +1,8 @@
-# Engineering Review: Config & Entry Point (P1-ER-1)
+# Engineering Review: Config & Entry Point (H-ER-1)
 
-**Priority:** P1
+**Priority:** high
 **Source:** Post-v0.3 engineering review
-**Depends on:** none (first in sequence)
+**Depends on:** none
 **Domain:** review
 **Sequence:** 1 of 8
 

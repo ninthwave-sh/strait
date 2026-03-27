@@ -1,8 +1,8 @@
-# Engineering Review: Policy Engine (P1-ER-2)
+# Engineering Review: Policy Engine (H-ER-2)
 
-**Priority:** P1
+**Priority:** high
 **Source:** Post-v0.3 engineering review
-**Depends on:** ER-1 (config review — policy loading depends on config)
+**Depends on:** H-ER-1
 **Domain:** review
 **Sequence:** 2 of 8
 

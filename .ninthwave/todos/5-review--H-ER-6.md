@@ -1,8 +1,8 @@
-# Engineering Review: Generation & Replay (P1-ER-6)
+# Engineering Review: Generation & Replay (H-ER-6)
 
-**Priority:** P1
+**Priority:** high
 **Source:** Post-v0.3 engineering review
-**Depends on:** ER-2 (policy — generates Cedar), ER-5 (observation — consumes observation events)
+**Depends on:** H-ER-2, H-ER-5
 **Domain:** review
 **Sequence:** 6 of 8
 

@@ -1,8 +1,8 @@
-# Engineering Review: MITM Pipeline (P1-ER-4)
+# Engineering Review: MITM Pipeline (H-ER-4)
 
-**Priority:** P1
+**Priority:** high
 **Source:** Post-v0.3 engineering review
-**Depends on:** ER-2 (policy), ER-3 (credentials — both used in the pipeline)
+**Depends on:** H-ER-2, H-ER-3
 **Domain:** review
 **Sequence:** 4 of 8
 

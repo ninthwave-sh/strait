@@ -676,7 +676,7 @@ mod tests {
             "missing 'watch' subcommand"
         );
         assert!(
-subcommand_names.contains(&"explain"),
+            subcommand_names.contains(&"explain"),
             "missing 'explain' subcommand"
         );
         assert!(
@@ -686,7 +686,7 @@ subcommand_names.contains(&"explain"),
     }
 
     #[test]
-fn test_explain_subcommand_parses() {
+    fn test_explain_subcommand_parses() {
         let cli = Cli::try_parse_from(["strait", "explain", "policy.cedar"]).unwrap();
         match cli.command {
             Commands::Explain { policy } => {

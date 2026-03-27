@@ -30,6 +30,8 @@ use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use sha2::{Digest, Sha256};
 
+use tracing::warn;
+
 use crate::credentials::{parse_aws_host, Credential};
 
 /// Default environment variable names for AWS credentials.
@@ -124,14 +126,26 @@ impl SigV4Credential {
 
         // Build signing parameters
         let settings = SigningSettings::default();
-        let params = v4::SigningParams::builder()
+        let params = match v4::SigningParams::builder()
             .identity(&identity)
             .region(region)
             .name(&aws_info.service)
             .time(time)
             .settings(settings)
             .build()
-            .ok()?;
+        {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    host = %host,
+                    service = %aws_info.service,
+                    region = %region,
+                    "SigV4 SigningParams::build() failed"
+                );
+                return None;
+            }
+        };
 
         let signing_params: aws_sigv4::http_request::SigningParams<'_> = params.into();
 
@@ -155,26 +169,52 @@ impl SigV4Credential {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()));
 
-        let signable = SignableRequest::new(method, &uri, header_iter, signable_body).ok()?;
+        let signable = match SignableRequest::new(method, &uri, header_iter, signable_body) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    host = %host,
+                    service = %aws_info.service,
+                    region = %region,
+                    "SigV4 SignableRequest::new() failed"
+                );
+                return None;
+            }
+        };
 
         // Sign the request
-        let (instructions, _signature) = sign(signable, &signing_params).ok()?.into_parts();
+        let (instructions, _signature) = match sign(signable, &signing_params) {
+            Ok(output) => output.into_parts(),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    host = %host,
+                    service = %aws_info.service,
+                    region = %region,
+                    "SigV4 sign() failed"
+                );
+                return None;
+            }
+        };
 
         // Collect the headers returned by the signing process (Authorization,
         // X-Amz-Date, and optionally X-Amz-Security-Token), plus the
-        // content-sha256 header we computed.
+        // content-sha256 header we computed (only if the signer didn't
+        // already include it).
         let mut result: Vec<(String, String)> = instructions
             .headers()
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect();
 
-        result.push(("x-amz-content-sha256".to_string(), content_sha256));
-
-        if result.is_empty() {
-            None
-        } else {
-            Some(result)
+        let has_content_sha = result
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-amz-content-sha256"));
+        if !has_content_sha {
+            result.push(("x-amz-content-sha256".to_string(), content_sha256));
         }
+
+        Some(result)
     }
 }
 
@@ -204,6 +244,7 @@ fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, UNIX_EPOCH};
 
     /// Helper: create a SigV4Credential with known keys (no env vars needed).
@@ -573,5 +614,100 @@ mod tests {
 
         std::env::remove_var("STRAIT_TEST_SV4_AK2");
         std::env::remove_var("STRAIT_TEST_SV4_SK2");
+    }
+
+    // -----------------------------------------------------------------------
+    // Warning capture helper for tracing tests
+    // -----------------------------------------------------------------------
+
+    /// Minimal tracing subscriber that captures event messages at WARN level.
+    struct WarnCollector {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for WarnCollector {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = MsgExtractor(String::new());
+            event.record(&mut visitor);
+            self.messages.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Extracts the `message` field from a tracing event.
+    struct MsgExtractor(String);
+
+    impl tracing::field::Visit for MsgExtractor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{:?}", value);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Signing failure logging
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sigv4_signing_failure_emits_warning() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let collector = WarnCollector {
+            messages: messages.clone(),
+        };
+        let _guard = tracing::subscriber::set_default(collector);
+
+        let cred = test_credential();
+        let headers = vec![("Host".to_string(), "s3.us-east-1.amazonaws.com".to_string())];
+
+        // A path with a space produces an invalid URI ("https://host/foo bar"),
+        // which causes SignableRequest::new() to fail and trigger a warn! log.
+        let result = cred.sign_request("GET", "/foo bar", &headers, None, fixed_time());
+
+        assert!(
+            result.is_none(),
+            "signing with invalid URI path should return None"
+        );
+
+        let msgs = messages.lock().unwrap();
+        assert!(!msgs.is_empty(), "signing failure should emit a warn! log");
+        assert!(
+            msgs.iter().any(|m| m.contains("SigV4")),
+            "warning should mention SigV4, got: {:?}",
+            *msgs
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // No duplicate x-amz-content-sha256 header
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sigv4_no_duplicate_content_sha256_header() {
+        let cred = test_credential();
+        let headers = vec![("Host".to_string(), "s3.us-east-1.amazonaws.com".to_string())];
+
+        let result = cred
+            .sign_request("GET", "/", &headers, None, fixed_time())
+            .expect("signing should succeed");
+
+        let count = result
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("x-amz-content-sha256"))
+            .count();
+
+        assert_eq!(
+            count, 1,
+            "should have exactly one x-amz-content-sha256 header, got {count}"
+        );
     }
 }

@@ -117,6 +117,17 @@ TLS TRUST:
         socket: Option<PathBuf>,
     },
 
+    /// Explain a Cedar policy in plain English.
+    ///
+    /// Reads a Cedar policy file and prints a human-readable summary of what
+    /// the policy allows and denies. Groups rules by action namespace (http,
+    /// fs, proc) so non-Cedar-experts can review generated policies.
+    Explain {
+        /// Path to the Cedar policy file.
+        #[arg(value_name = "POLICY_FILE")]
+        policy: PathBuf,
+    },
+
     /// Manage built-in Cedar policy templates.
     ///
     /// List available templates or apply one to get a starting Cedar policy
@@ -211,6 +222,10 @@ async fn main() -> anyhow::Result<()> {
             schema,
         } => {
             generate::generate(&observations, &output, &schema)?;
+        }
+        Commands::Explain { policy } => {
+            let summary = strait::explain::explain(&policy)?;
+            print!("{summary}");
         }
         Commands::Template { action } => match action {
             TemplateAction::List => {
@@ -637,6 +652,21 @@ mod tests {
             subcommand_names.contains(&"watch"),
             "missing 'watch' subcommand"
         );
+        assert!(
+            subcommand_names.contains(&"explain"),
+            "missing 'explain' subcommand"
+        );
+    }
+
+    #[test]
+    fn test_explain_subcommand_parses() {
+        let cli = Cli::try_parse_from(["strait", "explain", "policy.cedar"]).unwrap();
+        match cli.command {
+            Commands::Explain { policy } => {
+                assert_eq!(policy.to_str().unwrap(), "policy.cedar");
+            }
+            _ => panic!("expected Explain subcommand"),
+        }
     }
 
     #[test]

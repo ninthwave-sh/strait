@@ -4,6 +4,7 @@ pub mod config;
 pub mod credentials;
 mod health;
 mod mitm;
+pub mod observe;
 pub mod policy;
 pub mod sigv4;
 

@@ -9,6 +9,7 @@ pub mod ca;
 pub mod config;
 pub mod container;
 pub mod credentials;
+pub mod explain;
 pub mod generate;
 pub mod health;
 pub mod launch;

@@ -50,6 +50,9 @@ pub enum EventKind {
         decision: String,
         /// Request latency in microseconds.
         latency_us: u64,
+        /// Enforcement mode: "observe", "warn", or "enforce".
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        enforcement_mode: String,
     },
     /// Container started.
     ContainerStart { container_id: String, image: String },
@@ -69,6 +72,19 @@ pub enum EventKind {
     FsAccess { path: String, operation: String },
     /// Process execution observed (future — not MVP).
     ProcExec { pid: u32, command: String },
+    /// Policy violation detected (used in warn and enforce modes).
+    PolicyViolation {
+        /// Enforcement mode: "warn" or "enforce".
+        enforcement_mode: String,
+        /// The action that was evaluated (e.g. "http:CONNECT", "fs:write").
+        action: String,
+        /// The resource that was evaluated (e.g. host, path).
+        resource: String,
+        /// What happened: "warn" (allowed despite violation) or "deny" (blocked).
+        decision: String,
+        /// Human-readable reason for the violation.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +383,7 @@ mod tests {
                 path: "/repos/org/repo".to_string(),
                 decision: "allow".to_string(),
                 latency_us: 150,
+                enforcement_mode: String::new(),
             },
         };
 
@@ -485,6 +502,7 @@ mod tests {
                 path: "/data".to_string(),
                 decision: "deny".to_string(),
                 latency_us: 500,
+                enforcement_mode: String::new(),
             },
         };
 
@@ -595,6 +613,7 @@ mod tests {
             path: "/repos".to_string(),
             decision: "allow".to_string(),
             latency_us: 100,
+            enforcement_mode: String::new(),
         });
 
         stream.emit(EventKind::Mount {

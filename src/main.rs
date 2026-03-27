@@ -126,8 +126,8 @@ TLS TRUST:
     /// access controlled by Cedar policies. Three modes:
     ///
     /// - `--observe`: observe mode (allow all, record activity)
-    /// - `--warn`: evaluate policy, allow all, log violations as warnings (future)
-    /// - `--policy`: enforce policy, deny disallowed access (future)
+    /// - `--warn <policy.cedar>`: evaluate policy, allow all, log violations as warnings
+    /// - `--policy <policy.cedar>`: enforce policy, deny disallowed access
     ///
     /// Network traffic routes through the built-in proxy. Filesystem access is
     /// controlled via bind-mount restrictions derived from Cedar `fs:` policies.
@@ -136,8 +136,22 @@ TLS TRUST:
         ///
         /// All filesystem and network access is permitted. Activity is recorded
         /// to an observation log for later policy generation with `strait generate`.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["warn", "policy"])]
         observe: bool,
+
+        /// Evaluate Cedar policy but allow all access, logging violations as warnings.
+        ///
+        /// Container bind-mounts are restricted to paths permitted by `fs:` policies.
+        /// Network connections to disallowed hosts are logged as warnings but not blocked.
+        #[arg(long, value_name = "POLICY_FILE", conflicts_with_all = ["observe", "policy"])]
+        warn: Option<PathBuf>,
+
+        /// Enforce Cedar policy: deny disallowed filesystem and network access.
+        ///
+        /// Container bind-mounts are restricted to paths permitted by `fs:` policies.
+        /// Network connections to disallowed hosts are blocked with HTTP 403.
+        #[arg(long, value_name = "POLICY_FILE", conflicts_with_all = ["observe", "warn"])]
+        policy: Option<PathBuf>,
 
         /// Docker image to use for the container.
         #[arg(long, default_value = "alpine:latest")]
@@ -215,24 +229,50 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Launch {
             observe,
+            warn,
+            policy,
             image,
             output,
             command,
         } => {
-            if !observe {
-                eprintln!("strait launch requires --observe (enforce mode not yet implemented)");
-                eprintln!("Usage: strait launch --observe <command> [args...]");
-                std::process::exit(1);
-            }
-
             tracing_subscriber::fmt()
                 .json()
                 .with_target(false)
                 .with_writer(std::io::stderr)
                 .init();
 
-            let exit_code =
-                strait::launch::run_launch_observe(command, Some(&image), Some(output)).await?;
+            let exit_code = if let Some(policy_path) = policy {
+                // Enforce mode: deny disallowed access
+                strait::launch::run_launch_with_policy(
+                    strait::launch::EnforcementMode::Enforce,
+                    &policy_path,
+                    command,
+                    Some(&image),
+                    Some(output),
+                )
+                .await?
+            } else if let Some(warn_path) = warn {
+                // Warn mode: allow all, log violations
+                strait::launch::run_launch_with_policy(
+                    strait::launch::EnforcementMode::Warn,
+                    &warn_path,
+                    command,
+                    Some(&image),
+                    Some(output),
+                )
+                .await?
+            } else if observe {
+                // Observe mode: allow all, record activity
+                strait::launch::run_launch_observe(command, Some(&image), Some(output)).await?
+            } else {
+                eprintln!(
+                    "strait launch requires one of: --observe, --warn <policy.cedar>, --policy <policy.cedar>"
+                );
+                eprintln!("Usage: strait launch --observe <command> [args...]");
+                eprintln!("       strait launch --warn policy.cedar <command> [args...]");
+                eprintln!("       strait launch --policy policy.cedar <command> [args...]");
+                std::process::exit(1);
+            };
             std::process::exit(exit_code);
         }
         Commands::Init {
@@ -625,11 +665,15 @@ mod tests {
         match cli.command {
             Commands::Launch {
                 observe,
+                warn,
+                policy,
                 image,
                 output,
                 command,
             } => {
                 assert!(observe);
+                assert!(warn.is_none());
+                assert!(policy.is_none());
                 assert_eq!(image, "ubuntu:24.04");
                 assert_eq!(output.to_str().unwrap(), "/tmp/obs.jsonl");
                 assert_eq!(command, vec!["npm", "test"]);
@@ -696,5 +740,104 @@ mod tests {
             subcommand_names.contains(&"watch"),
             "missing 'watch' subcommand"
         );
+    }
+
+    #[test]
+    fn test_launch_warn_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--warn",
+            "policy.cedar",
+            "echo",
+            "hello",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Launch {
+                observe,
+                warn,
+                policy,
+                command,
+                ..
+            } => {
+                assert!(!observe, "observe should be false");
+                assert_eq!(warn.unwrap().to_str().unwrap(), "policy.cedar");
+                assert!(policy.is_none(), "policy should be None");
+                assert_eq!(command, vec!["echo", "hello"]);
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_policy_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--policy",
+            "policy.cedar",
+            "npm",
+            "test",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Launch {
+                observe,
+                warn,
+                policy,
+                command,
+                ..
+            } => {
+                assert!(!observe, "observe should be false");
+                assert!(warn.is_none(), "warn should be None");
+                assert_eq!(policy.unwrap().to_str().unwrap(), "policy.cedar");
+                assert_eq!(command, vec!["npm", "test"]);
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_observe_and_warn_conflict() {
+        let result = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--observe",
+            "--warn",
+            "policy.cedar",
+            "echo",
+            "hello",
+        ]);
+        assert!(result.is_err(), "--observe and --warn should conflict");
+    }
+
+    #[test]
+    fn test_launch_observe_and_policy_conflict() {
+        let result = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--observe",
+            "--policy",
+            "policy.cedar",
+            "echo",
+            "hello",
+        ]);
+        assert!(result.is_err(), "--observe and --policy should conflict");
+    }
+
+    #[test]
+    fn test_launch_warn_and_policy_conflict() {
+        let result = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--warn",
+            "warn.cedar",
+            "--policy",
+            "policy.cedar",
+            "echo",
+            "hello",
+        ]);
+        assert!(result.is_err(), "--warn and --policy should conflict");
     }
 }

@@ -22,8 +22,9 @@
 //!
 //! ## AWS host parsing
 //!
-//! [`parse_aws_host`] extracts service and region from standard AWS endpoint
-//! hostnames (`<service>.<region>.amazonaws.com`). This enables a single
+//! [`parse_aws_host`] extracts service and region from AWS endpoint hostnames
+//! across all partitions (standard, China, GovCloud). It handles dualstack,
+//! FIPS, VPC, and virtual-hosted endpoint variants. This enables a single
 //! `host_pattern = "*.amazonaws.com"` credential entry to cover all AWS
 //! services.
 //!
@@ -63,52 +64,86 @@ pub struct AwsHostInfo {
     pub region: Option<String>,
 }
 
+/// Known qualifier segments that appear in AWS endpoint hostnames but are
+/// neither service names nor region names.  These are filtered out before
+/// extracting service and region.
+const AWS_HOST_QUALIFIERS: &[&str] = &["dualstack", "fips", "vpce"];
+
 /// Parse an AWS hostname into its service and region components.
 ///
-/// Recognises standard AWS endpoint formats:
-/// - `<service>.<region>.amazonaws.com` (regional, e.g. `s3.us-east-1.amazonaws.com`)
-/// - `<service>.amazonaws.com` (global, e.g. `iam.amazonaws.com`)
-/// - `<prefix>.<service>.<region>.amazonaws.com` (virtual-hosted, e.g.
-///   `bucket.s3.us-east-1.amazonaws.com` — returns service `s3`, region `us-east-1`)
+/// Recognises standard AWS endpoint formats across all partitions:
+///
+/// | Format | Example |
+/// |--------|---------|
+/// | `<service>.<region>.amazonaws.com` | `s3.us-east-1.amazonaws.com` |
+/// | `<service>.amazonaws.com` (global) | `iam.amazonaws.com` |
+/// | `<service>.dualstack.<region>.amazonaws.com` | `s3.dualstack.us-east-1.amazonaws.com` |
+/// | `<service>-fips.<region>.amazonaws.com` | `s3-fips.us-east-1.amazonaws.com` |
+/// | `<prefix>.<service>.<region>.amazonaws.com` | `bucket.s3.us-east-1.amazonaws.com` |
+/// | `<service>.<region>.amazonaws.com.cn` (China) | `dynamodb.cn-north-1.amazonaws.com.cn` |
+///
+/// Known qualifier segments (`dualstack`, `fips`, `vpce`) are skipped.
+/// A `-fips` suffix on the service segment is stripped (e.g. `s3-fips` → `s3`).
+/// GovCloud regions (e.g. `us-gov-west-1`) use the standard `.amazonaws.com`
+/// suffix and are handled automatically.
 ///
 /// Returns `None` for non-AWS hostnames, bare `amazonaws.com`, and look-alikes
 /// like `notamazonaws.com`.
 pub fn parse_aws_host(host: &str) -> Option<AwsHostInfo> {
-    let suffix = ".amazonaws.com";
-    if !host.ends_with(suffix) {
+    // Recognise AWS hostname suffixes for different partitions.
+    // Check the longer suffix first so `.amazonaws.com` doesn't partially
+    // match a `.amazonaws.com.cn` hostname.
+    let prefix = if let Some(p) = host.strip_suffix(".amazonaws.com.cn") {
+        p
+    } else if let Some(p) = host.strip_suffix(".amazonaws.com") {
+        p
+    } else {
         return None;
-    }
+    };
 
-    let prefix = &host[..host.len() - suffix.len()];
     if prefix.is_empty() {
-        // Bare "amazonaws.com" — no service prefix
         return None;
     }
 
     let parts: Vec<&str> = prefix.split('.').collect();
-    match parts.len() {
+
+    // Filter out known qualifier segments (dualstack, fips, vpce).
+    let meaningful: Vec<&str> = parts
+        .iter()
+        .filter(|s| !AWS_HOST_QUALIFIERS.contains(s))
+        .copied()
+        .collect();
+
+    match meaningful.len() {
+        0 => None,
         // <service>.amazonaws.com — global endpoint
         1 => Some(AwsHostInfo {
-            service: parts[0].to_string(),
+            service: strip_service_qualifier(meaningful[0]),
             region: None,
         }),
         // <service>.<region>.amazonaws.com — standard regional
         2 => Some(AwsHostInfo {
-            service: parts[0].to_string(),
-            region: Some(parts[1].to_string()),
+            service: strip_service_qualifier(meaningful[0]),
+            region: Some(meaningful[1].to_string()),
         }),
         // <prefix>.<service>.<region>.amazonaws.com — virtual-hosted style
-        // Take the last two segments as service and region.
-        n if n >= 3 => {
-            let service = parts[n - 2].to_string();
-            let region = parts[n - 1].to_string();
+        // Take the last two meaningful segments as service and region.
+        n => {
+            let service = strip_service_qualifier(meaningful[n - 2]);
+            let region = meaningful[n - 1].to_string();
             Some(AwsHostInfo {
                 service,
                 region: Some(region),
             })
         }
-        _ => None,
     }
+}
+
+/// Strip known qualifier suffixes from an AWS service name.
+///
+/// Currently handles `-fips` (e.g. `s3-fips` → `s3`).
+fn strip_service_qualifier(service: &str) -> String {
+    service.strip_suffix("-fips").unwrap_or(service).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +526,104 @@ mod tests {
         let info = parse_aws_host("deep.nested.s3.us-east-1.amazonaws.com").unwrap();
         assert_eq!(info.service, "s3");
         assert_eq!(info.region, Some("us-east-1".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_aws_host — dualstack, FIPS, and VPC endpoints
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_aws_host_s3_dualstack() {
+        let info = parse_aws_host("s3.dualstack.us-east-1.amazonaws.com").unwrap();
+        assert_eq!(info.service, "s3");
+        assert_eq!(info.region, Some("us-east-1".to_string()));
+    }
+
+    #[test]
+    fn parse_aws_host_s3_fips() {
+        let info = parse_aws_host("s3-fips.us-east-1.amazonaws.com").unwrap();
+        assert_eq!(info.service, "s3");
+        assert_eq!(info.region, Some("us-east-1".to_string()));
+    }
+
+    #[test]
+    fn parse_aws_host_s3_dualstack_fips() {
+        let info = parse_aws_host("s3.dualstack.fips.us-east-1.amazonaws.com").unwrap();
+        assert_eq!(info.service, "s3");
+        assert_eq!(info.region, Some("us-east-1".to_string()));
+    }
+
+    #[test]
+    fn parse_aws_host_s3_fips_dualstack() {
+        let info = parse_aws_host("s3-fips.dualstack.us-east-1.amazonaws.com").unwrap();
+        assert_eq!(info.service, "s3");
+        assert_eq!(info.region, Some("us-east-1".to_string()));
+    }
+
+    #[test]
+    fn parse_aws_host_dynamodb_dualstack() {
+        let info = parse_aws_host("dynamodb.dualstack.eu-west-1.amazonaws.com").unwrap();
+        assert_eq!(info.service, "dynamodb");
+        assert_eq!(info.region, Some("eu-west-1".to_string()));
+    }
+
+    #[test]
+    fn parse_aws_host_virtual_hosted_s3_dualstack() {
+        let info = parse_aws_host("bucket.s3.dualstack.us-east-1.amazonaws.com").unwrap();
+        assert_eq!(info.service, "s3");
+        assert_eq!(info.region, Some("us-east-1".to_string()));
+    }
+
+    #[test]
+    fn parse_aws_host_vpce_endpoint() {
+        let info = parse_aws_host("vpce-1a2b3c4d.s3.us-east-1.vpce.amazonaws.com").unwrap();
+        assert_eq!(info.service, "s3");
+        assert_eq!(info.region, Some("us-east-1".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_aws_host — China and GovCloud partitions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_aws_host_china_dynamodb() {
+        let info = parse_aws_host("dynamodb.cn-north-1.amazonaws.com.cn").unwrap();
+        assert_eq!(info.service, "dynamodb");
+        assert_eq!(info.region, Some("cn-north-1".to_string()));
+    }
+
+    #[test]
+    fn parse_aws_host_china_s3() {
+        let info = parse_aws_host("s3.cn-northwest-1.amazonaws.com.cn").unwrap();
+        assert_eq!(info.service, "s3");
+        assert_eq!(info.region, Some("cn-northwest-1".to_string()));
+    }
+
+    #[test]
+    fn parse_aws_host_china_global() {
+        let info = parse_aws_host("iam.amazonaws.com.cn").unwrap();
+        assert_eq!(info.service, "iam");
+        assert_eq!(info.region, None);
+    }
+
+    #[test]
+    fn parse_aws_host_china_dualstack() {
+        let info = parse_aws_host("s3.dualstack.cn-north-1.amazonaws.com.cn").unwrap();
+        assert_eq!(info.service, "s3");
+        assert_eq!(info.region, Some("cn-north-1".to_string()));
+    }
+
+    #[test]
+    fn parse_aws_host_govcloud() {
+        // GovCloud uses the standard .amazonaws.com suffix with us-gov-* regions
+        let info = parse_aws_host("s3.us-gov-west-1.amazonaws.com").unwrap();
+        assert_eq!(info.service, "s3");
+        assert_eq!(info.region, Some("us-gov-west-1".to_string()));
+    }
+
+    #[test]
+    fn parse_aws_host_bare_amazonaws_cn_returns_none() {
+        assert!(parse_aws_host("amazonaws.com.cn").is_none());
     }
 
     // -----------------------------------------------------------------------

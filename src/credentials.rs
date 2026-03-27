@@ -136,12 +136,21 @@ pub trait Credential: Debug + Send + Sync {
 ///
 /// This is the simplest credential type: it always returns the same
 /// header/value pair regardless of the request contents.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BearerCredential {
     /// HTTP header name (e.g. "Authorization").
     pub header: String,
     /// Full header value including prefix (e.g. "token ghp_abc123").
     pub value: String,
+}
+
+impl std::fmt::Debug for BearerCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BearerCredential")
+            .field("header", &self.header)
+            .field("value", &"***")
+            .finish()
+    }
 }
 
 impl Credential for BearerCredential {
@@ -866,6 +875,42 @@ mod tests {
         assert!(
             err.contains("must have either 'host' or 'host_pattern'"),
             "got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Debug redaction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bearer_credential_debug_redacts_value() {
+        let cred = BearerCredential {
+            header: "Authorization".to_string(),
+            value: "token super_secret_ghp_abc123".to_string(),
+        };
+
+        let debug_output = format!("{:?}", cred);
+
+        // Must NOT contain the actual secret
+        assert!(
+            !debug_output.contains("super_secret_ghp_abc123"),
+            "Debug output must not contain the secret value, got: {debug_output}"
+        );
+
+        // Must contain the struct name and redacted marker
+        assert!(
+            debug_output.contains("BearerCredential"),
+            "Debug output should contain struct name, got: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("***"),
+            "Debug output should contain redaction marker, got: {debug_output}"
+        );
+
+        // Header name is non-secret metadata and should be visible
+        assert!(
+            debug_output.contains("Authorization"),
+            "Debug output should show the header name, got: {debug_output}"
         );
     }
 

@@ -9,7 +9,7 @@
 //! `ObservationStream` in the v0.3 launch orchestrator.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -162,6 +162,148 @@ impl ObservationStream {
 }
 
 // ---------------------------------------------------------------------------
+// Unix socket server
+// ---------------------------------------------------------------------------
+
+/// Check whether a directory is writable by creating and removing a probe file.
+#[cfg(unix)]
+fn dir_is_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".strait-probe-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Resolve the socket directory from an ordered list of candidates.
+///
+/// Returns the first writable directory, or the current working directory
+/// as a last resort.
+#[cfg(unix)]
+fn resolve_socket_dir_with_candidates(candidates: &[PathBuf]) -> PathBuf {
+    for dir in candidates {
+        if dir_is_writable(dir) {
+            return dir.clone();
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Determine the best directory for the observation socket.
+///
+/// Tries, in order:
+/// 1. `/tmp`
+/// 2. `XDG_RUNTIME_DIR` (Linux user-specific runtime directory)
+/// 3. Current working directory (last resort)
+#[cfg(unix)]
+fn resolve_socket_dir() -> PathBuf {
+    let mut candidates = vec![PathBuf::from("/tmp")];
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        candidates.push(PathBuf::from(xdg));
+    }
+    resolve_socket_dir_with_candidates(&candidates)
+}
+
+#[cfg(unix)]
+impl ObservationStream {
+    /// Return the default socket path for the current process.
+    ///
+    /// The path is `/tmp/strait-<pid>.sock` (or a fallback directory if
+    /// `/tmp` is not writable).
+    pub fn socket_path() -> PathBuf {
+        resolve_socket_dir().join(format!("strait-{}.sock", std::process::id()))
+    }
+
+    /// Start a Unix socket server that streams JSONL events to connected
+    /// clients.
+    ///
+    /// The server listens at the default socket path (see [`socket_path`]).
+    /// Returns the path so callers (e.g. `strait watch`) know where to
+    /// connect.
+    ///
+    /// Multiple clients can connect simultaneously — each gets its own
+    /// broadcast receiver. If a prior process left a stale socket file at
+    /// the same path, it is removed automatically before binding.
+    pub async fn start_socket_server(&self) -> anyhow::Result<PathBuf> {
+        let path = Self::socket_path();
+        self.start_socket_server_at(&path).await?;
+        Ok(path)
+    }
+
+    /// Start a Unix socket server at a specific path.
+    ///
+    /// This is the lower-level variant of [`start_socket_server`] that
+    /// allows callers (and tests) to control the socket location.
+    pub async fn start_socket_server_at(&self, path: &Path) -> anyhow::Result<()> {
+        // Remove stale socket from a prior run.
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|e| {
+                anyhow::anyhow!("failed to remove stale socket '{}': {}", path.display(), e)
+            })?;
+            tracing::debug!(path = %path.display(), "removed stale socket");
+        }
+
+        let listener = tokio::net::UnixListener::bind(path).map_err(|e| {
+            anyhow::anyhow!("failed to bind Unix socket at '{}': {}", path.display(), e)
+        })?;
+
+        tracing::info!(path = %path.display(), "observation socket server started");
+
+        let tx = self.tx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _addr)) => {
+                        tracing::debug!("observation socket client connected");
+                        let mut rx = tx.subscribe();
+                        tokio::spawn(async move {
+                            use tokio::io::AsyncWriteExt;
+                            let mut writer = tokio::io::BufWriter::new(stream);
+                            loop {
+                                match rx.recv().await {
+                                    Ok(event) => {
+                                        let json = match serde_json::to_string(&event) {
+                                            Ok(j) => j,
+                                            Err(_) => continue,
+                                        };
+                                        let line = format!("{json}\n");
+                                        if writer.write_all(line.as_bytes()).await.is_err() {
+                                            break;
+                                        }
+                                        if writer.flush().await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        tracing::debug!(
+                                            lagged = n,
+                                            "socket client lagged, skipping"
+                                        );
+                                        continue;
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                            tracing::debug!("observation socket client disconnected");
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "observation socket accept error");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -169,6 +311,8 @@ impl ObservationStream {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
+    #[cfg(unix)]
+    use tokio::io::AsyncBufReadExt;
 
     // -- Serialization tests --------------------------------------------------
 
@@ -490,5 +634,194 @@ mod tests {
                 other => panic!("event {i}: expected ContainerStart, got {other:?}"),
             }
         }
+    }
+
+    // -- Unix socket server tests ----------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn socket_server_starts_and_accepts_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+
+        let stream = ObservationStream::new();
+        stream.start_socket_server_at(&sock_path).await.unwrap();
+
+        let client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        assert!(client.peer_addr().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn events_appear_on_connected_socket_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+
+        let stream = ObservationStream::new();
+        stream.start_socket_server_at(&sock_path).await.unwrap();
+
+        let client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let mut reader = tokio::io::BufReader::new(client);
+
+        // Give the accept loop time to register the client.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        stream.emit(EventKind::ContainerStart {
+            container_id: "c1".to_string(),
+            image: "alpine".to_string(),
+        });
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+
+        let event: ObservationEvent = serde_json::from_str(&line).unwrap();
+        match &event.event {
+            EventKind::ContainerStart {
+                container_id,
+                image,
+            } => {
+                assert_eq!(container_id, "c1");
+                assert_eq!(image, "alpine");
+            }
+            other => panic!("expected ContainerStart, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn multiple_clients_receive_all_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+
+        let stream = ObservationStream::new();
+        stream.start_socket_server_at(&sock_path).await.unwrap();
+
+        let client1 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let client2 = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let mut reader1 = tokio::io::BufReader::new(client1);
+        let mut reader2 = tokio::io::BufReader::new(client2);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        stream.emit(EventKind::ContainerStart {
+            container_id: "c1".to_string(),
+            image: "alpine".to_string(),
+        });
+
+        let mut line1 = String::new();
+        let mut line2 = String::new();
+        reader1.read_line(&mut line1).await.unwrap();
+        reader2.read_line(&mut line2).await.unwrap();
+
+        let e1: ObservationEvent = serde_json::from_str(&line1).unwrap();
+        let e2: ObservationEvent = serde_json::from_str(&line2).unwrap();
+        assert_eq!(e1.event, e2.event);
+        match &e1.event {
+            EventKind::ContainerStart { container_id, .. } => {
+                assert_eq!(container_id, "c1");
+            }
+            other => panic!("expected ContainerStart, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_disconnect_does_not_crash_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+
+        let stream = ObservationStream::new();
+        stream.start_socket_server_at(&sock_path).await.unwrap();
+
+        // Connect a client and immediately drop it.
+        {
+            let _client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        }
+
+        // Give the server time to notice the disconnect.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Emitting an event should not panic.
+        stream.emit(EventKind::ContainerStart {
+            container_id: "c1".to_string(),
+            image: "alpine".to_string(),
+        });
+
+        // Another client should still be able to connect and receive events.
+        let client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let mut reader = tokio::io::BufReader::new(client);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        stream.emit(EventKind::ContainerStart {
+            container_id: "c2".to_string(),
+            image: "alpine".to_string(),
+        });
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let event: ObservationEvent = serde_json::from_str(&line).unwrap();
+        match &event.event {
+            EventKind::ContainerStart { container_id, .. } => {
+                assert_eq!(container_id, "c2");
+            }
+            other => panic!("expected ContainerStart, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_socket_is_auto_cleaned() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+
+        // Create a stale socket file (simulates a prior process crash).
+        std::fs::write(&sock_path, "stale").unwrap();
+        assert!(sock_path.exists());
+
+        let stream = ObservationStream::new();
+        stream.start_socket_server_at(&sock_path).await.unwrap();
+
+        // Should be able to connect (stale file was removed and re-bound).
+        let _client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_skips_unwritable_dirs() {
+        // When all candidates are unwritable, resolve falls back to cwd.
+        let candidates = vec![
+            PathBuf::from("/nonexistent-dir-a"),
+            PathBuf::from("/nonexistent-dir-b"),
+        ];
+        let result = super::resolve_socket_dir_with_candidates(&candidates);
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(result, cwd);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_uses_first_writable_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidates = vec![PathBuf::from("/nonexistent-dir"), dir.path().to_path_buf()];
+        let result = super::resolve_socket_dir_with_candidates(&candidates);
+        assert_eq!(result, dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_path_contains_pid() {
+        let path = ObservationStream::socket_path();
+        let pid = std::process::id();
+        let expected_name = format!("strait-{pid}.sock");
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains(&expected_name),
+            "socket path should contain PID, got: {}",
+            path.display()
+        );
     }
 }

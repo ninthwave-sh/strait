@@ -327,7 +327,7 @@ permit(
 
     // Observation log should have a policy_violation event for the cwd
     let events = observation_events(&obs_path);
-    let violations = events_of_type(&events, "policy_violation");
+    let _violations = events_of_type(&events, "policy_violation");
     // May or may not have violations depending on cwd matching
     // But container_stop should exist
     let stops = events_of_type(&events, "container_stop");

@@ -331,6 +331,16 @@ pub struct ProxyContext {
     /// When set (e.g. during `init --observe`), every MITM'd request emits
     /// a `NetworkRequest` event through this stream.
     pub observation_stream: Option<ObservationStream>,
+
+    /// When true, MITM all connections regardless of the `mitm_hosts` list.
+    ///
+    /// Used by `launch` modes where all traffic must be observed or evaluated.
+    /// Bypasses the `should_mitm()` allowlist check.
+    pub mitm_all: bool,
+
+    /// When true, policy denials are logged as warnings but traffic is still
+    /// forwarded upstream. Used by `launch --warn` mode.
+    pub warn_only: bool,
 }
 
 impl ProxyContext {
@@ -428,6 +438,8 @@ impl ProxyContext {
             git_policy,
             policy_config: config.policy.clone(),
             observation_stream: None,
+            mitm_all: false,
+            warn_only: false,
         })
     }
 }

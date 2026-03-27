@@ -341,6 +341,16 @@ pub struct ProxyContext {
     /// When true, policy denials are logged as warnings but traffic is still
     /// forwarded upstream. Used by `launch --warn` mode.
     pub warn_only: bool,
+    /// Override the upstream TCP address for testing.
+    ///
+    /// When set, `handle_mitm` connects to this address instead of `{host}:{port}`.
+    /// Production code leaves this as `None`.
+    pub upstream_addr_override: Option<std::net::SocketAddr>,
+    /// Override the TLS client config for upstream connections (for testing).
+    ///
+    /// When set, `handle_mitm` uses this config instead of building one from
+    /// webpki roots. Production code leaves this as `None`.
+    pub upstream_tls_override: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl ProxyContext {
@@ -440,6 +450,8 @@ impl ProxyContext {
             observation_stream: None,
             mitm_all: false,
             warn_only: false,
+            upstream_addr_override: None,
+            upstream_tls_override: None,
         })
     }
 }

@@ -289,70 +289,34 @@ async fn ca_cert_is_unique_per_session() {
 
 #[tokio::test]
 async fn mitm_terminates_tls_and_exposes_inner_request() {
-    // Start the proxy's CA
-    let ca = strait_test_helpers::generate_ca();
-
     // Start a TLS echo server (simulates api.github.com)
     let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
 
-    // Start the proxy listener
+    // Build a production ProxyContext that routes to the echo server
+    let ctx = strait_test_helpers::build_production_mitm_context(
+        echo_addr,
+        "api.github.com",
+        std::time::Duration::from_secs(5),
+    );
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
+
+    // Start the proxy listener using the production handle_connection
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
-    let ca_clone = ca.clone();
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
     tokio::spawn(async move {
         let (client, peer) = proxy_listener.accept().await.unwrap();
-        // Simulate the proxy's CONNECT handling for MITM
-        strait_test_helpers::handle_mitm_connection(client, peer, &ca_clone, echo_addr).await;
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
     });
 
     // Connect to the proxy and send a CONNECT request
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-    client
-        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
-        .await
-        .unwrap();
-
-    // Read the 200 response
-    let mut buf = BufReader::new(&mut client);
-    let mut response_line = String::new();
-    buf.read_line(&mut response_line).await.unwrap();
-    assert!(
-        response_line.contains("200"),
-        "Expected 200, got: {}",
-        response_line.trim()
-    );
-    // Drain response headers
-    loop {
-        let mut line = String::new();
-        buf.read_line(&mut line).await.unwrap();
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-
-    // Now do TLS handshake with the proxy (using the session CA as trust root)
-    let mut root_store = rustls::RootCertStore::empty();
-    let ca_pem_bytes = ca.ca_cert_pem.as_bytes();
-    let mut cursor = std::io::Cursor::new(ca_pem_bytes);
-    for cert in rustls_pemfile::certs(&mut cursor) {
-        root_store.add(cert.unwrap()).unwrap();
-    }
-
-    let client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let server_name = ServerName::try_from("api.github.com").unwrap();
-
-    // Drop the BufReader to get back the inner stream
-    let client_inner = buf.into_inner();
-    let mut tls = connector.connect(server_name, client_inner).await.unwrap();
+    let mut tls = connect_through_mitm(proxy_addr, &ca_pem, "api.github.com").await;
 
     // Send an HTTP request through the TLS tunnel
     tls.write_all(
-        b"GET /repos/test/repo HTTP/1.1\r\nHost: api.github.com\r\nX-Test: hello\r\n\r\n",
+        b"GET /repos/test/repo HTTP/1.1\r\nHost: api.github.com\r\nX-Test: hello\r\nConnection: close\r\n\r\n",
     )
     .await
     .unwrap();
@@ -464,64 +428,29 @@ async fn passthrough_does_not_decrypt() {
 
 #[tokio::test]
 async fn mitm_preserves_request_body_through_pipeline() {
-    // Start the proxy's CA
-    let ca = strait_test_helpers::generate_ca();
-
     // Start a TLS echo server that echoes headers + body
     let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
 
-    // Start the proxy listener
+    // Build a production ProxyContext that routes to the echo server
+    let ctx = strait_test_helpers::build_production_mitm_context(
+        echo_addr,
+        "api.github.com",
+        std::time::Duration::from_secs(5),
+    );
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
+
+    // Start the proxy listener using the production handle_connection
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
-    let ca_clone = ca.clone();
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
     tokio::spawn(async move {
         let (client, peer) = proxy_listener.accept().await.unwrap();
-        strait_test_helpers::handle_mitm_connection(client, peer, &ca_clone, echo_addr).await;
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
     });
 
-    // Connect to the proxy and send a CONNECT request
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-    client
-        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
-        .await
-        .unwrap();
-
-    // Read the 200 response
-    let mut buf = BufReader::new(&mut client);
-    let mut response_line = String::new();
-    buf.read_line(&mut response_line).await.unwrap();
-    assert!(
-        response_line.contains("200"),
-        "Expected 200, got: {}",
-        response_line.trim()
-    );
-    // Drain response headers
-    loop {
-        let mut line = String::new();
-        buf.read_line(&mut line).await.unwrap();
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-
-    // TLS handshake with the proxy (using the session CA as trust root)
-    let mut root_store = rustls::RootCertStore::empty();
-    let ca_pem_bytes = ca.ca_cert_pem.as_bytes();
-    let mut cursor = std::io::Cursor::new(ca_pem_bytes);
-    for cert in rustls_pemfile::certs(&mut cursor) {
-        root_store.add(cert.unwrap()).unwrap();
-    }
-
-    let client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let server_name = ServerName::try_from("api.github.com").unwrap();
-
-    let client_inner = buf.into_inner();
-    let mut tls = connector.connect(server_name, client_inner).await.unwrap();
+    let mut tls = connect_through_mitm(proxy_addr, &ca_pem, "api.github.com").await;
 
     // Send a POST request with a body
     let body = r#"{"name":"test-repo","private":true}"#;
@@ -530,6 +459,7 @@ async fn mitm_preserves_request_body_through_pipeline() {
          Host: api.github.com\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
+         Connection: close\r\n\
          \r\n\
          {}",
         body.len(),
@@ -1283,58 +1213,27 @@ async fn read_http_response<R: tokio::io::AsyncRead + Unpin>(reader: &mut BufRea
 /// second request processed after first response completes.
 #[tokio::test]
 async fn keepalive_two_sequential_requests() {
-    let ca = strait_test_helpers::generate_ca();
     let (echo_addr, _pem, _der) = start_keepalive_echo_server().await;
+
+    // Use production handle_connection with keepalive support
+    let ctx = strait_test_helpers::build_production_mitm_context(
+        echo_addr,
+        "api.github.com",
+        std::time::Duration::from_secs(5),
+    );
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
-    let ca_clone = ca.clone();
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
     tokio::spawn(async move {
         let (client, peer) = proxy_listener.accept().await.unwrap();
-        strait_test_helpers::handle_mitm_keepalive(
-            client,
-            peer,
-            &ca_clone,
-            echo_addr,
-            "api.github.com",
-        )
-        .await;
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
     });
 
-    // Connect and CONNECT
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-    client
-        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
-        .await
-        .unwrap();
-
-    // Read 200 + drain headers
-    let mut buf = BufReader::new(&mut client);
-    let mut response_line = String::new();
-    buf.read_line(&mut response_line).await.unwrap();
-    assert!(response_line.contains("200"));
-    loop {
-        let mut line = String::new();
-        buf.read_line(&mut line).await.unwrap();
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-
-    // TLS handshake with proxy
-    let mut root_store = rustls::RootCertStore::empty();
-    let mut cursor = std::io::Cursor::new(ca.ca_cert_pem.as_bytes());
-    for cert in rustls_pemfile::certs(&mut cursor) {
-        root_store.add(cert.unwrap()).unwrap();
-    }
-    let client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let server_name = ServerName::try_from("api.github.com").unwrap();
-    let client_inner = buf.into_inner();
-    let tls = connector.connect(server_name, client_inner).await.unwrap();
+    let tls = connect_through_mitm(proxy_addr, &ca_pem, "api.github.com").await;
 
     let (read_half, mut write_half) = tokio::io::split(tls);
     let mut reader = BufReader::new(read_half);
@@ -1385,55 +1284,27 @@ async fn keepalive_two_sequential_requests() {
 /// closes the connection (no further requests accepted).
 #[tokio::test]
 async fn keepalive_client_connection_close_exits_loop() {
-    let ca = strait_test_helpers::generate_ca();
     let (echo_addr, _pem, _der) = start_keepalive_echo_server().await;
+
+    // Use production handle_connection
+    let ctx = strait_test_helpers::build_production_mitm_context(
+        echo_addr,
+        "api.github.com",
+        std::time::Duration::from_secs(5),
+    );
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
-    let ca_clone = ca.clone();
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
     tokio::spawn(async move {
         let (client, peer) = proxy_listener.accept().await.unwrap();
-        strait_test_helpers::handle_mitm_keepalive(
-            client,
-            peer,
-            &ca_clone,
-            echo_addr,
-            "api.github.com",
-        )
-        .await;
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
     });
 
-    // Connect, CONNECT, TLS handshake
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-    client
-        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
-        .await
-        .unwrap();
-    let mut buf = BufReader::new(&mut client);
-    let mut response_line = String::new();
-    buf.read_line(&mut response_line).await.unwrap();
-    assert!(response_line.contains("200"));
-    loop {
-        let mut line = String::new();
-        buf.read_line(&mut line).await.unwrap();
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-
-    let mut root_store = rustls::RootCertStore::empty();
-    let mut cursor = std::io::Cursor::new(ca.ca_cert_pem.as_bytes());
-    for cert in rustls_pemfile::certs(&mut cursor) {
-        root_store.add(cert.unwrap()).unwrap();
-    }
-    let client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let server_name = ServerName::try_from("api.github.com").unwrap();
-    let client_inner = buf.into_inner();
-    let tls = connector.connect(server_name, client_inner).await.unwrap();
+    let tls = connect_through_mitm(proxy_addr, &ca_pem, "api.github.com").await;
 
     let (read_half, mut write_half) = tokio::io::split(tls);
     let mut reader = BufReader::new(read_half);
@@ -1465,57 +1336,27 @@ async fn keepalive_client_connection_close_exits_loop() {
 /// arrives within the keep-alive timeout window.
 #[tokio::test]
 async fn keepalive_idle_timeout_closes_connection() {
-    let ca = strait_test_helpers::generate_ca();
     let (echo_addr, _pem, _der) = start_keepalive_echo_server().await;
+
+    // Use production handle_connection with a very short keepalive timeout (1s)
+    let ctx = strait_test_helpers::build_production_mitm_context(
+        echo_addr,
+        "api.github.com",
+        std::time::Duration::from_secs(1),
+    );
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
-    let ca_clone = ca.clone();
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
     tokio::spawn(async move {
         let (client, peer) = proxy_listener.accept().await.unwrap();
-        // Use a very short timeout (1s) so the test doesn't hang
-        strait_test_helpers::handle_mitm_keepalive_with_timeout(
-            client,
-            peer,
-            &ca_clone,
-            echo_addr,
-            "api.github.com",
-            std::time::Duration::from_secs(1),
-        )
-        .await;
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
     });
 
-    // Connect, CONNECT, TLS handshake
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-    client
-        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
-        .await
-        .unwrap();
-    let mut buf = BufReader::new(&mut client);
-    let mut response_line = String::new();
-    buf.read_line(&mut response_line).await.unwrap();
-    assert!(response_line.contains("200"));
-    loop {
-        let mut line = String::new();
-        buf.read_line(&mut line).await.unwrap();
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-
-    let mut root_store = rustls::RootCertStore::empty();
-    let mut cursor = std::io::Cursor::new(ca.ca_cert_pem.as_bytes());
-    for cert in rustls_pemfile::certs(&mut cursor) {
-        root_store.add(cert.unwrap()).unwrap();
-    }
-    let client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let server_name = ServerName::try_from("api.github.com").unwrap();
-    let client_inner = buf.into_inner();
-    let tls = connector.connect(server_name, client_inner).await.unwrap();
+    let tls = connect_through_mitm(proxy_addr, &ca_pem, "api.github.com").await;
 
     let (read_half, mut write_half) = tokio::io::split(tls);
     let mut reader = BufReader::new(read_half);
@@ -1548,57 +1389,27 @@ async fn keepalive_idle_timeout_closes_connection() {
 /// the next request.
 #[tokio::test]
 async fn keepalive_deny_mid_loop_continues() {
-    let ca = strait_test_helpers::generate_ca();
     let (echo_addr, _pem, _der) = start_keepalive_echo_server().await;
+
+    // Use production handle_connection with a policy that denies /denied
+    let ctx = strait_test_helpers::build_production_mitm_context_with_deny(
+        echo_addr,
+        "api.github.com",
+        "/denied",
+    );
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
-    let ca_clone = ca.clone();
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
     tokio::spawn(async move {
         let (client, peer) = proxy_listener.accept().await.unwrap();
-        // Deny requests to /denied, allow everything else
-        strait_test_helpers::handle_mitm_keepalive_deny_path(
-            client,
-            peer,
-            &ca_clone,
-            echo_addr,
-            "api.github.com",
-            "/denied",
-        )
-        .await;
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
     });
 
-    // Connect, CONNECT, TLS handshake
-    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-    client
-        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
-        .await
-        .unwrap();
-    let mut buf = BufReader::new(&mut client);
-    let mut response_line = String::new();
-    buf.read_line(&mut response_line).await.unwrap();
-    assert!(response_line.contains("200"));
-    loop {
-        let mut line = String::new();
-        buf.read_line(&mut line).await.unwrap();
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-
-    let mut root_store = rustls::RootCertStore::empty();
-    let mut cursor = std::io::Cursor::new(ca.ca_cert_pem.as_bytes());
-    for cert in rustls_pemfile::certs(&mut cursor) {
-        root_store.add(cert.unwrap()).unwrap();
-    }
-    let client_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-    let server_name = ServerName::try_from("api.github.com").unwrap();
-    let client_inner = buf.into_inner();
-    let tls = connector.connect(server_name, client_inner).await.unwrap();
+    let tls = connect_through_mitm(proxy_addr, &ca_pem, "api.github.com").await;
 
     let (read_half, mut write_half) = tokio::io::split(tls);
     let mut reader = BufReader::new(read_half);
@@ -2694,20 +2505,27 @@ async fn connect_through_mitm(
 /// routing through a loopback TLS echo server.
 #[tokio::test]
 async fn mitm_chunked_request_body_decoded_and_forwarded() {
-    let ca = strait_test_helpers::generate_ca();
     let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
+
+    // Use production handle_mitm which already handles chunked decoding
+    let ctx = strait_test_helpers::build_production_mitm_context(
+        echo_addr,
+        "api.github.com",
+        std::time::Duration::from_secs(5),
+    );
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
-    let ca_clone = ca.clone();
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
     tokio::spawn(async move {
         let (client, peer) = proxy_listener.accept().await.unwrap();
-        strait_test_helpers::handle_mitm_connection_chunked(client, peer, &ca_clone, echo_addr)
-            .await;
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
     });
 
-    let mut tls = connect_through_mitm(proxy_addr, &ca.ca_cert_pem, "api.github.com").await;
+    let mut tls = connect_through_mitm(proxy_addr, &ca_pem, "api.github.com").await;
 
     // Send a POST with chunked encoding
     let body_data = r#"{"name":"chunked-test"}"#;
@@ -2862,19 +2680,27 @@ async fn mitm_negative_content_length_returns_400() {
 /// to verify nothing is broken in the standard path.
 #[tokio::test]
 async fn mitm_content_length_body_still_works() {
-    let ca = strait_test_helpers::generate_ca();
     let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
+
+    // Use production handle_mitm for Content-Length body forwarding
+    let ctx = strait_test_helpers::build_production_mitm_context(
+        echo_addr,
+        "api.github.com",
+        std::time::Duration::from_secs(5),
+    );
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
 
-    let ca_clone = ca.clone();
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
     tokio::spawn(async move {
         let (client, peer) = proxy_listener.accept().await.unwrap();
-        strait_test_helpers::handle_mitm_connection(client, peer, &ca_clone, echo_addr).await;
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
     });
 
-    let mut tls = connect_through_mitm(proxy_addr, &ca.ca_cert_pem, "api.github.com").await;
+    let mut tls = connect_through_mitm(proxy_addr, &ca_pem, "api.github.com").await;
 
     // Send a POST with Content-Length (the standard path)
     let body = r#"{"name":"cl-test","private":true}"#;
@@ -3252,46 +3078,10 @@ async fn passthrough_allowed_in_warn_only_mode() {
 mod strait_test_helpers {
     use super::*;
 
-    // Re-export the CA for testing
+    // Lightweight test CA for tests that only need a PEM certificate.
     #[derive(Clone)]
     pub struct TestCa {
         pub ca_cert_pem: String,
-        inner: InnerCa,
-    }
-
-    #[derive(Clone)]
-    struct InnerCa {
-        ca_cert_der: CertificateDer<'static>,
-        ca_key_pair: Arc<KeyPair>,
-    }
-
-    impl TestCa {
-        pub fn issue_leaf_cert(
-            &self,
-            hostname: &str,
-        ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-            let leaf_key = KeyPair::generate().unwrap();
-            let mut params = CertificateParams::default();
-            params.distinguished_name.push(DnType::CommonName, hostname);
-            params
-                .subject_alt_names
-                .push(rcgen::SanType::DnsName(hostname.try_into().unwrap()));
-
-            let ca_cert_params =
-                CertificateParams::from_ca_cert_der(&self.inner.ca_cert_der).unwrap();
-            let ca_cert_for_signing = ca_cert_params.self_signed(&self.inner.ca_key_pair).unwrap();
-
-            let leaf_cert = params
-                .signed_by(&leaf_key, &ca_cert_for_signing, &self.inner.ca_key_pair)
-                .unwrap();
-
-            let chain = vec![
-                CertificateDer::from(leaf_cert.der().to_vec()),
-                self.inner.ca_cert_der.clone(),
-            ];
-            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
-            (chain, key)
-        }
     }
 
     pub fn generate_ca() -> TestCa {
@@ -3303,662 +3093,114 @@ mod strait_test_helpers {
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
 
         let ca_cert = params.self_signed(&key_pair).unwrap();
-        let ca_cert_pem = ca_cert.pem();
-        let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
-
         TestCa {
-            ca_cert_pem,
-            inner: InnerCa {
-                ca_cert_der,
-                ca_key_pair: Arc::new(key_pair),
-            },
+            ca_cert_pem: ca_cert.pem(),
         }
     }
 
-    /// Simulate the proxy's MITM connection handler.
-    /// Accepts the CONNECT request, terminates TLS with a session-CA-signed cert,
-    /// reads the inner HTTP, then forwards to the real upstream (echo server).
-    pub async fn handle_mitm_connection(
-        mut client: TcpStream,
-        _peer: std::net::SocketAddr,
-        ca: &TestCa,
-        upstream_addr: std::net::SocketAddr,
-    ) {
-        let mut buf = BufReader::new(&mut client);
-        // Read CONNECT line
-        let mut line = String::new();
-        buf.read_line(&mut line).await.unwrap();
-        // Drain headers
-        loop {
-            let mut l = String::new();
-            buf.read_line(&mut l).await.unwrap();
-            if l.trim().is_empty() {
-                break;
-            }
-        }
-        drop(buf);
-
-        // Send 200
-        client
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await
-            .unwrap();
-
-        // Accept TLS from client using session CA
-        let (cert_chain, key) = ca.issue_leaf_cert("api.github.com");
-        let server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-        let mut tls_client = acceptor.accept(client).await.unwrap();
-
-        // Read inner HTTP request
-        let mut buf = BufReader::new(&mut tls_client);
-        let mut request_line = String::new();
-        buf.read_line(&mut request_line).await.unwrap();
-        let mut headers = Vec::new();
-        let mut content_length: Option<usize> = None;
-        loop {
-            let mut h = String::new();
-            buf.read_line(&mut h).await.unwrap();
-            if h.trim().is_empty() {
-                break;
-            }
-            let trimmed = h.trim().to_string();
-            if let Some((k, v)) = trimmed.split_once(':') {
-                if k.trim().eq_ignore_ascii_case("content-length") {
-                    content_length = v.trim().parse().ok();
-                }
-            }
-            headers.push(trimmed);
-        }
-
-        // Read request body if Content-Length present
-        let mut request_body = Vec::new();
-        if let Some(len) = content_length {
-            request_body.resize(len, 0);
-            buf.read_exact(&mut request_body).await.unwrap();
-        }
-
-        // Connect to upstream (echo server)
-        let upstream_tcp = TcpStream::connect(upstream_addr).await.unwrap();
-
-        // TLS to the echo server - trust its CA
-        // For simplicity, use a dangerous client config that trusts everything
-        let client_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify))
-            .with_no_client_auth();
-
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-        let server_name = ServerName::try_from("localhost").unwrap();
-        let mut tls_upstream = connector.connect(server_name, upstream_tcp).await.unwrap();
-
-        // Forward the request (headers + body)
-        let mut req = request_line.clone();
-        for h in &headers {
-            req.push_str(h);
-            req.push_str("\r\n");
-        }
-        req.push_str("\r\n");
-        tls_upstream.write_all(req.as_bytes()).await.unwrap();
-        if !request_body.is_empty() {
-            tls_upstream.write_all(&request_body).await.unwrap();
-        }
-
-        // Relay response back with proper shutdown propagation
-        let tls_client_inner = buf.into_inner();
-        let (mut cr, mut cw) = tokio::io::split(tls_client_inner);
-        let (mut ur, mut uw) = tokio::io::split(tls_upstream);
-
-        tokio::select! {
-            _ = tokio::io::copy(&mut ur, &mut cw) => {
-                let _ = cw.shutdown().await;
-                let _ = tokio::io::copy(&mut cr, &mut uw).await;
-            }
-            _ = tokio::io::copy(&mut cr, &mut uw) => {
-                let _ = uw.shutdown().await;
-                let _ = tokio::io::copy(&mut ur, &mut cw).await;
-            }
-        }
-    }
-
-    /// Like [`handle_mitm_connection`] but with support for `Transfer-Encoding:
-    /// chunked` request bodies. Decodes the chunked body, replaces the header
-    /// with `Content-Length`, and forwards to the echo server — mirroring the
-    /// real `handle_mitm` behavior added in H-CP-17.
-    pub async fn handle_mitm_connection_chunked(
-        mut client: TcpStream,
-        _peer: std::net::SocketAddr,
-        ca: &TestCa,
-        upstream_addr: std::net::SocketAddr,
-    ) {
-        let mut buf = BufReader::new(&mut client);
-        let mut line = String::new();
-        buf.read_line(&mut line).await.unwrap();
-        loop {
-            let mut l = String::new();
-            buf.read_line(&mut l).await.unwrap();
-            if l.trim().is_empty() {
-                break;
-            }
-        }
-        drop(buf);
-
-        client
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await
-            .unwrap();
-
-        let (cert_chain, key) = ca.issue_leaf_cert("api.github.com");
-        let server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-        let mut tls_client = acceptor.accept(client).await.unwrap();
-
-        let mut buf = BufReader::new(&mut tls_client);
-        let mut request_line = String::new();
-        buf.read_line(&mut request_line).await.unwrap();
-        let mut headers = Vec::new();
-        let mut content_length: Option<usize> = None;
-        let mut has_chunked = false;
-        loop {
-            let mut h = String::new();
-            buf.read_line(&mut h).await.unwrap();
-            if h.trim().is_empty() {
-                break;
-            }
-            let trimmed = h.trim().to_string();
-            if let Some((k, v)) = trimmed.split_once(':') {
-                if k.trim().eq_ignore_ascii_case("content-length") {
-                    content_length = v.trim().parse().ok();
-                }
-                if k.trim().eq_ignore_ascii_case("transfer-encoding")
-                    && v.trim().to_ascii_lowercase().contains("chunked")
-                {
-                    has_chunked = true;
-                }
-            }
-            headers.push(trimmed);
-        }
-
-        // Read request body: chunked or Content-Length
-        let mut request_body = Vec::new();
-        if has_chunked {
-            // Decode chunked encoding
-            loop {
-                let mut size_line = String::new();
-                buf.read_line(&mut size_line).await.unwrap();
-                let size_str = size_line.trim().split(';').next().unwrap_or("0");
-                let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
-                if chunk_size == 0 {
-                    // Consume trailing CRLF
-                    let mut trailer = String::new();
-                    let _ = buf.read_line(&mut trailer).await;
-                    break;
-                }
-                let mut chunk = vec![0u8; chunk_size];
-                buf.read_exact(&mut chunk).await.unwrap();
-                request_body.extend_from_slice(&chunk);
-                // Read trailing CRLF
-                let mut crlf = [0u8; 2];
-                buf.read_exact(&mut crlf).await.unwrap();
-            }
-            // Replace Transfer-Encoding with Content-Length in headers
-            headers.retain(|h| {
-                !h.split_once(':')
-                    .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("transfer-encoding"))
-            });
-            headers.push(format!("Content-Length: {}", request_body.len()));
-        } else if let Some(len) = content_length {
-            request_body.resize(len, 0);
-            let _ = buf.read_exact(&mut request_body).await;
-        }
-
-        // Connect to upstream echo server
-        let upstream_tcp = TcpStream::connect(upstream_addr).await.unwrap();
-        let client_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify))
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-        let server_name = ServerName::try_from("localhost").unwrap();
-        let mut tls_upstream = connector.connect(server_name, upstream_tcp).await.unwrap();
-
-        // Forward request
-        let mut req = request_line.clone();
-        for h in &headers {
-            req.push_str(h);
-            req.push_str("\r\n");
-        }
-        req.push_str("\r\n");
-        tls_upstream.write_all(req.as_bytes()).await.unwrap();
-        if !request_body.is_empty() {
-            tls_upstream.write_all(&request_body).await.unwrap();
-        }
-
-        // Relay response
-        let tls_client_inner = buf.into_inner();
-        let (mut cr, mut cw) = tokio::io::split(tls_client_inner);
-        let (mut ur, mut uw) = tokio::io::split(tls_upstream);
-
-        tokio::select! {
-            _ = tokio::io::copy(&mut ur, &mut cw) => {
-                let _ = cw.shutdown().await;
-                let _ = tokio::io::copy(&mut cr, &mut uw).await;
-            }
-            _ = tokio::io::copy(&mut cr, &mut uw) => {
-                let _ = uw.shutdown().await;
-                let _ = tokio::io::copy(&mut ur, &mut cw).await;
-            }
-        }
-    }
-
-    // --- Keep-alive test helpers ---
-
-    /// Handle a MITM connection with HTTP/1.1 keep-alive support.
+    /// Build a [`ProxyContext`] that routes through the production `handle_mitm`
+    /// code path to a local echo server.
     ///
-    /// Loops over sequential requests on the same TLS connection, forwarding
-    /// each to the upstream echo server and relaying the response back.
-    /// Exits when the client sends `Connection: close`, on EOF, or on upstream
-    /// `Connection: close`.
-    pub async fn handle_mitm_keepalive(
-        client: TcpStream,
-        _peer: std::net::SocketAddr,
-        ca: &TestCa,
-        upstream_addr: std::net::SocketAddr,
+    /// Uses `upstream_addr_override` + `upstream_tls_override` (NoVerify) so
+    /// production code connects to the echo server instead of the real internet.
+    /// This replaces the duplicated MITM helpers (`handle_mitm_connection`,
+    /// `handle_mitm_connection_chunked`, `handle_mitm_keepalive_*`) with the
+    /// real production pipeline.
+    pub fn build_production_mitm_context(
+        echo_addr: std::net::SocketAddr,
         hostname: &str,
-    ) {
-        handle_mitm_keepalive_with_timeout(
-            client,
-            _peer,
-            ca,
-            upstream_addr,
-            hostname,
-            std::time::Duration::from_secs(5),
-        )
-        .await;
-    }
+        keepalive_timeout: std::time::Duration,
+    ) -> strait::config::ProxyContext {
+        let session_ca = strait::ca::SessionCa::generate().unwrap();
+        let audit_logger = Arc::new(strait::audit::AuditLogger::new(None).unwrap());
 
-    /// Like [`handle_mitm_keepalive`] but with a configurable idle timeout.
-    pub async fn handle_mitm_keepalive_with_timeout(
-        mut client: TcpStream,
-        _peer: std::net::SocketAddr,
-        ca: &TestCa,
-        upstream_addr: std::net::SocketAddr,
-        hostname: &str,
-        idle_timeout: std::time::Duration,
-    ) {
-        let mut buf = BufReader::new(&mut client);
-        // Read CONNECT line
-        let mut line = String::new();
-        buf.read_line(&mut line).await.unwrap();
-        // Drain headers
-        loop {
-            let mut l = String::new();
-            buf.read_line(&mut l).await.unwrap();
-            if l.trim().is_empty() {
-                break;
-            }
-        }
-        drop(buf);
-
-        // Send 200
-        client
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await
-            .unwrap();
-
-        // Accept TLS from client using session CA
-        let (cert_chain, key) = ca.issue_leaf_cert(hostname);
-        let server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-        let tls_client = acceptor.accept(client).await.unwrap();
-
-        let (read_half, mut write_half) = tokio::io::split(tls_client);
-        let mut buf_reader = BufReader::new(read_half);
-
-        loop {
-            // Read request with idle timeout
-            let mut request_line = String::new();
-            let read_result =
-                tokio::time::timeout(idle_timeout, buf_reader.read_line(&mut request_line)).await;
-
-            match read_result {
-                Err(_) => break,    // timeout
-                Ok(Ok(0)) => break, // EOF
-                Ok(Err(_)) => break,
-                Ok(Ok(_)) => {}
-            }
-
-            if request_line.trim().is_empty() {
-                break;
-            }
-
-            let mut headers: Vec<(String, String)> = Vec::new();
-            let mut content_length: Option<usize> = None;
-            let mut client_close = false;
-
-            loop {
-                let mut h = String::new();
-                buf_reader.read_line(&mut h).await.unwrap();
-                if h.trim().is_empty() {
-                    break;
-                }
-                let trimmed = h.trim().to_string();
-                if let Some((k, v)) = trimmed.split_once(':') {
-                    let key = k.trim().to_string();
-                    let val = v.trim().to_string();
-                    if key.eq_ignore_ascii_case("content-length") {
-                        content_length = val.parse().ok();
-                    }
-                    if key.eq_ignore_ascii_case("connection") && val.eq_ignore_ascii_case("close") {
-                        client_close = true;
-                    }
-                    headers.push((key, val));
-                }
-            }
-
-            let mut request_body = Vec::new();
-            if let Some(len) = content_length {
-                request_body.resize(len, 0);
-                buf_reader.read_exact(&mut request_body).await.unwrap();
-            }
-
-            // Forward to echo server
-            let upstream_tcp = TcpStream::connect(upstream_addr).await.unwrap();
-            let client_config = rustls::ClientConfig::builder()
+        let tls_config = Arc::new(
+            rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth();
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-            let server_name = ServerName::try_from("localhost").unwrap();
-            let tls_upstream = connector.connect(server_name, upstream_tcp).await.unwrap();
-            let (upstream_read, mut upstream_write) = tokio::io::split(tls_upstream);
+                .with_no_client_auth(),
+        );
 
-            let mut req = request_line.clone();
-            for (k, v) in &headers {
-                req.push_str(&format!("{k}: {v}\r\n"));
-            }
-            req.push_str("\r\n");
-            upstream_write.write_all(req.as_bytes()).await.unwrap();
-            if !request_body.is_empty() {
-                upstream_write.write_all(&request_body).await.unwrap();
-            }
-            upstream_write.flush().await.unwrap();
-
-            // Read and relay response
-            let mut upstream_reader = BufReader::new(upstream_read);
-            let mut status = String::new();
-            upstream_reader.read_line(&mut status).await.unwrap();
-            write_half.write_all(status.as_bytes()).await.unwrap();
-
-            let mut resp_content_length: Option<usize> = None;
-            let mut upstream_close = false;
-            let mut resp_headers = String::new();
-            loop {
-                let mut line = String::new();
-                upstream_reader.read_line(&mut line).await.unwrap();
-                resp_headers.push_str(&line);
-                if line.trim().is_empty() {
-                    break;
-                }
-                if let Some((k, v)) = line.trim().split_once(':') {
-                    if k.trim().eq_ignore_ascii_case("content-length") {
-                        resp_content_length = v.trim().parse().ok();
-                    }
-                    if k.trim().eq_ignore_ascii_case("connection")
-                        && v.trim().eq_ignore_ascii_case("close")
-                    {
-                        upstream_close = true;
-                    }
-                }
-            }
-            write_half.write_all(resp_headers.as_bytes()).await.unwrap();
-
-            if let Some(len) = resp_content_length {
-                let mut remaining = len;
-                let mut buf = vec![0u8; 8192];
-                while remaining > 0 {
-                    let to_read = buf.len().min(remaining);
-                    let n = upstream_reader.read(&mut buf[..to_read]).await.unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    write_half.write_all(&buf[..n]).await.unwrap();
-                    remaining -= n;
-                }
-            } else {
-                // Read until EOF
-                let mut buf = vec![0u8; 8192];
-                loop {
-                    let n = upstream_reader.read(&mut buf).await.unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    write_half.write_all(&buf[..n]).await.unwrap();
-                }
-                upstream_close = true;
-            }
-
-            write_half.flush().await.unwrap();
-
-            if client_close || upstream_close {
-                break;
-            }
+        strait::config::ProxyContext {
+            session_ca,
+            policy_engine: None,
+            credential_store: None,
+            audit_logger,
+            mitm_hosts: vec![hostname.to_string()],
+            max_body_size: 10 * 1024 * 1024,
+            keepalive_timeout,
+            startup_instant: std::time::Instant::now(),
+            identity_header: "X-Strait-Agent".to_string(),
+            identity_default: "anonymous".to_string(),
+            git_policy: None,
+            policy_config: None,
+            observation_stream: None,
+            enforcement_mode: "observe".to_string(),
+            mitm_all: false,
+            warn_only: false,
+            upstream_addr_override: Some(echo_addr),
+            upstream_tls_override: Some(tls_config),
         }
-
-        let _ = write_half.shutdown().await;
     }
 
-    /// Keep-alive MITM handler that denies requests to a specific path with 403
-    /// and forwards all other requests normally.
-    pub async fn handle_mitm_keepalive_deny_path(
-        mut client: TcpStream,
-        _peer: std::net::SocketAddr,
-        ca: &TestCa,
-        upstream_addr: std::net::SocketAddr,
+    /// Build a [`ProxyContext`] with a Cedar policy engine that denies a
+    /// specific path, routing through the production `handle_mitm` pipeline.
+    pub fn build_production_mitm_context_with_deny(
+        echo_addr: std::net::SocketAddr,
         hostname: &str,
         deny_path: &str,
-    ) {
-        let mut buf = BufReader::new(&mut client);
-        let mut line = String::new();
-        buf.read_line(&mut line).await.unwrap();
-        loop {
-            let mut l = String::new();
-            buf.read_line(&mut l).await.unwrap();
-            if l.trim().is_empty() {
-                break;
-            }
-        }
-        drop(buf);
+    ) -> strait::config::ProxyContext {
+        let session_ca = strait::ca::SessionCa::generate().unwrap();
+        let audit_logger = Arc::new(strait::audit::AuditLogger::new(None).unwrap());
 
-        client
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await
-            .unwrap();
-
-        let (cert_chain, key) = ca.issue_leaf_cert(hostname);
-        let server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-        let tls_client = acceptor.accept(client).await.unwrap();
-
-        let (read_half, mut write_half) = tokio::io::split(tls_client);
-        let mut buf_reader = BufReader::new(read_half);
-
-        loop {
-            let mut request_line = String::new();
-            let read_result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                buf_reader.read_line(&mut request_line),
-            )
-            .await;
-
-            match read_result {
-                Err(_) => break,
-                Ok(Ok(0)) => break,
-                Ok(Err(_)) => break,
-                Ok(Ok(_)) => {}
-            }
-
-            if request_line.trim().is_empty() {
-                break;
-            }
-
-            let parts: Vec<&str> = request_line.split_whitespace().collect();
-            let method = parts.first().copied().unwrap_or("GET");
-            let path = parts.get(1).copied().unwrap_or("/");
-
-            let mut headers: Vec<(String, String)> = Vec::new();
-            let mut content_length: Option<usize> = None;
-            let mut client_close = false;
-
-            loop {
-                let mut h = String::new();
-                buf_reader.read_line(&mut h).await.unwrap();
-                if h.trim().is_empty() {
-                    break;
-                }
-                let trimmed = h.trim().to_string();
-                if let Some((k, v)) = trimmed.split_once(':') {
-                    let key = k.trim().to_string();
-                    let val = v.trim().to_string();
-                    if key.eq_ignore_ascii_case("content-length") {
-                        content_length = val.parse().ok();
-                    }
-                    if key.eq_ignore_ascii_case("connection") && val.eq_ignore_ascii_case("close") {
-                        client_close = true;
-                    }
-                    headers.push((key, val));
-                }
-            }
-
-            let mut request_body = Vec::new();
-            if let Some(len) = content_length {
-                request_body.resize(len, 0);
-                buf_reader.read_exact(&mut request_body).await.unwrap();
-            }
-
-            // Check if this path should be denied
-            if path == deny_path {
-                let body = serde_json::json!({
-                    "error": "policy_denied",
-                    "message": format!("Request denied: {} {}", method, path),
-                    "host": hostname,
-                    "method": method,
-                    "path": path,
-                });
-                let body_bytes = serde_json::to_string(&body).unwrap();
-                let response = format!(
-                    "HTTP/1.1 403 Forbidden\r\n\
-                     Content-Type: application/json\r\n\
-                     Content-Length: {}\r\n\
-                     \r\n\
-                     {}",
-                    body_bytes.len(),
-                    body_bytes
-                );
-                write_half.write_all(response.as_bytes()).await.unwrap();
-                write_half.flush().await.unwrap();
-
-                if client_close {
-                    break;
-                }
-                continue;
-            }
-
-            // Forward to echo server
-            let upstream_tcp = TcpStream::connect(upstream_addr).await.unwrap();
-            let client_config = rustls::ClientConfig::builder()
+        let tls_config = Arc::new(
+            rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth();
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-            let server_name = ServerName::try_from("localhost").unwrap();
-            let tls_upstream = connector.connect(server_name, upstream_tcp).await.unwrap();
-            let (upstream_read, mut upstream_write) = tokio::io::split(tls_upstream);
+                .with_no_client_auth(),
+        );
 
-            let mut req = request_line.clone();
-            for (k, v) in &headers {
-                req.push_str(&format!("{k}: {v}\r\n"));
-            }
-            req.push_str("\r\n");
-            upstream_write.write_all(req.as_bytes()).await.unwrap();
-            if !request_body.is_empty() {
-                upstream_write.write_all(&request_body).await.unwrap();
-            }
-            upstream_write.flush().await.unwrap();
+        // Policy: permit everything EXCEPT the denied path
+        let policy_text = format!(
+            r#"
+@id("allow-all")
+permit(principal, action, resource);
 
-            // Read and relay response
-            let mut upstream_reader = BufReader::new(upstream_read);
-            let mut status = String::new();
-            upstream_reader.read_line(&mut status).await.unwrap();
-            write_half.write_all(status.as_bytes()).await.unwrap();
+@id("deny-path")
+@reason("Path is denied by test policy")
+forbid(principal, action, resource)
+when {{ context.path == "{deny_path}" }};
+"#
+        );
 
-            let mut resp_content_length: Option<usize> = None;
-            let mut upstream_close = false;
-            let mut resp_headers = String::new();
-            loop {
-                let mut line = String::new();
-                upstream_reader.read_line(&mut line).await.unwrap();
-                resp_headers.push_str(&line);
-                if line.trim().is_empty() {
-                    break;
-                }
-                if let Some((k, v)) = line.trim().split_once(':') {
-                    if k.trim().eq_ignore_ascii_case("content-length") {
-                        resp_content_length = v.trim().parse().ok();
-                    }
-                    if k.trim().eq_ignore_ascii_case("connection")
-                        && v.trim().eq_ignore_ascii_case("close")
-                    {
-                        upstream_close = true;
-                    }
-                }
-            }
-            write_half.write_all(resp_headers.as_bytes()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("policy.cedar");
+        std::fs::write(&policy_path, &policy_text).unwrap();
+        // Leak the tempdir so it persists for the lifetime of the context
+        std::mem::forget(dir);
 
-            if let Some(len) = resp_content_length {
-                let mut remaining = len;
-                let mut buf = vec![0u8; 8192];
-                while remaining > 0 {
-                    let to_read = buf.len().min(remaining);
-                    let n = upstream_reader.read(&mut buf[..to_read]).await.unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    write_half.write_all(&buf[..n]).await.unwrap();
-                    remaining -= n;
-                }
-            } else {
-                let mut buf = vec![0u8; 8192];
-                loop {
-                    let n = upstream_reader.read(&mut buf).await.unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    write_half.write_all(&buf[..n]).await.unwrap();
-                }
-                upstream_close = true;
-            }
+        let engine = strait::policy::PolicyEngine::load(&policy_path, None).unwrap();
 
-            write_half.flush().await.unwrap();
-
-            if client_close || upstream_close {
-                break;
-            }
+        strait::config::ProxyContext {
+            session_ca,
+            policy_engine: Some(arc_swap::ArcSwap::from_pointee(engine)),
+            credential_store: None,
+            audit_logger,
+            mitm_hosts: vec![hostname.to_string()],
+            max_body_size: 10 * 1024 * 1024,
+            keepalive_timeout: std::time::Duration::from_secs(5),
+            startup_instant: std::time::Instant::now(),
+            identity_header: "X-Strait-Agent".to_string(),
+            identity_default: "anonymous".to_string(),
+            git_policy: None,
+            policy_config: None,
+            observation_stream: None,
+            enforcement_mode: "enforce".to_string(),
+            mitm_all: false,
+            warn_only: false,
+            upstream_addr_override: Some(echo_addr),
+            upstream_tls_override: Some(tls_config),
         }
-
-        let _ = write_half.shutdown().await;
     }
 
     /// Build a minimal [`ProxyContext`] for testing `handle_connection` and `handle_mitm`.

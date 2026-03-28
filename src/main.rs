@@ -188,6 +188,10 @@ TLS TRUST:
         #[arg(long, default_value = "observations.jsonl")]
         output: PathBuf,
 
+        /// Set environment variables in the container (repeatable).
+        #[arg(long, value_name = "KEY=VALUE")]
+        env: Vec<String>,
+
         /// The command and arguments to run inside the container.
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -297,6 +301,7 @@ async fn main() -> anyhow::Result<()> {
             config,
             image,
             output,
+            env,
             command,
         } => {
             init_tracing();
@@ -333,6 +338,7 @@ async fn main() -> anyhow::Result<()> {
                     Some(output),
                     credential_store,
                     mitm_hosts,
+                    env,
                 )
                 .await?
             } else if let Some(warn_path) = warn {
@@ -345,6 +351,7 @@ async fn main() -> anyhow::Result<()> {
                     Some(output),
                     credential_store,
                     mitm_hosts,
+                    env,
                 )
                 .await?
             } else {
@@ -356,6 +363,7 @@ async fn main() -> anyhow::Result<()> {
                     Some(output),
                     credential_store,
                     mitm_hosts,
+                    env,
                 )
                 .await?
             };
@@ -637,6 +645,7 @@ mod tests {
                 policy,
                 image,
                 output,
+                env,
                 command,
                 ..
             } => {
@@ -645,6 +654,7 @@ mod tests {
                 assert!(policy.is_none());
                 assert_eq!(image, "ubuntu:24.04");
                 assert_eq!(output.to_str().unwrap(), "/tmp/obs.jsonl");
+                assert!(env.is_empty());
                 assert_eq!(command, vec!["npm", "test"]);
             }
             _ => panic!("expected Launch subcommand"),
@@ -824,6 +834,49 @@ mod tests {
             "hello",
         ]);
         assert!(result.is_err(), "--observe and --policy should conflict");
+    }
+
+    #[test]
+    fn test_launch_env_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--observe",
+            "--env",
+            "FOO=bar",
+            "--env",
+            "BAZ=qux",
+            "echo",
+            "hello",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Launch { env, command, .. } => {
+                assert_eq!(env, vec!["FOO=bar", "BAZ=qux"]);
+                assert_eq!(command, vec!["echo", "hello"]);
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_env_flag_with_equals_in_value() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--observe",
+            "--env",
+            "FOO=bar=baz",
+            "echo",
+            "hello",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Launch { env, .. } => {
+                assert_eq!(env, vec!["FOO=bar=baz"]);
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
     }
 
     #[test]

@@ -97,6 +97,7 @@ pub async fn run_launch_observe(
     output: Option<PathBuf>,
     credential_store: Option<Arc<CredentialStore>>,
     mitm_hosts: Vec<String>,
+    extra_env: Vec<String>,
 ) -> anyhow::Result<i32> {
     let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
@@ -173,6 +174,7 @@ pub async fn run_launch_observe(
         &cwd,
     )?;
     config.auto_remove = false;
+    config.env.extend(extra_env);
 
     let container_id = container_mgr.create_container_from_config(&config).await?;
 
@@ -252,6 +254,7 @@ pub async fn run_launch_observe(
 /// In **enforce** mode: the proxy denies disallowed connections with 403.
 ///
 /// Returns the container's exit code.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_launch_with_policy(
     mode: EnforcementMode,
     policy_path: &Path,
@@ -260,6 +263,7 @@ pub async fn run_launch_with_policy(
     output: Option<PathBuf>,
     credential_store: Option<Arc<CredentialStore>>,
     mitm_hosts: Vec<String>,
+    extra_env: Vec<String>,
 ) -> anyhow::Result<i32> {
     let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
@@ -365,6 +369,7 @@ pub async fn run_launch_with_policy(
         &cwd,
     )?;
     config.auto_remove = false;
+    config.env.extend(extra_env);
 
     let container_id = container_mgr.create_container_from_config(&config).await?;
 

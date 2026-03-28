@@ -90,6 +90,7 @@ async fn launch_observe_echo_hello() {
         Some(obs_path.clone()),
         None,
         Vec::new(),
+        vec![],
     )
     .await
     .expect("launch should succeed");
@@ -139,6 +140,7 @@ async fn launch_observe_contains_lifecycle_events() {
         Some(obs_path.clone()),
         None,
         Vec::new(),
+        vec![],
     )
     .await
     .unwrap();
@@ -185,6 +187,7 @@ async fn launch_observe_bad_command_exit_code() {
         Some(obs_path.clone()),
         None,
         Vec::new(),
+        vec![],
     )
     .await
     .unwrap();
@@ -258,6 +261,7 @@ async fn launch_policy_invalid_file_fails_fast() {
         Some(obs_path.clone()),
         None,
         Vec::new(),
+        vec![],
     )
     .await;
 
@@ -288,6 +292,7 @@ async fn launch_policy_missing_file_fails_fast() {
         Some(obs_path),
         None,
         Vec::new(),
+        vec![],
     )
     .await;
 
@@ -343,6 +348,7 @@ permit(
         Some(obs_path.clone()),
         None,
         Vec::new(),
+        vec![],
     )
     .await
     .unwrap();
@@ -399,6 +405,7 @@ permit(
         Some(obs_path.clone()),
         None,
         Vec::new(),
+        vec![],
     )
     .await
     .unwrap();

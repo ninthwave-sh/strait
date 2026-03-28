@@ -238,7 +238,10 @@ fn evaluate_event(
 
             // "passthrough" means traffic was not inspected — it effectively went through,
             // so we treat it as "allow" for comparison purposes.
-            let observed_allowed = decision == "allow" || decision == "passthrough";
+            // "warn" means the policy denied the request but warn mode allowed it
+            // through anyway, so it counts as observed-allowed for comparison.
+            let observed_allowed =
+                decision == "allow" || decision == "passthrough" || decision == "warn";
             let observed_str = decision.as_str();
 
             if policy_allowed == observed_allowed {
@@ -1222,6 +1225,95 @@ permit(
         let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.matches, 1, "only 'node index.js' should match");
         assert_eq!(result.mismatches.len(), 1, "'rm -rf /' should mismatch");
+    }
+
+    // -- Warn decision treated as allowed ---------------------------------------
+
+    #[test]
+    fn warn_decision_treated_as_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // "warn" means the proxy allowed the request despite a policy denial
+        // (warn mode). For replay comparison, this counts as "allowed".
+        let events = vec![make_network_event(
+            "GET",
+            "api.github.com",
+            "/repos/org/repo",
+            "warn",
+        )];
+        let obs_path = write_observations(&dir, &events);
+
+        // Policy allows this request — should match because warn == allowed.
+        let policy = r#"
+permit(
+  principal,
+  action == Action::"http:GET",
+  resource in Resource::"api.github.com"
+);
+"#;
+        let policy_path = write_policy(&dir, policy);
+
+        let result = replay(&obs_path, &policy_path, None).unwrap();
+        assert_eq!(result.matches, 1, "warn should be treated as allowed");
+        assert!(result.mismatches.is_empty());
+    }
+
+    #[test]
+    fn warn_decision_mismatch_when_policy_denies() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Observed "warn" (allowed through) but policy would deny.
+        let events = vec![make_network_event(
+            "DELETE",
+            "api.github.com",
+            "/repos/org/repo",
+            "warn",
+        )];
+        let obs_path = write_observations(&dir, &events);
+
+        // Policy only allows GET — DELETE is denied.
+        let policy = r#"
+permit(
+  principal,
+  action == Action::"http:GET",
+  resource in Resource::"api.github.com"
+);
+"#;
+        let policy_path = write_policy(&dir, policy);
+
+        let result = replay(&obs_path, &policy_path, None).unwrap();
+        assert_eq!(result.mismatches.len(), 1);
+        assert_eq!(result.mismatches[0].observed, "warn");
+        assert_eq!(result.mismatches[0].policy_decision, "deny");
+    }
+
+    #[test]
+    fn deny_decision_still_counted_as_denied() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Observed "deny" — should count as denied, not allowed.
+        let events = vec![make_network_event(
+            "GET",
+            "api.github.com",
+            "/repos",
+            "deny",
+        )];
+        let obs_path = write_observations(&dir, &events);
+
+        // Policy allows GET — so this is a mismatch (observed deny, policy allow).
+        let policy = r#"
+permit(
+  principal,
+  action == Action::"http:GET",
+  resource in Resource::"api.github.com"
+);
+"#;
+        let policy_path = write_policy(&dir, policy);
+
+        let result = replay(&obs_path, &policy_path, None).unwrap();
+        assert_eq!(result.mismatches.len(), 1, "deny should remain denied");
+        assert_eq!(result.mismatches[0].observed, "deny");
+        assert_eq!(result.mismatches[0].policy_decision, "allow");
     }
 
     // -- AWS context attributes in replay -------------------------------------

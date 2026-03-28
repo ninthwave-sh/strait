@@ -275,7 +275,29 @@ impl PolicyEngine {
             EntityId::from_str(&resource_id).unwrap(),
         );
 
-        let context = Context::empty();
+        // Build context with path and operation attributes so Cedar policies
+        // using `when { context.path like ... }` or `context.operation` work
+        // consistently in both live enforcement and replay.
+        let operation = action.strip_prefix("fs:").unwrap_or(action);
+        let context_pairs: Vec<(String, RestrictedExpression)> = vec![
+            (
+                "path".to_string(),
+                RestrictedExpression::from_str(&format!(
+                    "\"{}\"",
+                    escape_cedar_string(&normalized)
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
+            ),
+            (
+                "operation".to_string(),
+                RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(operation)))
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to build Cedar context for operation: {e}")
+                    })?,
+            ),
+        ];
+        let context = Context::from_pairs(context_pairs)
+            .map_err(|e| anyhow::anyhow!("failed to build Cedar fs context: {e}"))?;
         let request = Request::new(principal, action_uid, resource, context, None)
             .map_err(|e| anyhow::anyhow!("failed to build Cedar fs request: {e}"))?;
 
@@ -1780,6 +1802,72 @@ permit(
             .evaluate_fs("/etc/passwd", "fs:read", "agent")
             .unwrap();
         assert!(!result.allowed, "fs:read outside /project should be denied");
+    }
+
+    #[test]
+    fn evaluate_fs_context_path_condition_matches() {
+        // Policy uses `when { context.path like "/project/*" }` — should match
+        // now that evaluate_fs populates context with path and operation.
+        let f = write_policy(
+            r#"
+@id("allow-fs-context-path")
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:read",
+    resource
+) when { context.path like "/project/*" };
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let result = engine
+            .evaluate_fs("/project/src/main.rs", "fs:read", "agent")
+            .unwrap();
+        assert!(
+            result.allowed,
+            "fs:read should be allowed when context.path matches /project/*"
+        );
+
+        // Path outside /project should be denied by the `when` condition.
+        let result = engine
+            .evaluate_fs("/etc/passwd", "fs:read", "agent")
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "fs:read should be denied when context.path does not match /project/*"
+        );
+    }
+
+    #[test]
+    fn evaluate_fs_context_operation_populated() {
+        // Policy gates on context.operation — only allow "read" operations.
+        let f = write_policy(
+            r#"
+@id("allow-fs-read-only-by-context")
+permit(
+    principal == Agent::"agent",
+    action,
+    resource in Resource::"fs::/project"
+) when { context.operation == "read" };
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let result = engine
+            .evaluate_fs("/project/src", "fs:read", "agent")
+            .unwrap();
+        assert!(
+            result.allowed,
+            "fs:read should be allowed when context.operation == 'read'"
+        );
+
+        let result = engine
+            .evaluate_fs("/project/src", "fs:write", "agent")
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "fs:write should be denied when context.operation != 'read'"
+        );
     }
 
     // --- is_host_permitted tests ---

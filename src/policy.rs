@@ -342,6 +342,15 @@ impl PolicyEngine {
 /// - `FsWrite` if `fs:write` is permitted (implies read access too)
 /// - `FsRead` if only `fs:read` is permitted
 /// - Nothing if neither is permitted (path will not be mounted)
+///
+/// # Limitation
+///
+/// This function only evaluates the **caller-supplied** candidate paths — it
+/// does not discover or enumerate all paths that the Cedar policy might permit.
+/// If the policy allows access to a path not included in `paths`, that path
+/// will not appear in the returned permissions and will not be mounted into
+/// the container. Callers are responsible for providing a comprehensive set
+/// of candidate paths (e.g., the working directory, explicit mounts).
 pub fn extract_fs_permissions(
     engine: &PolicyEngine,
     paths: &[String],

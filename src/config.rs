@@ -26,6 +26,7 @@ use crate::policy::PolicyEngine;
 
 /// Top-level configuration parsed from `strait.toml`.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct StraitConfig {
     /// Path to write the session CA certificate PEM (required).
     pub ca_cert_path: PathBuf,
@@ -57,6 +58,7 @@ pub struct StraitConfig {
 
 /// `[listen]` section — address and port for the proxy listener.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ListenConfig {
     /// Bind address (default `"127.0.0.1"`).
     #[serde(default = "default_address")]
@@ -88,6 +90,7 @@ const DEFAULT_KEEPALIVE_TIMEOUT_SECS: u64 = 30;
 
 /// `[mitm]` section — which hosts to intercept.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct MitmConfig {
     /// Hostnames that should be MITM'd for policy inspection.
     #[serde(default)]
@@ -131,6 +134,7 @@ fn default_keepalive_timeout_secs() -> u64 {
 /// - `git_url`: clone a git repository and load the policy from it. The repo is
 ///   polled at `poll_interval_secs` for changes and hot-reloaded atomically.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     /// Path to a local `.cedar` policy file (mutually exclusive with `git_url`).
     pub file: Option<PathBuf>,
@@ -179,6 +183,7 @@ impl PolicyConfig {
 /// - `"bearer"` (default) — injects a single static header/value pair.
 /// - `"aws-sigv4"` — signs the request with AWS Signature Version 4.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialEntryConfig {
     /// Exact hostname this credential applies to (e.g. `"api.github.com"`).
     /// Mutually exclusive with `host_pattern`.
@@ -220,6 +225,7 @@ fn default_credential_type() -> String {
 
 /// `[audit]` section — audit log file configuration.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AuditConfig {
     /// Path to an audit log file. If omitted, events are only written to stderr.
     pub log_path: Option<PathBuf>,
@@ -227,6 +233,7 @@ pub struct AuditConfig {
 
 /// `[identity]` section — agent identity extraction from request headers.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct IdentityConfig {
     /// HTTP header name to extract the agent identity from (default `"X-Strait-Agent"`).
     #[serde(default = "default_identity_header")]
@@ -256,6 +263,7 @@ fn default_identity_default() -> String {
 
 /// `[health]` section — health check endpoint configuration.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct HealthConfig {
     /// Port for the health check endpoint (required when `[health]` is present).
     pub port: u16,
@@ -1140,6 +1148,71 @@ poll_interval_secs = 30
         assert!(
             err.contains("poll_interval_secs"),
             "error should mention poll_interval_secs, got: {err}"
+        );
+    }
+
+    // --- deny_unknown_fields tests ---
+
+    #[test]
+    fn unknown_top_level_field_errors() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+ploicy = "typo.cedar"
+"#,
+        );
+        let result = StraitConfig::load(f.path());
+        assert!(result.is_err(), "typo field 'ploicy' should be rejected");
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_section_errors() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+
+[ploicy]
+file = "policy.cedar"
+"#,
+        );
+        let result = StraitConfig::load(f.path());
+        assert!(
+            result.is_err(),
+            "typo section '[ploicy]' should be rejected"
+        );
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_field_in_nested_section_errors() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+
+[listen]
+address = "127.0.0.1"
+port = 8080
+typo_field = true
+"#,
+        );
+        let result = StraitConfig::load(f.path());
+        assert!(
+            result.is_err(),
+            "unknown field in [listen] should be rejected"
+        );
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("unknown field"),
+            "error should mention unknown field, got: {err}"
         );
     }
 

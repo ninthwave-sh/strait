@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
@@ -148,26 +148,27 @@ TLS TRUST:
     ///
     /// Network traffic routes through the built-in proxy. Filesystem access is
     /// controlled via bind-mount restrictions derived from Cedar `fs:` policies.
+    #[command(group(ArgGroup::new("mode").required(true).args(["observe", "warn", "policy"])))]
     Launch {
         /// Run in observation mode: allow all activity, record to JSONL.
         ///
         /// All filesystem and network access is permitted. Activity is recorded
         /// to an observation log for later policy generation with `strait generate`.
-        #[arg(long, conflicts_with_all = ["warn", "policy"])]
+        #[arg(long)]
         observe: bool,
 
         /// Evaluate Cedar policy but allow all access, logging violations as warnings.
         ///
         /// Container bind-mounts are restricted to paths permitted by `fs:` policies.
         /// Network connections to disallowed hosts are logged as warnings but not blocked.
-        #[arg(long, value_name = "POLICY_FILE", conflicts_with_all = ["observe", "policy"])]
+        #[arg(long, value_name = "POLICY_FILE")]
         warn: Option<PathBuf>,
 
         /// Enforce Cedar policy: deny disallowed filesystem and network access.
         ///
         /// Container bind-mounts are restricted to paths permitted by `fs:` policies.
         /// Network connections to disallowed hosts are blocked with HTTP 403.
-        #[arg(long, value_name = "POLICY_FILE", conflicts_with_all = ["observe", "warn"])]
+        #[arg(long, value_name = "POLICY_FILE")]
         policy: Option<PathBuf>,
 
         /// Docker image to use for the container.
@@ -227,6 +228,18 @@ TLS TRUST:
     },
 }
 
+/// Initialize the tracing subscriber with JSON output to stderr.
+///
+/// Called once at startup. Commands that produce no tracing events see no
+/// output — the subscriber is effectively a no-op for non-proxy commands.
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .json()
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -276,12 +289,9 @@ async fn main() -> anyhow::Result<()> {
             output,
             command,
         } => {
-            tracing_subscriber::fmt()
-                .json()
-                .with_target(false)
-                .with_writer(std::io::stderr)
-                .init();
+            init_tracing();
 
+            // clap's ArgGroup "mode" guarantees exactly one of these is set.
             let exit_code = if let Some(policy_path) = policy {
                 // Enforce mode: deny disallowed access
                 strait::launch::run_launch_with_policy(
@@ -302,17 +312,10 @@ async fn main() -> anyhow::Result<()> {
                     Some(output),
                 )
                 .await?
-            } else if observe {
-                // Observe mode: allow all, record activity
-                strait::launch::run_launch_observe(command, Some(&image), Some(output)).await?
             } else {
-                eprintln!(
-                    "strait launch requires one of: --observe, --warn <policy.cedar>, --policy <policy.cedar>"
-                );
-                eprintln!("Usage: strait launch --observe <command> [args...]");
-                eprintln!("       strait launch --warn policy.cedar <command> [args...]");
-                eprintln!("       strait launch --policy policy.cedar <command> [args...]");
-                std::process::exit(1);
+                // Observe mode: allow all, record activity
+                debug_assert!(observe);
+                strait::launch::run_launch_observe(command, Some(&image), Some(output)).await?
             };
             std::process::exit(exit_code);
         }
@@ -335,21 +338,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run the HTTPS proxy server.
-async fn run_proxy(config_path: PathBuf) -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .json()
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
-
-    // Load configuration
-    let config = StraitConfig::load(&config_path)?;
-    info!(path = %config_path.display(), "configuration loaded");
-
-    // Build shared proxy context
-    let ctx = Arc::new(ProxyContext::from_config(&config)?);
-
+/// Shared proxy startup: write CA cert, bind listener, print port.
+///
+/// Both `run_proxy` and `run_observe` perform the same startup sequence after
+/// building their respective `ProxyContext`. This helper eliminates that
+/// duplication.
+async fn bind_proxy_listener(
+    config: &StraitConfig,
+    ctx: &ProxyContext,
+) -> anyhow::Result<TcpListener> {
     // Write CA cert PEM to configured path
     std::fs::write(&config.ca_cert_path, &ctx.session_ca.ca_cert_pem)?;
     info!(path = %config.ca_cert_path.display(), "CA cert written");
@@ -364,6 +361,22 @@ async fn run_proxy(config_path: PathBuf) -> anyhow::Result<()> {
 
     // Print port to stderr for programmatic consumption
     eprintln!("PORT={}", local_addr.port());
+
+    Ok(listener)
+}
+
+/// Run the HTTPS proxy server.
+async fn run_proxy(config_path: PathBuf) -> anyhow::Result<()> {
+    init_tracing();
+
+    // Load configuration
+    let config = StraitConfig::load(&config_path)?;
+    info!(path = %config_path.display(), "configuration loaded");
+
+    // Build shared proxy context
+    let ctx = Arc::new(ProxyContext::from_config(&config)?);
+
+    let listener = bind_proxy_listener(&config, &ctx).await?;
 
     // Start git policy poll task if configured
     if ctx.git_policy.is_some() {
@@ -419,11 +432,7 @@ async fn run_observe(
 
     let duration = parse_duration(duration_str)?;
 
-    tracing_subscriber::fmt()
-        .json()
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+    init_tracing();
 
     // Load configuration, ignoring the policy section
     let mut config = config::StraitConfig::load(&config_path)?;
@@ -445,24 +454,7 @@ async fn run_observe(
     ctx.observation_stream = Some(obs_stream);
     let ctx = Arc::new(ctx);
 
-    // Write CA cert PEM
-    std::fs::write(&config.ca_cert_path, &ctx.session_ca.ca_cert_pem)?;
-    info!(path = %config.ca_cert_path.display(), "CA cert written");
-
-    let listen_addr: std::net::SocketAddr =
-        format!("{}:{}", config.listen.address, config.listen.port)
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid listen address: {e}"))?;
-
-    let listener = TcpListener::bind(listen_addr).await?;
-    let local_addr = listener.local_addr()?;
-    info!(
-        port = local_addr.port(),
-        "strait listening (observation mode)"
-    );
-
-    // Print port to stderr for programmatic consumption
-    eprintln!("PORT={}", local_addr.port());
+    let listener = bind_proxy_listener(&config, &ctx).await?;
     eprintln!(
         "Observation mode: recording traffic for {}. Send requests through the proxy.",
         duration_str
@@ -559,14 +551,13 @@ mod tests {
     }
 
     #[test]
-    fn test_launch_subcommand_parses() {
-        let cli = Cli::try_parse_from(["strait", "launch", "node", "server.js"]).unwrap();
-        match cli.command {
-            Commands::Launch { command, .. } => {
-                assert_eq!(command, vec!["node", "server.js"]);
-            }
-            _ => panic!("expected Launch subcommand"),
-        }
+    fn test_launch_requires_mode_flag() {
+        // launch without --observe, --warn, or --policy must fail (ArgGroup "mode" is required)
+        let result = Cli::try_parse_from(["strait", "launch", "node", "server.js"]);
+        assert!(
+            result.is_err(),
+            "launch without a mode flag should be rejected"
+        );
     }
 
     #[test]

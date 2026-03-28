@@ -1,0 +1,35 @@
+# strait.toml — Claude Code sandbox configuration.
+#
+# MITM-intercepts Anthropic and GitHub API traffic for policy evaluation
+# and credential injection. The agent inside the container never sees
+# the real API keys.
+
+ca_cert_path = "/tmp/strait-ca.pem"
+
+[mitm]
+hosts = [
+    "api.anthropic.com",
+    "api.github.com",
+]
+
+# Anthropic API — inject x-api-key header
+[[credential]]
+host = "api.anthropic.com"
+header = "x-api-key"
+source = "env"
+env_var = "ANTHROPIC_API_KEY"
+
+# GitHub API — inject Authorization header
+[[credential]]
+host = "api.github.com"
+header = "Authorization"
+value_prefix = "token "
+source = "env"
+env_var = "GITHUB_TOKEN"
+
+[identity]
+header = "X-Strait-Agent"
+default = "claude-code"
+
+[audit]
+log_path = "/tmp/strait-audit.jsonl"

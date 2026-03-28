@@ -65,3 +65,4 @@ The `test` job is a required status check on `main` — PRs cannot merge until i
 - Launch integration tests require Docker
 - Test helpers use a `NoVerify` cert verifier for echo server connections only
 - Tracing via `tracing` crate, structured JSON to stderr
+- No AI slop signals in user-facing text (em dashes, flowery language). Keep prose direct and plain.

@@ -1,7 +1,7 @@
 class Strait < Formula
-  desc "HTTPS proxy with Cedar policy evaluation, credential injection, and audit logging"
+  desc "Policy platform for AI agents - Cedar policy over network, filesystem, and process access"
   homepage "https://github.com/ninthwave-sh/strait"
-  license "MIT"
+  license "Apache-2.0"
 
   # TODO: Update with actual release URL and SHA after first release
   # url "https://github.com/ninthwave-sh/strait/releases/download/v0.1.0/strait-#{arch}-apple-darwin.tar.gz"

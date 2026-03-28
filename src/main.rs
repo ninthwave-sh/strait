@@ -20,7 +20,7 @@ use strait::mitm::handle_connection;
 #[command(
     name = "strait",
     version,
-    about = "HTTPS proxy with Cedar policy evaluation, credential injection, and audit logging"
+    about = "Policy platform for AI agents - Cedar policy over network, filesystem, and process access"
 )]
 struct Cli {
     #[command(subcommand)]

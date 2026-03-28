@@ -8,7 +8,10 @@
 //! generation on every CONNECT request. Cache entries expire after 1 hour
 //! (well within the 24-hour CA lifetime).
 
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    KeyUsagePurpose,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -94,6 +97,7 @@ impl SessionCa {
             .push(rcgen::SanType::DnsName(hostname.try_into()?));
         params.not_before = OffsetDateTime::now_utc() - Duration::minutes(5);
         params.not_after = OffsetDateTime::now_utc() + Duration::hours(24);
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
 
         let ca_cert_params = CertificateParams::from_ca_cert_der(&self.ca_cert_der)?;
         let ca_cert_for_signing = ca_cert_params.self_signed(&self.ca_key_pair)?;
@@ -159,6 +163,24 @@ mod tests {
         assert_eq!(chain1[0].as_ref(), chain2[0].as_ref());
         assert_eq!(chain1[1].as_ref(), chain2[1].as_ref());
         assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn leaf_cert_includes_server_auth_eku() {
+        let ca = SessionCa::generate().unwrap();
+        let (chain, _key) = ca.issue_leaf_cert("api.github.com").unwrap();
+
+        // id-kp-serverAuth OID: 1.3.6.1.5.5.7.3.1
+        // DER-encoded OID value bytes (after tag+length): 2B 06 01 05 05 07 03 01
+        let server_auth_oid = [0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+        let leaf_der = chain[0].as_ref();
+        let found = leaf_der
+            .windows(server_auth_oid.len())
+            .any(|w| w == server_auth_oid);
+        assert!(
+            found,
+            "leaf certificate DER should contain id-kp-serverAuth OID"
+        );
     }
 
     #[test]

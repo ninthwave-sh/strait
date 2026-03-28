@@ -395,6 +395,7 @@ mod tests {
 
     fn make_event(event: EventKind) -> ObservationEvent {
         ObservationEvent {
+            version: 1,
             timestamp: "2026-03-27T14:32:01.000Z".to_string(),
             event,
         }

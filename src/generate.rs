@@ -452,6 +452,7 @@ mod tests {
 
     fn make_network_event(method: &str, host: &str, path: &str) -> ObservationEvent {
         ObservationEvent {
+            version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
             event: EventKind::NetworkRequest {
                 method: method.to_string(),
@@ -466,6 +467,7 @@ mod tests {
 
     fn make_fs_event(path: &str, operation: &str) -> ObservationEvent {
         ObservationEvent {
+            version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
             event: EventKind::FsAccess {
                 path: path.to_string(),
@@ -732,6 +734,7 @@ mod tests {
     fn container_events_are_skipped() {
         let events = vec![
             ObservationEvent {
+                version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
                 event: EventKind::ContainerStart {
                     container_id: "abc123".to_string(),
@@ -739,6 +742,7 @@ mod tests {
                 },
             },
             ObservationEvent {
+                version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
                 event: EventKind::ContainerStop {
                     container_id: "abc123".to_string(),
@@ -759,6 +763,7 @@ mod tests {
     fn proc_exec_produces_permit() {
         let dir = tempfile::tempdir().unwrap();
         let events = vec![ObservationEvent {
+            version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
             event: EventKind::ProcExec {
                 pid: 42,
@@ -868,6 +873,7 @@ mod tests {
         decision: &str,
     ) -> ObservationEvent {
         ObservationEvent {
+            version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
             event: EventKind::NetworkRequest {
                 method: method.to_string(),

@@ -3,7 +3,7 @@
 # Quick start (GitHub):
 #   1. Replace "our-org" in github.cedar with your GitHub org name.
 #   2. Export your token:  export GITHUB_TOKEN="ghp_..."
-#   3. Run:  strait --config examples/strait.toml
+#   3. Run:  strait proxy --config examples/strait.toml
 #   4. Trust the CA cert:  export SSL_CERT_FILE=/tmp/strait-ca.pem
 #   5. Proxy requests:     HTTPS_PROXY=http://127.0.0.1:8080 curl https://api.github.com/repos/our-org/repo
 #

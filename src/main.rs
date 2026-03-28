@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use strait::config;
+use strait::credentials::CredentialStore;
 use strait::generate;
 use strait::templates;
 use strait::watch;
@@ -171,6 +172,14 @@ TLS TRUST:
         #[arg(long, value_name = "POLICY_FILE")]
         policy: Option<PathBuf>,
 
+        /// Path to a strait.toml configuration file.
+        ///
+        /// When provided, the credential store and MITM host list from the config
+        /// are used by the launch proxy. This enables credential injection in
+        /// container mode -- the agent never sees the real API key.
+        #[arg(short, long, value_name = "FILE")]
+        config: Option<PathBuf>,
+
         /// Docker image to use for the container.
         #[arg(long, default_value = "alpine:latest")]
         image: String,
@@ -285,11 +294,33 @@ async fn main() -> anyhow::Result<()> {
             observe,
             warn,
             policy,
+            config,
             image,
             output,
             command,
         } => {
             init_tracing();
+
+            // Load credential store and MITM hosts from config if provided.
+            let (credential_store, mitm_hosts) = if let Some(ref config_path) = config {
+                let cfg = StraitConfig::load(config_path)?;
+                info!(path = %config_path.display(), "launch config loaded");
+
+                let cred_store = if cfg.credential.is_empty() {
+                    None
+                } else {
+                    let store = CredentialStore::from_entries(&cfg.credential)?;
+                    info!(
+                        count = cfg.credential.len(),
+                        "credentials loaded from config"
+                    );
+                    Some(Arc::new(store))
+                };
+
+                (cred_store, cfg.mitm.hosts.clone())
+            } else {
+                (None, Vec::new())
+            };
 
             // clap's ArgGroup "mode" guarantees exactly one of these is set.
             let exit_code = if let Some(policy_path) = policy {
@@ -300,6 +331,8 @@ async fn main() -> anyhow::Result<()> {
                     command,
                     Some(&image),
                     Some(output),
+                    credential_store,
+                    mitm_hosts,
                 )
                 .await?
             } else if let Some(warn_path) = warn {
@@ -310,12 +343,21 @@ async fn main() -> anyhow::Result<()> {
                     command,
                     Some(&image),
                     Some(output),
+                    credential_store,
+                    mitm_hosts,
                 )
                 .await?
             } else {
                 // Observe mode: allow all, record activity
                 debug_assert!(observe);
-                strait::launch::run_launch_observe(command, Some(&image), Some(output)).await?
+                strait::launch::run_launch_observe(
+                    command,
+                    Some(&image),
+                    Some(output),
+                    credential_store,
+                    mitm_hosts,
+                )
+                .await?
             };
             std::process::exit(exit_code);
         }
@@ -596,6 +638,7 @@ mod tests {
                 image,
                 output,
                 command,
+                ..
             } => {
                 assert!(observe);
                 assert!(warn.is_none());
@@ -796,5 +839,85 @@ mod tests {
             "hello",
         ]);
         assert!(result.is_err(), "--warn and --policy should conflict");
+    }
+
+    #[test]
+    fn test_launch_config_flag_with_observe() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--observe",
+            "--config",
+            "strait.toml",
+            "echo",
+            "ok",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Launch {
+                observe,
+                config,
+                command,
+                ..
+            } => {
+                assert!(observe);
+                assert_eq!(config.unwrap().to_str().unwrap(), "strait.toml");
+                assert_eq!(command, vec!["echo", "ok"]);
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_config_flag_with_policy() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--policy",
+            "policy.cedar",
+            "--config",
+            "strait.toml",
+            "echo",
+            "ok",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Launch { policy, config, .. } => {
+                assert_eq!(policy.unwrap().to_str().unwrap(), "policy.cedar");
+                assert_eq!(config.unwrap().to_str().unwrap(), "strait.toml");
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_config_short_flag() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--observe",
+            "-c",
+            "strait.toml",
+            "echo",
+            "ok",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Launch { config, .. } => {
+                assert_eq!(config.unwrap().to_str().unwrap(), "strait.toml");
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_without_config_flag() {
+        let cli = Cli::try_parse_from(["strait", "launch", "--observe", "echo", "ok"]).unwrap();
+        match cli.command {
+            Commands::Launch { config, .. } => {
+                assert!(config.is_none());
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
     }
 }

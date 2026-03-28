@@ -88,6 +88,8 @@ async fn launch_observe_echo_hello() {
         vec!["echo".to_string(), "hello".to_string()],
         Some("alpine:latest"),
         Some(obs_path.clone()),
+        None,
+        Vec::new(),
     )
     .await
     .expect("launch should succeed");
@@ -135,6 +137,8 @@ async fn launch_observe_contains_lifecycle_events() {
         vec!["echo".to_string(), "lifecycle".to_string()],
         Some("alpine:latest"),
         Some(obs_path.clone()),
+        None,
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -179,6 +183,8 @@ async fn launch_observe_bad_command_exit_code() {
         vec!["false".to_string()], // `false` exits with code 1
         Some("alpine:latest"),
         Some(obs_path.clone()),
+        None,
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -250,6 +256,8 @@ async fn launch_policy_invalid_file_fails_fast() {
         vec!["echo".to_string(), "hello".to_string()],
         Some("alpine:latest"),
         Some(obs_path.clone()),
+        None,
+        Vec::new(),
     )
     .await;
 
@@ -278,6 +286,8 @@ async fn launch_policy_missing_file_fails_fast() {
         vec!["echo".to_string(), "hello".to_string()],
         Some("alpine:latest"),
         Some(obs_path),
+        None,
+        Vec::new(),
     )
     .await;
 
@@ -331,6 +341,8 @@ permit(
         vec!["ls".to_string(), "/workspace".to_string()],
         Some("alpine:latest"),
         Some(obs_path.clone()),
+        None,
+        Vec::new(),
     )
     .await
     .unwrap();
@@ -385,6 +397,8 @@ permit(
         vec!["echo".to_string(), "warn-test".to_string()],
         Some("alpine:latest"),
         Some(obs_path.clone()),
+        None,
+        Vec::new(),
     )
     .await
     .unwrap();

@@ -53,6 +53,7 @@ use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
 use crate::config::ProxyContext;
 use crate::container::{ContainerManager, ContainerPermission, ContainerPolicy};
+use crate::credentials::CredentialStore;
 use crate::mitm::handle_connection;
 use crate::observe::{EventKind, ObservationStream};
 use crate::policy::{extract_fs_permissions, PolicyEngine};
@@ -94,6 +95,8 @@ pub async fn run_launch_observe(
     command: Vec<String>,
     image: Option<&str>,
     output: Option<PathBuf>,
+    credential_store: Option<Arc<CredentialStore>>,
+    mitm_hosts: Vec<String>,
 ) -> anyhow::Result<i32> {
     let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
@@ -138,6 +141,8 @@ pub async fn run_launch_observe(
         None, // no policy engine in observe mode
         obs_stream.clone(),
         false, // not warn_only
+        credential_store,
+        mitm_hosts,
     )?);
     let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx));
 
@@ -253,6 +258,8 @@ pub async fn run_launch_with_policy(
     command: Vec<String>,
     image: Option<&str>,
     output: Option<PathBuf>,
+    credential_store: Option<Arc<CredentialStore>>,
+    mitm_hosts: Vec<String>,
 ) -> anyhow::Result<i32> {
     let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
@@ -309,6 +316,8 @@ pub async fn run_launch_with_policy(
         Some(engine.clone()),
         obs_stream.clone(),
         mode == EnforcementMode::Warn,
+        credential_store,
+        mitm_hosts,
     )?);
     let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx));
 
@@ -489,16 +498,19 @@ async fn run_mitm_proxy_loop(listener: TcpListener, ctx: Arc<ProxyContext>) {
 
 /// Build a [`ProxyContext`] for launch modes.
 ///
-/// Creates a minimal proxy context suitable for container-based launch workflows:
-/// - `mitm_all = true`: MITM all connections (no allowlist needed)
+/// Creates a proxy context suitable for container-based launch workflows:
+/// - `mitm_all`: true when `mitm_hosts` is empty (MITM everything), false when
+///   a specific host list is provided from `--config`
 /// - Observation stream attached for recording traffic
-/// - No credentials configured (containers don't inject credentials)
-/// - No MITM host allowlist (everything is MITM'd)
-fn build_launch_proxy_context(
+/// - Optional credential store from `--config` for credential injection
+/// - Optional MITM host list from `--config`
+pub fn build_launch_proxy_context(
     session_ca: SessionCa,
     policy_engine: Option<PolicyEngine>,
     obs_stream: ObservationStream,
     warn_only: bool,
+    credential_store: Option<Arc<CredentialStore>>,
+    mitm_hosts: Vec<String>,
 ) -> anyhow::Result<ProxyContext> {
     let audit_logger = Arc::new(AuditLogger::new(None)?);
 
@@ -510,12 +522,16 @@ fn build_launch_proxy_context(
         "observe".to_string()
     };
 
+    // When mitm_hosts is empty, MITM all connections (original behavior).
+    // When mitm_hosts is provided from config, use the allowlist.
+    let mitm_all = mitm_hosts.is_empty();
+
     Ok(ProxyContext {
         session_ca,
         policy_engine: policy_engine.map(|e| ArcSwap::new(Arc::new(e))),
-        credential_store: None,
+        credential_store,
         audit_logger,
-        mitm_hosts: Vec::new(),
+        mitm_hosts,
         max_body_size: 10 * 1024 * 1024, // 10 MB default
         keepalive_timeout: std::time::Duration::from_secs(30),
         startup_instant: Instant::now(),
@@ -525,7 +541,7 @@ fn build_launch_proxy_context(
         policy_config: None,
         observation_stream: Some(obs_stream),
         enforcement_mode,
-        mitm_all: true,
+        mitm_all,
         warn_only,
         upstream_addr_override: None,
         upstream_tls_override: None,
@@ -833,8 +849,12 @@ mod tests {
         let obs_stream = ObservationStream::new();
 
         let ctx = build_launch_proxy_context(
-            session_ca, None, // observe mode — no policy
-            obs_stream, false,
+            session_ca,
+            None, // observe mode — no policy
+            obs_stream,
+            false,
+            None,
+            Vec::new(),
         )
         .unwrap();
 
@@ -880,6 +900,8 @@ permit(
             Some(engine),
             obs_stream,
             true, // warn mode
+            None,
+            Vec::new(),
         )
         .unwrap();
 
@@ -928,6 +950,8 @@ permit(
             Some(engine),
             obs_stream,
             false, // enforce mode
+            None,
+            Vec::new(),
         )
         .unwrap();
 
@@ -940,6 +964,93 @@ permit(
             ctx.enforcement_mode, "enforce",
             "policy + !warn_only → enforce mode"
         );
+    }
+
+    // -- Config-derived credential_store and mitm_hosts tests -----------------
+
+    /// Verify build_launch_proxy_context with a credential store produces a
+    /// ProxyContext where credential_store.is_some().
+    #[test]
+    fn proxy_context_with_credential_store() {
+        use crate::config::CredentialEntryConfig;
+
+        let session_ca = SessionCa::generate().unwrap();
+        let obs_stream = ObservationStream::new();
+
+        // Set a test env var for the credential resolver
+        std::env::set_var("STRAIT_TEST_TOKEN_LAUNCH", "test-secret");
+
+        let entries = vec![CredentialEntryConfig {
+            host: Some("api.github.com".to_string()),
+            host_pattern: None,
+            header: "Authorization".to_string(),
+            value_prefix: "Bearer ".to_string(),
+            source: "env".to_string(),
+            env_var: Some("STRAIT_TEST_TOKEN_LAUNCH".to_string()),
+            credential_type: "bearer".to_string(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
+        }];
+        let store = Arc::new(CredentialStore::from_entries(&entries).unwrap());
+
+        let ctx = build_launch_proxy_context(
+            session_ca,
+            None,
+            obs_stream,
+            false,
+            Some(store),
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(
+            ctx.credential_store.is_some(),
+            "credential_store should be present when provided from config"
+        );
+        assert!(ctx.mitm_all, "empty mitm_hosts should set mitm_all=true");
+    }
+
+    /// Verify build_launch_proxy_context with MITM hosts populates the hosts
+    /// list and sets mitm_all=false.
+    #[test]
+    fn proxy_context_with_mitm_hosts() {
+        let session_ca = SessionCa::generate().unwrap();
+        let obs_stream = ObservationStream::new();
+
+        let hosts = vec!["api.github.com".to_string(), "api.openai.com".to_string()];
+
+        let ctx =
+            build_launch_proxy_context(session_ca, None, obs_stream, false, None, hosts).unwrap();
+
+        assert_eq!(ctx.mitm_hosts.len(), 2);
+        assert!(ctx.mitm_hosts.contains(&"api.github.com".to_string()));
+        assert!(ctx.mitm_hosts.contains(&"api.openai.com".to_string()));
+        assert!(
+            !ctx.mitm_all,
+            "non-empty mitm_hosts should set mitm_all=false"
+        );
+    }
+
+    /// Verify build_launch_proxy_context without config preserves current
+    /// behavior: credential_store=None, mitm_all=true.
+    #[test]
+    fn proxy_context_without_config_preserves_defaults() {
+        let session_ca = SessionCa::generate().unwrap();
+        let obs_stream = ObservationStream::new();
+
+        let ctx = build_launch_proxy_context(session_ca, None, obs_stream, false, None, Vec::new())
+            .unwrap();
+
+        assert!(
+            ctx.credential_store.is_none(),
+            "no config should mean no credential_store"
+        );
+        assert!(
+            ctx.mitm_hosts.is_empty(),
+            "no config should mean empty mitm_hosts"
+        );
+        assert!(ctx.mitm_all, "no config should preserve mitm_all=true");
     }
 
     // -- MITM proxy integration tests -----------------------------------------
@@ -957,7 +1068,15 @@ permit(
         let proxy_addr = listener.local_addr().unwrap();
 
         let ctx = Arc::new(
-            build_launch_proxy_context(session_ca, None, obs_stream.clone(), false).unwrap(),
+            build_launch_proxy_context(
+                session_ca,
+                None,
+                obs_stream.clone(),
+                false,
+                None,
+                Vec::new(),
+            )
+            .unwrap(),
         );
 
         let proxy_handle = tokio::spawn(run_mitm_proxy_loop(listener, ctx));
@@ -1006,7 +1125,15 @@ permit(
         let proxy_addr = listener.local_addr().unwrap();
 
         let ctx = Arc::new(
-            build_launch_proxy_context(session_ca, None, obs_stream.clone(), false).unwrap(),
+            build_launch_proxy_context(
+                session_ca,
+                None,
+                obs_stream.clone(),
+                false,
+                None,
+                Vec::new(),
+            )
+            .unwrap(),
         );
 
         let proxy_handle = tokio::spawn(run_mitm_proxy_loop(listener, ctx));

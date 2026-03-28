@@ -31,10 +31,11 @@
 //! There are no `iptables` rules, network namespace restrictions, or DNS
 //! interception preventing direct connections in v0.3.
 //!
-//! **v0.4 hardening plan**: Network-level enforcement via Docker
-//! user-defined bridge with `--internal` (no default route) + explicit
-//! proxy route. This will ensure all outbound traffic must traverse the
-//! proxy, making enforcement non-bypassable.
+//! **v0.4 hardening plan**: Network-level enforcement via `--network=none`
+//! (zero network interfaces) + proxy access through a bind-mounted Unix
+//! socket. A small init wrapper inside the container bridges TCP to the
+//! socket, and `HTTPS_PROXY` points to the wrapper. This makes bypass
+//! impossible — there are no network interfaces to connect through.
 
 use anyhow::Context as _;
 use bollard::container::{

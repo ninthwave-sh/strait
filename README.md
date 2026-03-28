@@ -12,28 +12,28 @@ Strait unifies all three under Cedar. Observe what an agent actually does, auto-
 
 ```
   ┌──────────────────────────────────────────────────────┐
-  │           Container (Docker/Podman/OrbStack)          │
-  │                                                       │
-  │  ┌──────────────┐     ┌─────────────────────┐       │
-  │  │ AI Agent     │────▶│ Strait Proxy (MITM) │──▶ API│
+  │          Container (Docker/Podman/OrbStack)          │
+  │                                                      │
+  │  ┌──────────────┐     ┌──────────────────────┐       │
+  │  │ AI Agent     │────▶│ Strait Proxy (MITM)  │──▶ API│
   │  │ (your cmd)   │     │ Cedar eval + creds   │       │
-  │  │ [full TTY]   │     └─────────────────────┘       │
+  │  │ [full TTY]   │     └──────────────────────┘       │
   │  └──────────────┘                                    │
-  │                                                       │
+  │                                                      │
   │  Filesystem from Cedar policy:                       │
   │    fs:read  /project/src  → read-only mount          │
   │    fs:write /project/out  → read-write mount         │
   │    (no policy = not mounted = invisible)             │
-  └──────────────────────┬──────────────────────────────┘
+  └──────────────────────┬───────────────────────────────┘
                          │ observations
-  ┌──────────────────────▼──────────────────────────────┐
+  ┌──────────────────────▼───────────────────────────────┐
   │  Strait Host Process                                 │
   │   • Container lifecycle management                   │
   │   • Observation stream (Unix socket + JSONL)         │
   │   • strait watch — colored live event viewer         │
   │   • strait generate — Cedar policy from observations │
   │   • strait test --replay — policy verification       │
-  └─────────────────────────────────────────────────────┘
+  └──────────────────────────────────────────────────────┘
 ```
 
 Cedar policies control three domains:
@@ -186,7 +186,7 @@ strait watch                                       # live colored event stream
 
 ## Known limitations
 
-- **Network enforcement is cooperative** — the container routes traffic through the proxy via `HTTPS_PROXY`. A determined agent could bypass this. This is defense-in-depth, not a hard boundary.
+- **Network enforcement is currently cooperative** — the container routes traffic through the proxy via `HTTPS_PROXY`. A process that opens direct TCP connections can bypass the proxy. v0.4 will enforce network isolation via `--network=none` with proxy access through a bind-mounted Unix socket, making bypass impossible.
 - **Filesystem and process enforcement rely on container isolation** — standard container security model.
 
 ## Install
@@ -197,4 +197,4 @@ cargo install strait    # from source
 
 ## License
 
-MIT
+Apache-2.0

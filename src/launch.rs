@@ -222,6 +222,9 @@ pub async fn run_launch_observe(
     container_mgr.remove_container().await;
     proxy_handle.abort();
 
+    // Flush observation log before returning so callers can read the file.
+    obs_stream.flush();
+
     // Drop the terminal guard before printing final messages
     #[cfg(unix)]
     drop(_term_guard);
@@ -419,6 +422,9 @@ pub async fn run_launch_with_policy(
     // 12. Cleanup: remove container and stop proxy
     container_mgr.remove_container().await;
     proxy_handle.abort();
+
+    // Flush observation log before returning so callers can read the file.
+    obs_stream.flush();
 
     #[cfg(unix)]
     drop(_term_guard);

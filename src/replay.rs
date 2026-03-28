@@ -449,6 +449,7 @@ mod tests {
         decision: &str,
     ) -> ObservationEvent {
         ObservationEvent {
+            version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
             event: EventKind::NetworkRequest {
                 method: method.to_string(),
@@ -588,6 +589,7 @@ permit(
         let events = vec![
             make_network_event("GET", "api.github.com", "/repos", "allow"),
             ObservationEvent {
+                version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
                 event: EventKind::ContainerStart {
                     container_id: "abc123".to_string(),
@@ -595,6 +597,7 @@ permit(
                 },
             },
             ObservationEvent {
+                version: 1,
                 timestamp: "2026-03-27T00:00:01.000Z".to_string(),
                 event: EventKind::ContainerStop {
                     container_id: "abc123".to_string(),
@@ -750,6 +753,7 @@ permit(
         let dir = tempfile::tempdir().unwrap();
 
         let events = vec![ObservationEvent {
+            version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
             event: EventKind::FsAccess {
                 path: "/workspace/src/main.rs".to_string(),
@@ -779,6 +783,7 @@ permit(
         let dir = tempfile::tempdir().unwrap();
 
         let events = vec![ObservationEvent {
+            version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
             event: EventKind::ProcExec {
                 pid: 42,
@@ -808,6 +813,7 @@ permit(
         let dir = tempfile::tempdir().unwrap();
 
         let events = vec![ObservationEvent {
+            version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
             event: EventKind::Mount {
                 path: "/workspace".to_string(),
@@ -1008,6 +1014,7 @@ permit(
 
         let events = vec![
             ObservationEvent {
+                version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
                 event: EventKind::FsAccess {
                     path: "/workspace/secret/keys".to_string(),
@@ -1015,6 +1022,7 @@ permit(
                 },
             },
             ObservationEvent {
+                version: 1,
                 timestamp: "2026-03-27T00:00:01.000Z".to_string(),
                 event: EventKind::FsAccess {
                     path: "/workspace/src/main.rs".to_string(),
@@ -1054,6 +1062,7 @@ permit(
 
         let events = vec![
             ObservationEvent {
+                version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
                 event: EventKind::ProcExec {
                     pid: 1,
@@ -1061,6 +1070,7 @@ permit(
                 },
             },
             ObservationEvent {
+                version: 1,
                 timestamp: "2026-03-27T00:00:01.000Z".to_string(),
                 event: EventKind::ProcExec {
                     pid: 2,

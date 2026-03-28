@@ -5,8 +5,10 @@
 //! - `fs:write` policies map to read-write bind-mounts
 //! - `proc:exec` policies map to binaries available on the container PATH
 //!
-//! Network traffic routes through the host proxy via the `HTTPS_PROXY`
-//! environment variable pointing to `host.docker.internal:<port>`.
+//! Network traffic routes through the host proxy via `HTTPS_PROXY`,
+//! `HTTP_PROXY`, `https_proxy`, and `http_proxy` environment variables
+//! pointing to `host.docker.internal:<port>`. All four variants are set
+//! because different tools check different casings.
 
 use anyhow::Context as _;
 use bollard::container::{
@@ -54,6 +56,7 @@ pub struct ContainerConfig {
     /// Command to execute inside the container.
     pub cmd: Vec<String>,
     /// Environment variables to set (e.g. `"HTTPS_PROXY=http://host.docker.internal:8080"`).
+    /// All four proxy variants (HTTPS_PROXY, HTTP_PROXY, https_proxy, http_proxy) are set.
     pub env: Vec<String>,
     /// Bind-mount strings in Docker format: `"host_path:container_path:ro"` or `":rw"`.
     pub binds: Vec<String>,
@@ -290,10 +293,16 @@ impl ContainerManager {
             }
         }
 
-        // Build environment variables
-        let mut env = vec![format!(
-            "HTTPS_PROXY=http://host.docker.internal:{proxy_port}"
-        )];
+        // Build environment variables.
+        // Set all four proxy env var variants — different tools check different
+        // casings (e.g. curl checks http_proxy, Python checks HTTP_PROXY, etc.).
+        let proxy_url = format!("http://host.docker.internal:{proxy_port}");
+        let mut env = vec![
+            format!("HTTPS_PROXY={proxy_url}"),
+            format!("HTTP_PROXY={proxy_url}"),
+            format!("https_proxy={proxy_url}"),
+            format!("http_proxy={proxy_url}"),
+        ];
 
         // Add PATH with extra directories for proc:exec binaries
         if !extra_path_dirs.is_empty() {
@@ -705,35 +714,39 @@ mod tests {
     }
 
     #[test]
-    fn https_proxy_env_var_set_to_host() {
+    fn all_proxy_env_vars_set_to_host() {
         let policy = policy_with(vec![]);
         let config =
             ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
                 .unwrap();
 
-        assert!(
-            config
-                .env
-                .contains(&"HTTPS_PROXY=http://host.docker.internal:8080".to_string()),
-            "should have HTTPS_PROXY env var: {:?}",
-            config.env
-        );
+        let proxy_url = "http://host.docker.internal:8080";
+        for var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
+            let expected = format!("{var}={proxy_url}");
+            assert!(
+                config.env.contains(&expected),
+                "should have {var} env var: {:?}",
+                config.env
+            );
+        }
     }
 
     #[test]
-    fn https_proxy_uses_configured_port() {
+    fn all_proxy_vars_use_configured_port() {
         let policy = policy_with(vec![]);
         let config =
             ContainerManager::build_config(&policy, "node:20", &[], 9999, None, test_base_dir())
                 .unwrap();
 
-        assert!(
-            config
-                .env
-                .contains(&"HTTPS_PROXY=http://host.docker.internal:9999".to_string()),
-            "HTTPS_PROXY should use port 9999: {:?}",
-            config.env
-        );
+        let proxy_url = "http://host.docker.internal:9999";
+        for var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
+            let expected = format!("{var}={proxy_url}");
+            assert!(
+                config.env.contains(&expected),
+                "{var} should use port 9999: {:?}",
+                config.env
+            );
+        }
     }
 
     #[test]
@@ -818,10 +831,15 @@ mod tests {
             .binds
             .contains(&"/project/out:/project/out:rw".to_string()));
 
-        // Check HTTPS_PROXY
-        assert!(config
-            .env
-            .contains(&"HTTPS_PROXY=http://host.docker.internal:8080".to_string()));
+        // Check all proxy env vars
+        let proxy_url = "http://host.docker.internal:8080";
+        for var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
+            assert!(
+                config.env.contains(&format!("{var}={proxy_url}")),
+                "should have {var}: {:?}",
+                config.env
+            );
+        }
 
         // Check PATH includes git directories
         let path_env = config.env.iter().find(|e| e.starts_with("PATH="));
@@ -1074,13 +1092,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            config
-                .env
-                .contains(&"HTTPS_PROXY=http://host.docker.internal:8080".to_string()),
-            "HTTPS_PROXY should still be set with CA injection: {:?}",
-            config.env
-        );
+        let proxy_url = "http://host.docker.internal:8080";
+        for var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
+            assert!(
+                config.env.contains(&format!("{var}={proxy_url}")),
+                "{var} should still be set with CA injection: {:?}",
+                config.env
+            );
+        }
     }
 
     // -- Unit tests: bind-mount path validation (H-ER-3) ----------------------

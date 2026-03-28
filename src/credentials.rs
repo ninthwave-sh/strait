@@ -259,21 +259,42 @@ impl CredentialStore {
     /// Look up the credential for a given hostname.
     ///
     /// Returns the exact-match credential if one exists, otherwise falls back
-    /// to the first matching pattern entry.
+    /// to the first matching pattern entry. When multiple patterns match, a
+    /// trace-level log indicates which pattern won and which were skipped,
+    /// helping users diagnose first-match-wins ordering surprises.
     pub fn get(&self, host: &str) -> Option<&dyn Credential> {
         // Exact match takes priority
         if let Some(cred) = self.exact.get(host) {
             return Some(cred.as_ref());
         }
 
-        // Pattern match fallback
+        // Pattern match fallback — first match wins, but log when multiple match.
+        let mut winner: Option<(&str, &dyn Credential)> = None;
+        let mut additional_matches: Vec<&str> = Vec::new();
+
         for (pattern, cred) in &self.patterns {
             if host_matches_pattern(host, pattern) {
-                return Some(cred.as_ref());
+                if winner.is_none() {
+                    winner = Some((pattern.as_str(), cred.as_ref()));
+                } else {
+                    additional_matches.push(pattern.as_str());
+                }
             }
         }
 
-        None
+        if let Some((winning_pattern, cred)) = winner {
+            if !additional_matches.is_empty() {
+                tracing::trace!(
+                    host,
+                    selected_pattern = winning_pattern,
+                    also_matched = ?additional_matches,
+                    "multiple credential patterns match host; using first"
+                );
+            }
+            Some(cred)
+        } else {
+            None
+        }
     }
 }
 
@@ -295,16 +316,29 @@ fn entry_identifier(entry: &CredentialEntryConfig) -> &str {
 /// Supports:
 /// - `*.suffix` — matches any host ending in `.suffix` (but not `suffix` itself)
 /// - Exact string match as fallback for patterns without wildcards
+///
+/// AWS China partition: `*.amazonaws.com` also matches hosts ending in
+/// `.amazonaws.com.cn`, so a single credential entry covers all AWS partitions.
 fn host_matches_pattern(host: &str, pattern: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        // *.amazonaws.com matches s3.us-east-1.amazonaws.com
-        // but NOT bare "amazonaws.com"
-        host.ends_with(suffix)
-            && host.len() > suffix.len()
-            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+        if is_suffix_match(host, suffix) {
+            return true;
+        }
+        // AWS China partition: *.amazonaws.com also matches *.amazonaws.com.cn
+        if suffix == "amazonaws.com" && is_suffix_match(host, "amazonaws.com.cn") {
+            return true;
+        }
+        false
     } else {
         host == pattern
     }
+}
+
+/// Check whether `host` has `suffix` as a proper domain suffix (preceded by a dot).
+fn is_suffix_match(host: &str, suffix: &str) -> bool {
+    host.ends_with(suffix)
+        && host.len() > suffix.len()
+        && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
 }
 
 /// Resolve a single credential entry, reading the secret from its source.
@@ -1075,5 +1109,109 @@ mod tests {
     fn pattern_wildcard_does_not_match_embedded() {
         // "notamazonaws.com" ends with "amazonaws.com" but not ".amazonaws.com"
         assert!(!host_matches_pattern("notamazonaws.com", "*.amazonaws.com"));
+    }
+
+    // -----------------------------------------------------------------------
+    // AWS China partition pattern matching
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pattern_wildcard_matches_aws_china_endpoints() {
+        // *.amazonaws.com should also match *.amazonaws.com.cn (China partition)
+        assert!(host_matches_pattern(
+            "s3.cn-north-1.amazonaws.com.cn",
+            "*.amazonaws.com"
+        ));
+        assert!(host_matches_pattern(
+            "dynamodb.cn-north-1.amazonaws.com.cn",
+            "*.amazonaws.com"
+        ));
+        assert!(host_matches_pattern(
+            "iam.amazonaws.com.cn",
+            "*.amazonaws.com"
+        ));
+        assert!(host_matches_pattern(
+            "s3.dualstack.cn-north-1.amazonaws.com.cn",
+            "*.amazonaws.com"
+        ));
+    }
+
+    #[test]
+    fn pattern_wildcard_china_does_not_match_bare_suffix() {
+        assert!(!host_matches_pattern("amazonaws.com.cn", "*.amazonaws.com"));
+    }
+
+    #[test]
+    fn pattern_china_suffix_does_not_apply_to_non_aws_patterns() {
+        // Only *.amazonaws.com gets the .cn extension, not arbitrary patterns
+        assert!(!host_matches_pattern("foo.example.com.cn", "*.example.com"));
+    }
+
+    #[test]
+    fn credential_store_matches_china_via_aws_pattern() {
+        std::env::set_var("STRAIT_TEST_AWS_CN", "aws_china_secret");
+
+        let entries = vec![pattern_entry(
+            "*.amazonaws.com",
+            "Authorization",
+            "",
+            "env",
+            Some("STRAIT_TEST_AWS_CN"),
+        )];
+
+        let store = CredentialStore::from_entries(&entries).unwrap();
+
+        assert!(
+            store.get("s3.cn-north-1.amazonaws.com.cn").is_some(),
+            "S3 China regional should match *.amazonaws.com"
+        );
+        assert!(
+            store
+                .get("dynamodb.cn-northwest-1.amazonaws.com.cn")
+                .is_some(),
+            "DynamoDB China should match *.amazonaws.com"
+        );
+
+        std::env::remove_var("STRAIT_TEST_AWS_CN");
+    }
+
+    // -----------------------------------------------------------------------
+    // Multiple pattern match logging (structural test)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn first_pattern_wins_when_multiple_match() {
+        std::env::set_var("STRAIT_TEST_MULTI_1", "first_secret");
+        std::env::set_var("STRAIT_TEST_MULTI_2", "second_secret");
+
+        let entries = vec![
+            pattern_entry(
+                "*.amazonaws.com",
+                "Authorization",
+                "first:",
+                "env",
+                Some("STRAIT_TEST_MULTI_1"),
+            ),
+            pattern_entry(
+                "*.us-east-1.amazonaws.com",
+                "Authorization",
+                "second:",
+                "env",
+                Some("STRAIT_TEST_MULTI_2"),
+            ),
+        ];
+
+        let store = CredentialStore::from_entries(&entries).unwrap();
+
+        // s3.us-east-1.amazonaws.com matches both patterns — first wins
+        let cred = store.get("s3.us-east-1.amazonaws.com").unwrap();
+        let headers = cred.inject("GET", "/", &[], None).unwrap();
+        assert_eq!(
+            headers[0].1, "first:first_secret",
+            "first-match-wins: broader pattern declared first should win"
+        );
+
+        std::env::remove_var("STRAIT_TEST_MULTI_1");
+        std::env::remove_var("STRAIT_TEST_MULTI_2");
     }
 }

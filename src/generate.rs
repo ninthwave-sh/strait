@@ -11,10 +11,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use crate::observe::{EventKind, ObservationEvent};
+use crate::observe::{read_observations, EventKind, ObservationEvent};
 use crate::policy::escape_cedar_string;
 
 // ---------------------------------------------------------------------------
@@ -74,32 +73,6 @@ pub fn generate(input: &Path, output: &Path, schema_output: &Path) -> anyhow::Re
     }
 
     Ok(wildcard_count)
-}
-
-// ---------------------------------------------------------------------------
-// Observation reading
-// ---------------------------------------------------------------------------
-
-fn read_observations(path: &Path) -> anyhow::Result<Vec<ObservationEvent>> {
-    let file = std::fs::File::open(path).map_err(|e| {
-        anyhow::anyhow!("failed to open observation file '{}': {e}", path.display())
-    })?;
-    let reader = BufReader::new(file);
-    let mut events = Vec::new();
-
-    for (line_num, line) in reader.lines().enumerate() {
-        let line =
-            line.map_err(|e| anyhow::anyhow!("failed to read line {}: {e}", line_num + 1))?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let event: ObservationEvent = serde_json::from_str(trimmed)
-            .map_err(|e| anyhow::anyhow!("invalid JSON on line {}: {e}", line_num + 1))?;
-        events.push(event);
-    }
-
-    Ok(events)
 }
 
 // ---------------------------------------------------------------------------

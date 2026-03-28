@@ -15,6 +15,36 @@ fi
 section "Proxy Mode — GitHub API"
 
 # Write a test config
+# Write a test-specific policy (broader than examples/github.cedar so we can
+# test both allowed and denied paths against real endpoints)
+cat > "$TMPDIR_BASE/policy.cedar" <<'CEDAR'
+// Allow all GET requests to api.github.com
+@id("allow-reads")
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource in Resource::"api.github.com"
+);
+
+// Deny repo deletion
+@id("deny-repo-delete")
+@reason("Repository deletion is too destructive")
+forbid(
+    principal,
+    action == Action::"http:DELETE",
+    resource in Resource::"api.github.com/repos"
+);
+
+// Deny admin settings
+@id("deny-settings")
+@reason("Admin settings must be changed through the GitHub UI")
+forbid(
+    principal,
+    action == Action::"http:PATCH",
+    resource in Resource::"api.github.com"
+) when { context.path like "*/settings" };
+CEDAR
+
 cat > "$TMPDIR_BASE/strait.toml" <<EOF
 ca_cert_path = "$TMPDIR_BASE/ca.pem"
 
@@ -26,8 +56,7 @@ port = 0
 hosts = ["api.github.com"]
 
 [policy]
-file = "$REPO_ROOT/examples/github.cedar"
-schema = "$REPO_ROOT/examples/github.cedarschema"
+file = "$TMPDIR_BASE/policy.cedar"
 
 [[credential]]
 host = "api.github.com"
@@ -73,14 +102,14 @@ check_file_exists "CA cert written" "$TMPDIR_BASE/ca.pem"
 
 section "Allowed Requests"
 
-# GET /user — should be allowed (matches read-org-repos via resource hierarchy)
+# GET /user — should be allowed (policy permits all GET on api.github.com)
 RESPONSE=$(curl -s -o /dev/null -w '%{http_code}' \
     --proxy "http://127.0.0.1:$PROXY_PORT" \
     --cacert "$TMPDIR_BASE/ca.pem" \
     "https://api.github.com/user" 2>/dev/null) || true
 check_contains "GET /user returns 200" "$RESPONSE" "200"
 
-# GET /repos — should work
+# GET /user/repos — should work
 REPOS_RESPONSE=$(curl -s \
     --proxy "http://127.0.0.1:$PROXY_PORT" \
     --cacert "$TMPDIR_BASE/ca.pem" \

@@ -11,7 +11,7 @@
 #   - Docker (for container tests — 04, 05, 06)
 #   - GITHUB_TOKEN (for GitHub API tests — 03, 04, 08, 09)
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -85,9 +85,7 @@ echo -e "  docker:       $(command -v docker >/dev/null && docker info >/dev/nul
 echo -e "  GITHUB_TOKEN: $(test -n "${GITHUB_TOKEN:-}" && echo -e "${GREEN}set${RESET}" || echo -e "${YELLOW}not set${RESET}")"
 echo ""
 
-TOTAL_PASS=0
-TOTAL_FAIL=0
-TOTAL_SKIP=0
+FAIL_TOTAL=0
 RESULTS=()
 
 for test_name in "${ALL_TESTS[@]}"; do
@@ -111,6 +109,7 @@ for test_name in "${ALL_TESTS[@]}"; do
         RESULTS+=("${GREEN}PASS${RESET}  $test_name")
     else
         RESULTS+=("${RED}FAIL${RESET}  $test_name")
+        FAIL_TOTAL=$((FAIL_TOTAL + 1))
     fi
 done
 
@@ -125,3 +124,4 @@ for result in "${RESULTS[@]}"; do
 done
 
 echo ""
+exit "$FAIL_TOTAL"

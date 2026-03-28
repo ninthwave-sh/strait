@@ -16,8 +16,7 @@ if ! command -v docker &>/dev/null || ! docker info &>/dev/null 2>&1; then
 fi
 
 cleanup() {
-    jobs -p 2>/dev/null | xargs -r kill 2>/dev/null || true
-    docker rm -f strait-watch-test 2>/dev/null || true
+    kill_jobs
     cleanup_tmpdir
 }
 trap cleanup EXIT

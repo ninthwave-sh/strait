@@ -26,9 +26,7 @@ if [[ -z "${GITHUB_TOKEN:-}" ]]; then
 fi
 
 cleanup() {
-    # Kill any background strait processes
-    jobs -p 2>/dev/null | xargs -r kill 2>/dev/null || true
-    # Remove any leftover containers
+    kill_jobs
     docker rm -f strait-manual-test 2>/dev/null || true
     cleanup_tmpdir
 }
@@ -61,8 +59,8 @@ OBS_LINES=$(wc -l < "$TMPDIR_BASE/observations.jsonl" | tr -d ' ')
 check "observations.jsonl has events" test "$OBS_LINES" -gt 0
 
 OBS_CONTENT=$(cat "$TMPDIR_BASE/observations.jsonl")
-check_contains "observations contain network events" "$OBS_CONTENT" "api.github.com\|network\|http"
-check_contains "observations contain container events" "$OBS_CONTENT" "container\|Container\|start\|Start"
+check_contains "observations contain network events" "$OBS_CONTENT" "api.github.com|network|http"
+check_contains "observations contain container events" "$OBS_CONTENT" "container|Container|start|Start"
 
 echo ""
 echo -e "  ${CYAN}▶ Human review — observation sample:${RESET}"
@@ -112,9 +110,9 @@ echo -e "${RESET}"
 # ─────────────────────────────────────────────────────────────
 section "Phase 3: Replay Test"
 
+REPLAY_EXIT=0
 REPLAY_OUTPUT=$("$STRAIT" test --replay "$TMPDIR_BASE/observations.jsonl" \
-    --policy "$TMPDIR_BASE/generated.cedar" 2>&1) || true
-REPLAY_EXIT=$?
+    --policy "$TMPDIR_BASE/generated.cedar" 2>&1) || REPLAY_EXIT=$?
 
 # Generated policy should cover all observed actions
 check "replay passes (generated policy covers observations)" test "$REPLAY_EXIT" -eq 0
@@ -148,7 +146,7 @@ echo -e "  ${DIM}launching container in warn mode with generated policy...${RESE
     " > "$TMPDIR_BASE/warn-stdout.log" 2> "$TMPDIR_BASE/warn-stderr.log" || true
 
 WARN_CONTENT=$(cat "$TMPDIR_BASE/warn-stderr.log" "$TMPDIR_BASE/warn-observations.jsonl" 2>/dev/null)
-check_contains "warn mode logs warnings for novel requests" "$WARN_CONTENT" "warn\|Warn\|WARN\|violation\|denied"
+check_contains "warn mode logs warnings for novel requests" "$WARN_CONTENT" "warn|Warn|WARN|violation|denied"
 
 echo ""
 echo -e "  ${CYAN}▶ Human review — did the novel request (rate_limit) trigger a warning but still succeed?${RESET}"
@@ -182,7 +180,7 @@ echo -e "  ${DIM}launching container in enforce mode with generated policy...${R
     " > "$TMPDIR_BASE/enforce-stdout.log" 2> "$TMPDIR_BASE/enforce-stderr.log" || true
 
 ENFORCE_OUT=$(cat "$TMPDIR_BASE/enforce-stdout.log")
-check_contains "known request allowed in enforce mode" "$ENFORCE_OUT" "200\|zen"
+check_contains "known request allowed in enforce mode" "$ENFORCE_OUT" "200|zen"
 check_contains "novel request denied in enforce mode (403)" "$ENFORCE_OUT" "403"
 
 echo ""

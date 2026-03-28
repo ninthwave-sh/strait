@@ -14,8 +14,7 @@ if ! command -v docker &>/dev/null || ! docker info &>/dev/null 2>&1; then
 fi
 
 cleanup() {
-    jobs -p 2>/dev/null | xargs -r kill 2>/dev/null || true
-    docker rm -f strait-lifecycle-test 2>/dev/null || true
+    kill_jobs
     cleanup_tmpdir
 }
 trap cleanup EXIT
@@ -32,12 +31,12 @@ EXIT_0=$?
 check "exit code 0 propagated" test "$EXIT_0" -eq 0
 
 # Non-zero exit
+EXIT_42=0
 "$STRAIT" launch --observe \
     --image alpine:latest \
     --output "$TMPDIR_BASE/exit1.jsonl" \
     -- sh -c "exit 42" \
-    > /dev/null 2> /dev/null || true
-EXIT_42=$?
+    > /dev/null 2> /dev/null || EXIT_42=$?
 check "non-zero exit code propagated" test "$EXIT_42" -ne 0
 
 section "Container Cleanup"
@@ -70,9 +69,18 @@ sleep 5
 kill -TERM "$LAUNCH_PID" 2>/dev/null || true
 
 # Wait for clean shutdown (should not hang)
-TIMEOUT_EXIT=0
-timeout 15 bash -c "wait $LAUNCH_PID 2>/dev/null" || TIMEOUT_EXIT=$?
-check "SIGTERM causes clean shutdown within 15s" test "$TIMEOUT_EXIT" -ne 124
+# Poll with kill -0 since `wait` only works for children of current shell
+SHUTDOWN_OK=true
+for i in $(seq 1 30); do
+    if ! kill -0 "$LAUNCH_PID" 2>/dev/null; then
+        break
+    fi
+    if [[ $i -eq 30 ]]; then
+        SHUTDOWN_OK=false
+    fi
+    sleep 0.5
+done
+check "SIGTERM causes clean shutdown within 15s" $SHUTDOWN_OK
 
 # Verify no orphaned container
 sleep 1

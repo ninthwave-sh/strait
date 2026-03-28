@@ -25,12 +25,12 @@ check_file_exists "container-sandbox .cedar created" "$TMPDIR_BASE/container-san
 section "Explain"
 
 EXPLAIN=$("$STRAIT" explain "$REPO_ROOT/examples/github.cedar" 2>&1)
-check_contains "explain shows permit policies" "$EXPLAIN" "permit\|PERMIT\|allow\|ALLOW\|read"
-check_contains "explain shows forbid policies" "$EXPLAIN" "forbid\|FORBID\|deny\|DENY"
-check_contains "explain mentions github" "$EXPLAIN" "github\|GitHub"
+check_contains "explain shows permit policies" "$EXPLAIN" "permit|PERMIT|allow|ALLOW"
+check_contains "explain shows forbid policies" "$EXPLAIN" "forbid|FORBID|deny|DENY"
+check_contains "explain mentions github" "$EXPLAIN" "github|GitHub"
 
 EXPLAIN_AWS=$("$STRAIT" explain "$REPO_ROOT/examples/aws.cedar" 2>&1)
-check_contains "explain handles AWS policy" "$EXPLAIN_AWS" "aws\|AWS\|s3\|S3\|lambda\|Lambda"
+check_contains "explain handles AWS policy" "$EXPLAIN_AWS" "aws|AWS|s3|S3|lambda|Lambda"
 
 echo ""
 echo -e "  ${CYAN}▶ Human review — does this read well?${RESET}"
@@ -41,13 +41,13 @@ echo -e "${RESET}"
 section "Diff"
 
 # Diff identical policies — should show no changes
-DIFF_SAME=$("$STRAIT" diff "$REPO_ROOT/examples/github.cedar" "$REPO_ROOT/examples/github.cedar" 2>&1)
-DIFF_SAME_EXIT=$?
+DIFF_SAME_EXIT=0
+DIFF_SAME=$("$STRAIT" diff "$REPO_ROOT/examples/github.cedar" "$REPO_ROOT/examples/github.cedar" 2>&1) || DIFF_SAME_EXIT=$?
 check "diff identical policies exits 0" test "$DIFF_SAME_EXIT" -eq 0
 
 # Diff different policies — should show changes
 DIFF_DIFF=$("$STRAIT" diff "$REPO_ROOT/examples/github.cedar" "$REPO_ROOT/examples/aws.cedar" 2>&1) || true
-check_contains "diff different policies shows differences" "$DIFF_DIFF" "added\|removed\|Added\|Removed\|changed\|Changed\|+"
+check_contains "diff different policies shows differences" "$DIFF_DIFF" "added|removed|Added|Removed|changed|Changed"
 
 # Create a modified policy for meaningful diff
 cat > "$TMPDIR_BASE/modified.cedar" <<'CEDAR'
@@ -67,8 +67,8 @@ permit(
 CEDAR
 
 DIFF_MOD=$("$STRAIT" diff "$REPO_ROOT/examples/github.cedar" "$TMPDIR_BASE/modified.cedar" 2>&1) || true
-check_contains "diff detects added permission" "$DIFF_MOD" "issues\|added\|Added\|+"
-check_contains "diff detects removed permission" "$DIFF_MOD" "pulls\|removed\|Removed\|-"
+check_contains "diff detects added permission" "$DIFF_MOD" "issues|added|Added"
+check_contains "diff detects removed permission" "$DIFF_MOD" "pulls|removed|Removed"
 
 echo ""
 echo -e "  ${CYAN}▶ Human review — does the diff output make sense?${RESET}"

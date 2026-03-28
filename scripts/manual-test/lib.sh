@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Shared helpers for manual test scripts.
 
-set -euo pipefail
+set -uo pipefail
+# NOTE: set -e is intentionally NOT used. Check functions track pass/fail
+# via counters so all tests run even when some fail. Scripts call summary()
+# at the end to report results and return the correct exit code.
 
 # Colors
 RED='\033[0;31m'
@@ -43,15 +46,14 @@ check() {
     if output=$("$@" 2>&1); then
         echo -e "${GREEN}PASS${RESET}"
         PASS_COUNT=$((PASS_COUNT + 1))
-        return 0
     else
         echo -e "${RED}FAIL${RESET}"
         if [[ -n "$output" ]]; then
-            echo -e "    ${DIM}$output${RESET}" | head -5
+            printf '    %s\n' "$output" | head -5
         fi
         FAIL_COUNT=$((FAIL_COUNT + 1))
-        return 1
     fi
+    return 0
 }
 
 check_contains() {
@@ -59,16 +61,15 @@ check_contains() {
     local haystack="$2"
     local needle="$3"
     echo -n -e "  ${DIM}testing:${RESET} $description ... "
-    if echo "$haystack" | grep -q "$needle"; then
+    if echo "$haystack" | grep -qE "$needle"; then
         echo -e "${GREEN}PASS${RESET}"
         PASS_COUNT=$((PASS_COUNT + 1))
-        return 0
     else
         echo -e "${RED}FAIL${RESET}"
         echo -e "    ${DIM}expected to find: $needle${RESET}"
         FAIL_COUNT=$((FAIL_COUNT + 1))
-        return 1
     fi
+    return 0
 }
 
 check_not_contains() {
@@ -76,16 +77,15 @@ check_not_contains() {
     local haystack="$2"
     local needle="$3"
     echo -n -e "  ${DIM}testing:${RESET} $description ... "
-    if echo "$haystack" | grep -q "$needle"; then
+    if echo "$haystack" | grep -qE "$needle"; then
         echo -e "${RED}FAIL${RESET}"
         echo -e "    ${DIM}should NOT contain: $needle${RESET}"
         FAIL_COUNT=$((FAIL_COUNT + 1))
-        return 1
     else
         echo -e "${GREEN}PASS${RESET}"
         PASS_COUNT=$((PASS_COUNT + 1))
-        return 0
     fi
+    return 0
 }
 
 check_file_exists() {
@@ -95,13 +95,12 @@ check_file_exists() {
     if [[ -f "$path" ]]; then
         echo -e "${GREEN}PASS${RESET}"
         PASS_COUNT=$((PASS_COUNT + 1))
-        return 0
     else
         echo -e "${RED}FAIL${RESET}"
         echo -e "    ${DIM}file not found: $path${RESET}"
         FAIL_COUNT=$((FAIL_COUNT + 1))
-        return 1
     fi
+    return 0
 }
 
 skip() {
@@ -152,12 +151,27 @@ kill_bg() {
     fi
 }
 
+# Kill background jobs portably (macOS-compatible, no xargs -r)
+kill_jobs() {
+    local pids
+    pids=$(jobs -p 2>/dev/null) || true
+    if [[ -n "$pids" ]]; then
+        echo "$pids" | while read -r pid; do
+            kill "$pid" 2>/dev/null || true
+        done
+    fi
+}
+
 summary() {
     echo ""
     echo -e "${BOLD}━━━ Results ━━━${RESET}"
     echo -e "  ${GREEN}Passed: $PASS_COUNT${RESET}"
-    [[ $FAIL_COUNT -gt 0 ]] && echo -e "  ${RED}Failed: $FAIL_COUNT${RESET}"
-    [[ $SKIP_COUNT -gt 0 ]] && echo -e "  ${YELLOW}Skipped: $SKIP_COUNT${RESET}"
+    if [[ $FAIL_COUNT -gt 0 ]]; then
+        echo -e "  ${RED}Failed: $FAIL_COUNT${RESET}"
+    fi
+    if [[ $SKIP_COUNT -gt 0 ]]; then
+        echo -e "  ${YELLOW}Skipped: $SKIP_COUNT${RESET}"
+    fi
     echo ""
     if [[ $FAIL_COUNT -gt 0 ]]; then
         return 1

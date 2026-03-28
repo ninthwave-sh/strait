@@ -230,12 +230,38 @@ pub fn format_event(event: &ObservationEvent, max_width: usize) -> String {
 // Socket discovery
 // ---------------------------------------------------------------------------
 
-/// Discover an active observation socket in `/tmp`.
+/// Discover an active observation socket.
 ///
-/// Globs `/tmp/strait-*.sock` and returns the newest match by
-/// modification time.
+/// Searches the same directories as `resolve_socket_dir` in `observe.rs`:
+/// 1. `/tmp`
+/// 2. `XDG_RUNTIME_DIR` (if set)
+///
+/// Returns the newest `strait-*.sock` match by modification time across
+/// all candidate directories.
 pub fn discover_socket() -> Option<PathBuf> {
-    discover_socket_in(Path::new("/tmp"))
+    let mut candidates = vec![PathBuf::from("/tmp")];
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        candidates.push(PathBuf::from(xdg));
+    }
+    discover_socket_in_dirs(&candidates)
+}
+
+/// Discover the newest observation socket across multiple directories.
+fn discover_socket_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    for dir in dirs {
+        if let Some(found) = discover_socket_in(dir) {
+            let mtime = std::fs::metadata(&found)
+                .ok()
+                .and_then(|m| m.modified().ok());
+            if let Some(mtime) = mtime {
+                if best.as_ref().is_none_or(|(_, prev)| mtime > *prev) {
+                    best = Some((found, mtime));
+                }
+            }
+        }
+    }
+    best.map(|(path, _)| path)
 }
 
 /// Discover an observation socket in the given directory (testable).
@@ -781,6 +807,50 @@ mod tests {
     #[test]
     fn discover_socket_nonexistent_dir_returns_none() {
         assert!(discover_socket_in(Path::new("/nonexistent-dir-xyz")).is_none());
+    }
+
+    // -- Multi-directory socket discovery tests --------------------------------
+
+    #[test]
+    fn discover_socket_in_dirs_finds_socket_in_second_dir() {
+        // Simulates discovering a socket in XDG_RUNTIME_DIR when /tmp has none.
+        let dir1 = tempfile::tempdir().unwrap(); // empty (like /tmp with no sockets)
+        let dir2 = tempfile::tempdir().unwrap(); // has a socket (like XDG_RUNTIME_DIR)
+
+        let sock = dir2.path().join("strait-999.sock");
+        std::fs::write(&sock, "").unwrap();
+
+        let dirs = vec![dir1.path().to_path_buf(), dir2.path().to_path_buf()];
+        let found = discover_socket_in_dirs(&dirs);
+        assert_eq!(found, Some(sock));
+    }
+
+    #[test]
+    fn discover_socket_in_dirs_prefers_newest_across_dirs() {
+        // Socket in dir1 is older, socket in dir2 is newer.
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+
+        let old_sock = dir1.path().join("strait-100.sock");
+        std::fs::write(&old_sock, "").unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let new_sock = dir2.path().join("strait-200.sock");
+        std::fs::write(&new_sock, "").unwrap();
+
+        let dirs = vec![dir1.path().to_path_buf(), dir2.path().to_path_buf()];
+        let found = discover_socket_in_dirs(&dirs);
+        assert_eq!(found, Some(new_sock));
+    }
+
+    #[test]
+    fn discover_socket_in_dirs_empty_returns_none() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+
+        let dirs = vec![dir1.path().to_path_buf(), dir2.path().to_path_buf()];
+        assert!(discover_socket_in_dirs(&dirs).is_none());
     }
 
     // -- Socket connection integration tests ----------------------------------

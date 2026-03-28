@@ -439,6 +439,14 @@ fn build_launch_proxy_context(
 ) -> anyhow::Result<ProxyContext> {
     let audit_logger = Arc::new(AuditLogger::new(None)?);
 
+    let enforcement_mode = if policy_engine.is_some() && !warn_only {
+        "enforce".to_string()
+    } else if policy_engine.is_some() {
+        "warn".to_string()
+    } else {
+        "observe".to_string()
+    };
+
     Ok(ProxyContext {
         session_ca,
         policy_engine: policy_engine.map(|e| ArcSwap::new(Arc::new(e))),
@@ -453,6 +461,7 @@ fn build_launch_proxy_context(
         git_policy: None,
         policy_config: None,
         observation_stream: Some(obs_stream),
+        enforcement_mode,
         mitm_all: true,
         warn_only,
         upstream_addr_override: None,
@@ -672,6 +681,7 @@ mod tests {
         );
         assert!(ctx.mitm_all, "launch modes must MITM all connections");
         assert!(!ctx.warn_only, "observe mode should not be warn_only");
+        assert_eq!(ctx.enforcement_mode, "observe", "no policy → observe mode");
     }
 
     /// Verify warn-mode proxy context has policy engine and warn_only=true.
@@ -716,6 +726,10 @@ permit(
         );
         assert!(ctx.mitm_all, "launch modes must MITM all connections");
         assert!(ctx.warn_only, "warn mode should set warn_only=true");
+        assert_eq!(
+            ctx.enforcement_mode, "warn",
+            "policy + warn_only → warn mode"
+        );
     }
 
     /// Verify enforce-mode proxy context has policy engine and warn_only=false.
@@ -755,6 +769,10 @@ permit(
             "enforce mode should have a policy engine"
         );
         assert!(!ctx.warn_only, "enforce mode should not set warn_only");
+        assert_eq!(
+            ctx.enforcement_mode, "enforce",
+            "policy + !warn_only → enforce mode"
+        );
     }
 
     // -- MITM proxy integration tests -----------------------------------------
@@ -840,5 +858,107 @@ permit(
         assert!(rx.try_recv().is_err(), "should not emit event for GET");
 
         proxy_handle.abort();
+    }
+
+    /// Verify passthrough connections emit observation events with host/port
+    /// and decision="passthrough".
+    #[tokio::test]
+    async fn passthrough_connection_emits_observation_event() {
+        use tokio::io::AsyncReadExt;
+
+        // Start a fake upstream server so the passthrough connection succeeds.
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        // Accept and immediately close connections in the background.
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = upstream_listener.accept().await {
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let obs_stream = ObservationStream::new();
+        let mut rx = obs_stream.subscribe();
+
+        let session_ca = SessionCa::generate().unwrap();
+        let audit_logger = Arc::new(AuditLogger::new(None).unwrap());
+
+        // Build a ProxyContext with mitm_all=false, no policy, and no
+        // MITM hosts. This forces the passthrough path for all CONNECT
+        // requests.
+        let ctx = Arc::new(ProxyContext {
+            session_ca,
+            policy_engine: None,
+            credential_store: None,
+            audit_logger,
+            mitm_hosts: Vec::new(),
+            max_body_size: 10 * 1024 * 1024,
+            keepalive_timeout: std::time::Duration::from_secs(5),
+            startup_instant: Instant::now(),
+            identity_header: "X-Strait-Agent".to_string(),
+            identity_default: "anonymous".to_string(),
+            git_policy: None,
+            policy_config: None,
+            observation_stream: Some(obs_stream.clone()),
+            enforcement_mode: "observe".to_string(),
+            mitm_all: false,
+            warn_only: false,
+            upstream_addr_override: None,
+            upstream_tls_override: None,
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        let proxy_ctx = ctx.clone();
+        let proxy_handle = tokio::spawn(async move {
+            if let Ok((client, peer)) = proxy_listener.accept().await {
+                let _ = handle_connection(client, peer, &proxy_ctx).await;
+            }
+        });
+
+        // Send a CONNECT request targeting the fake upstream.
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let connect_req = format!(
+            "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            upstream_addr.port()
+        );
+        client.write_all(connect_req.as_bytes()).await.unwrap();
+
+        // Read the 200 Connection Established response.
+        let mut buf = vec![0u8; 1024];
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let n = client.read(&mut buf).await.unwrap_or(0);
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("200"),
+            "should get 200 Connection Established, got: {response}"
+        );
+
+        drop(client);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        proxy_handle.abort();
+
+        // Check for the passthrough observation event.
+        let event = rx
+            .try_recv()
+            .expect("should have received an observation event");
+        match &event.event {
+            EventKind::NetworkRequest {
+                method,
+                host,
+                path,
+                decision,
+                enforcement_mode,
+                ..
+            } => {
+                assert_eq!(method, "CONNECT");
+                assert_eq!(host, "127.0.0.1");
+                assert!(path.is_empty(), "passthrough should have empty path");
+                assert_eq!(decision, "passthrough");
+                assert_eq!(enforcement_mode, "observe");
+            }
+            other => panic!("expected NetworkRequest, got {other:?}"),
+        }
     }
 }

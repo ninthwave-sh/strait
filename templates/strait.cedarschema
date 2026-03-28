@@ -1,0 +1,55 @@
+// VALIDATED: 2026-03-28 strait template infrastructure
+// strait.cedarschema — Unified Cedar schema for all strait policy domains.
+//
+// This schema covers HTTP proxy, AWS, filesystem, and process actions in a
+// single file. Use it when your policy combines rules from multiple domains
+// (e.g. GitHub + AWS, or HTTP + filesystem for container sandboxes).
+//
+// Entity model:
+//   Agent    — the calling process (e.g. Agent::"worker", Agent::"ci-bot")
+//   Resource — hierarchical resource identifier:
+//     HTTP:  Resource::"api.github.com/repos/org/repo"
+//     FS:    Resource::"fs::/project/src"
+//     Proc:  Resource::"proc::git"
+//
+// Context attributes:
+//   host, path, method        — always present for HTTP requests
+//   aws_service?, aws_region? — present only for AWS endpoints (*.amazonaws.com)
+//   operation?                — present for filesystem actions (read, write, etc.)
+
+entity Agent;
+
+entity Resource in [Resource];
+
+// HTTP actions — used for proxy policy evaluation
+action "http:GET", "http:POST", "http:PUT", "http:PATCH", "http:DELETE", "http:HEAD", "http:OPTIONS"
+    appliesTo {
+        principal: Agent,
+        resource: Resource,
+        context: {
+            "host": String,
+            "path": String,
+            "method": String,
+            "aws_service"?: String,
+            "aws_region"?: String,
+        },
+    };
+
+// Filesystem actions — used for container sandbox policy evaluation
+action "fs:read", "fs:write", "fs:create", "fs:delete"
+    appliesTo {
+        principal: Agent,
+        resource: Resource,
+        context: {
+            "path": String,
+            "operation": String,
+        },
+    };
+
+// Process actions — used for container sandbox policy evaluation
+action "proc:exec", "proc:fork", "proc:signal"
+    appliesTo {
+        principal: Agent,
+        resource: Resource,
+        context: {},
+    };

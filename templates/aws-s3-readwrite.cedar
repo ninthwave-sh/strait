@@ -20,7 +20,7 @@ permit(
     principal,
     action == Action::"http:GET",
     resource
-) when { context.aws_service == "s3" };
+) when { context has aws_service && context.aws_service == "s3" };
 
 // Head requests for object/bucket metadata.
 @id("s3-head")
@@ -28,7 +28,7 @@ permit(
     principal,
     action == Action::"http:HEAD",
     resource
-) when { context.aws_service == "s3" };
+) when { context has aws_service && context.aws_service == "s3" };
 
 // Write objects and create buckets.
 @id("s3-write")
@@ -36,7 +36,7 @@ permit(
     principal,
     action == Action::"http:PUT",
     resource
-) when { context.aws_service == "s3" };
+) when { context has aws_service && context.aws_service == "s3" };
 
 // Multipart upload and other POST-based S3 operations.
 @id("s3-post")
@@ -44,7 +44,7 @@ permit(
     principal,
     action == Action::"http:POST",
     resource
-) when { context.aws_service == "s3" };
+) when { context has aws_service && context.aws_service == "s3" };
 
 // Deny all S3 delete operations — protects against accidental data loss.
 @id("deny-s3-delete")
@@ -53,4 +53,4 @@ forbid(
     principal,
     action == Action::"http:DELETE",
     resource
-) when { context.aws_service == "s3" };
+) when { context has aws_service && context.aws_service == "s3" };

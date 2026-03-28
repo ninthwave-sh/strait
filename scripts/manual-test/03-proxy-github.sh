@@ -175,10 +175,12 @@ fi
 
 section "Passthrough (non-MITM host)"
 
-# Request to a host NOT in mitm.hosts — should tunnel without MITM
+# Request to a host NOT in mitm.hosts — with policy enforcement active,
+# non-MITM hosts are denied (prevents open relay). curl returns 000 because
+# the CONNECT tunnel is rejected with 403.
 PASS_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
     --proxy "http://127.0.0.1:$PROXY_PORT" \
     "https://httpbin.org/get" 2>/dev/null) || true
-check_contains "passthrough to non-MITM host works (200)" "$PASS_CODE" "200"
+check_contains "non-MITM host denied when policy active (000)" "$PASS_CODE" "000"
 
 summary

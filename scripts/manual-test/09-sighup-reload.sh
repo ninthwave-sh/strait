@@ -106,6 +106,6 @@ check_contains "after reload: /user allowed (200)" "$USER_CODE_AFTER" "200"
 
 # Verify the reload was logged
 RELOAD_LOG=$(cat "$TMPDIR_BASE/stderr.log")
-check_contains "SIGHUP reload logged" "$RELOAD_LOG" "reload\|SIGHUP\|Reload"
+check_contains "SIGHUP reload logged" "$RELOAD_LOG" "reload|SIGHUP|Reload"
 
 summary

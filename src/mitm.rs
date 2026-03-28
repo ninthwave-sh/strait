@@ -80,8 +80,21 @@ pub async fn handle_connection(
 
             // Hand off to MITM handler
             handle_mitm(client, &host, port, ctx).await?;
+        } else if ctx.policy_engine.is_some() && !ctx.warn_only {
+            // Policy engine is active and enforcing — deny passthrough to non-MITM hosts.
+            // This prevents the proxy from being used as an open relay.
+            warn!(
+                host = host.as_str(),
+                port = port,
+                peer = %peer,
+                "CONNECT: denied passthrough to non-MITM host (policy engine active)"
+            );
+
+            let response = build_passthrough_denied_response(&host);
+            client.write_all(response.as_bytes()).await?;
         } else {
             // Passthrough path: transparent TCP tunnel
+            // (observe mode / no policy engine — allow through)
             let mut upstream = TcpStream::connect(format!("{host}:{port}")).await?;
 
             // Log passthrough event
@@ -200,11 +213,37 @@ pub async fn handle_mitm(
 
         let request_line = request_line.trim().to_string();
         let parts: Vec<&str> = request_line.split_whitespace().collect();
-        if parts.len() < 2 {
-            anyhow::bail!("invalid HTTP request line: {}", request_line);
+        if parts.len() < 3 {
+            warn!(
+                request_line = request_line.as_str(),
+                host = host,
+                "rejecting request: malformed request line (expected METHOD PATH HTTP/x.y)"
+            );
+            let response =
+                build_bad_request_response(&format!("Malformed HTTP request line: {request_line}"));
+            write_half.write_all(response.as_bytes()).await?;
+            write_half.flush().await?;
+            break;
         }
         let method = parts[0].to_string();
         let path = parts[1].to_string();
+        let version = parts[2];
+
+        // Validate HTTP version token (RFC 9112 §2.3: must be HTTP/1.0 or HTTP/1.1)
+        if version != "HTTP/1.0" && version != "HTTP/1.1" {
+            warn!(
+                version = version,
+                host = host,
+                method = method.as_str(),
+                path = path.as_str(),
+                "rejecting request: unsupported HTTP version"
+            );
+            let response =
+                build_bad_request_response(&format!("Unsupported HTTP version: {version}"));
+            write_half.write_all(response.as_bytes()).await?;
+            write_half.flush().await?;
+            break;
+        }
 
         // Read headers
         let mut headers: Vec<(String, String)> = Vec::new();
@@ -240,6 +279,22 @@ pub async fn handle_mitm(
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
             .map(|(_, v)| v.as_str());
+
+        // Reject conflicting Content-Length + Transfer-Encoding: chunked (RFC 9112 §6.3)
+        if has_chunked && raw_content_length.is_some() {
+            warn!(
+                host = host,
+                method = method.as_str(),
+                path = path.as_str(),
+                "rejecting request: conflicting Content-Length and Transfer-Encoding headers"
+            );
+            let response = build_bad_request_response(
+                "Conflicting Content-Length and Transfer-Encoding headers",
+            );
+            write_half.write_all(response.as_bytes()).await?;
+            write_half.flush().await?;
+            break;
+        }
 
         // Validate Content-Length: malformed values (non-numeric, negative) → 400
         let content_length: Option<usize> = match raw_content_length {
@@ -816,6 +871,31 @@ fn build_bad_request_response(reason: &str) -> String {
     let body_bytes = serde_json::to_string(&body).expect("JSON serialization cannot fail");
     format!(
         "HTTP/1.1 400 Bad Request\r\n\
+Content-Type: application/json\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\
+\r\n\
+{}",
+        body_bytes.len(),
+        body_bytes
+    )
+}
+
+/// Build an HTTP 403 response for passthrough connections denied by policy.
+///
+/// Returned when a CONNECT request targets a non-MITM host while a policy
+/// engine is active and enforcing. This prevents the proxy from acting as
+/// an open relay. Uses `Connection: close` because the CONNECT handshake
+/// has not been completed.
+fn build_passthrough_denied_response(host: &str) -> String {
+    let body = serde_json::json!({
+        "error": "passthrough_denied",
+        "message": format!("CONNECT to {host} denied: host is not in the MITM allowlist and policy enforcement is active"),
+        "host": host,
+    });
+    let body_bytes = serde_json::to_string(&body).expect("JSON serialization cannot fail");
+    format!(
+        "HTTP/1.1 403 Forbidden\r\n\
 Content-Type: application/json\r\n\
 Content-Length: {}\r\n\
 Connection: close\r\n\
@@ -1499,5 +1579,55 @@ mod tests {
         let mut reader = BufReader::new(&chunked[..]);
         let body = read_chunked_body(&mut reader, 1024).await.unwrap();
         assert_eq!(body, b"hello");
+    }
+
+    // --- Passthrough denied response tests ---
+
+    #[test]
+    fn passthrough_denied_response_format() {
+        let response = build_passthrough_denied_response("evil.example.com");
+
+        let lines: Vec<&str> = response.split("\r\n").collect();
+        assert_eq!(lines[0], "HTTP/1.1 403 Forbidden");
+        assert_eq!(lines[1], "Content-Type: application/json");
+        assert!(lines[2].starts_with("Content-Length: "));
+        assert_eq!(lines[3], "Connection: close");
+        assert_eq!(lines[4], "");
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let body = &response[body_start..];
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["error"], "passthrough_denied");
+        assert!(parsed["message"]
+            .as_str()
+            .unwrap()
+            .contains("evil.example.com"));
+        assert_eq!(parsed["host"], "evil.example.com");
+    }
+
+    #[test]
+    fn passthrough_denied_content_length_matches_body() {
+        let response = build_passthrough_denied_response("test.example.com");
+
+        let content_length_line = response
+            .split("\r\n")
+            .find(|line| line.starts_with("Content-Length:"))
+            .expect("Content-Length header must be present");
+        let claimed_length: usize = content_length_line
+            .strip_prefix("Content-Length: ")
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let actual_body = &response[body_start..];
+
+        assert_eq!(
+            claimed_length,
+            actual_body.len(),
+            "Content-Length ({}) must match actual body length ({})",
+            claimed_length,
+            actual_body.len()
+        );
     }
 }

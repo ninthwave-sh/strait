@@ -26,11 +26,11 @@ section "Explain"
 
 EXPLAIN=$("$STRAIT" explain "$REPO_ROOT/examples/github.cedar" 2>&1)
 check_contains "explain shows permit policies" "$EXPLAIN" "permit|PERMIT|allow|ALLOW"
-check_contains "explain shows forbid policies" "$EXPLAIN" "forbid|FORBID|deny|DENY"
+check_contains "explain shows forbid policies" "$EXPLAIN" "forbid|FORBID|deny|DENY|denies|Denies"
 check_contains "explain mentions github" "$EXPLAIN" "github|GitHub"
 
 EXPLAIN_AWS=$("$STRAIT" explain "$REPO_ROOT/examples/aws.cedar" 2>&1)
-check_contains "explain handles AWS policy" "$EXPLAIN_AWS" "aws|AWS|s3|S3|lambda|Lambda"
+check_contains "explain handles AWS policy" "$EXPLAIN_AWS" "GovCloud|IAM|conditional"
 
 echo ""
 echo -e "  ${CYAN}▶ Human review — does this read well?${RESET}"

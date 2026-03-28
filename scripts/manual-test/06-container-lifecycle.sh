@@ -102,30 +102,33 @@ check_contains "auto-pulled image ran successfully" "$PULL_OUT" "pulled"
 
 section "Filesystem Mounts (Enforce Mode)"
 
-# Create a simple policy that allows read but not write
-cat > "$TMPDIR_BASE/fs-policy.cedar" <<'CEDAR'
+# Create a test directory (must use canonical absolute path for Cedar + bind mount;
+# macOS needs pwd -P to resolve /var -> /private/var symlink)
+mkdir -p "$TMPDIR_BASE/workspace"
+WORKSPACE="$(cd "$TMPDIR_BASE/workspace" && pwd -P)"
+echo "test content" > "$WORKSPACE/readme.txt"
+
+# Cedar policy uses the actual canonical host path so extract_fs_permissions matches
+cat > "$TMPDIR_BASE/fs-policy.cedar" <<CEDAR
 permit(
     principal,
     action == Action::"fs:read",
-    resource in Resource::"fs::/workspace"
+    resource in Resource::"fs::${WORKSPACE}"
 );
 CEDAR
 
-# Create a test directory
-mkdir -p "$TMPDIR_BASE/workspace"
-echo "test content" > "$TMPDIR_BASE/workspace/readme.txt"
-
 echo -e "  ${DIM}testing filesystem enforcement... (this may vary by container setup)${RESET}"
 
-"$STRAIT" launch --policy "$TMPDIR_BASE/fs-policy.cedar" \
+# Run from the workspace dir so it becomes the cwd candidate path
+(cd "$WORKSPACE" && "$STRAIT" launch --policy "$TMPDIR_BASE/fs-policy.cedar" \
     --image alpine:latest \
     --output "$TMPDIR_BASE/fs-observations.jsonl" \
     -- sh -c "
-        echo 'Attempting to read /workspace/readme.txt:'
-        cat /workspace/readme.txt 2>&1 || echo 'READ FAILED'
-        echo 'Attempting to write /workspace/new.txt:'
-        echo 'new' > /workspace/new.txt 2>&1 || echo 'WRITE BLOCKED (expected)'
-    " > "$TMPDIR_BASE/fs-stdout.log" 2> "$TMPDIR_BASE/fs-stderr.log" || true
+        echo 'Attempting to read ${WORKSPACE}/readme.txt:'
+        cat '${WORKSPACE}/readme.txt' 2>&1 || echo 'READ FAILED'
+        echo 'Attempting to write ${WORKSPACE}/new.txt:'
+        echo 'new' > '${WORKSPACE}/new.txt' 2>&1 || echo 'WRITE BLOCKED (expected)'
+    " > "$TMPDIR_BASE/fs-stdout.log" 2> "$TMPDIR_BASE/fs-stderr.log") || true
 
 FS_OUT=$(cat "$TMPDIR_BASE/fs-stdout.log")
 echo ""

@@ -63,8 +63,8 @@ CEDAR
 
 # Create synthetic observations that won't match
 cat > "$TMPDIR_BASE/synthetic.jsonl" <<'JSONL'
-{"version":1,"timestamp":"2026-03-28T00:00:00Z","type":"network_request","method":"GET","host":"api.github.com","path":"/repos","decision":"allow"}
-{"version":1,"timestamp":"2026-03-28T00:00:01Z","type":"network_request","method":"DELETE","host":"api.github.com","path":"/repos/x","decision":"allow"}
+{"version":1,"timestamp":"2026-03-28T00:00:00Z","type":"network_request","method":"GET","host":"api.github.com","path":"/repos","decision":"allow","latency_us":0}
+{"version":1,"timestamp":"2026-03-28T00:00:01Z","type":"network_request","method":"DELETE","host":"api.github.com","path":"/repos/x","decision":"allow","latency_us":0}
 JSONL
 
 REPLAY_EXIT=0

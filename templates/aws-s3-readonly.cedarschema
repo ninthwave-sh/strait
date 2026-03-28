@@ -8,6 +8,13 @@
 //
 // AWS context attributes are set automatically by strait when the target
 // host matches *.amazonaws.com.
+//
+// Context attributes:
+//   host, path, method     — built-in, always present for HTTP requests
+//   aws_service, aws_region — built-in for AWS endpoints
+//   header:<name>           — HTTP headers are namespaced with the "header:" prefix
+//                              (e.g. context["header:authorization"])
+//                              Add header attributes below if your policies reference them.
 
 entity Agent;
 

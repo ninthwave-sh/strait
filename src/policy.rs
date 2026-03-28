@@ -132,33 +132,47 @@ impl PolicyEngine {
         // For "http:GET" → "GET"; for non-HTTP actions, use the full action string.
         let method = action.strip_prefix("http:").unwrap_or(action);
 
-        // Context: { host, path, method, headers }
+        // Context: { host, path, method, header:<name>... }
+        // Headers are namespaced as "header:<name>" to prevent overwriting
+        // built-in context attributes (host, path, method).
         let header_pairs: Vec<(String, RestrictedExpression)> = headers
             .iter()
             .map(|(k, v)| {
-                (
-                    k.to_lowercase(),
-                    RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(v)))
-                        .unwrap(),
+                let lower = k.to_lowercase();
+                if BUILTIN_CONTEXT_KEYS.contains(&lower.as_str()) {
+                    tracing::warn!(
+                        header = %lower,
+                        "header key collides with built-in context attribute; namespaced as header:{}",
+                        lower
+                    );
+                }
+                let expr = RestrictedExpression::from_str(
+                    &format!("\"{}\"", escape_cedar_string(v)),
                 )
+                .map_err(|e| {
+                    anyhow::anyhow!("invalid header value for Cedar context key '{}': {e}", lower)
+                })?;
+                Ok((format!("header:{lower}"), expr))
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let mut context_pairs: Vec<(String, RestrictedExpression)> = vec![
             (
                 "host".to_string(),
                 RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(host)))
-                    .unwrap(),
+                    .map_err(|e| anyhow::anyhow!("failed to build Cedar context for host: {e}"))?,
             ),
             (
                 "path".to_string(),
                 RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path)))
-                    .unwrap(),
+                    .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
             ),
             (
                 "method".to_string(),
                 RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(method)))
-                    .unwrap(),
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to build Cedar context for method: {e}")
+                    })?,
             ),
         ];
 
@@ -172,18 +186,22 @@ impl PolicyEngine {
                     "\"{}\"",
                     escape_cedar_string(&aws_info.service)
                 ))
-                .unwrap(),
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to build Cedar context for aws_service: {e}")
+                })?,
             ));
             // Always provide aws_region — default to us-east-1 for global endpoints
             let region = aws_info.region.as_deref().unwrap_or("us-east-1");
             context_pairs.push((
                 "aws_region".to_string(),
                 RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(region)))
-                    .unwrap(),
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to build Cedar context for aws_region: {e}")
+                    })?,
             ));
         }
 
-        // Add individual headers as context attributes
+        // Add individual headers as namespaced context attributes
         context_pairs.extend(header_pairs);
 
         let context =
@@ -576,9 +594,20 @@ pub fn build_proc_entities(command: &str, agent_id: &str) -> anyhow::Result<Enti
         .map_err(|e| anyhow::anyhow!("failed to build proc entity set: {e}"))
 }
 
+/// Built-in Cedar context attribute names that must not be overwritten by headers.
+const BUILTIN_CONTEXT_KEYS: &[&str] = &["host", "path", "method", "aws_service", "aws_region"];
+
 /// Escape a string for use in a Cedar string literal.
+///
+/// Escapes backslashes, double quotes, and control characters (\n, \r, \t, \0)
+/// to prevent injection or panics in Cedar expression parsing.
 pub(crate) fn escape_cedar_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+        .replace('\0', "\\0")
 }
 
 /// Build the structured JSON body for a 403 denial response.
@@ -1917,5 +1946,230 @@ permit(
             perms.is_empty(),
             "HTTP-only policy should produce no fs mounts"
         );
+    }
+
+    // --- Header namespace security tests (H-ER-1) ---
+
+    #[test]
+    fn header_named_path_does_not_override_url_path() {
+        // A header named "path" must NOT override the actual URL path in context.
+        // The header should appear as "header:path", not "path".
+        let f = write_policy(
+            r#"
+@id("allow-by-path")
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource
+) when { context.path == "/safe" };
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // Request to /safe should be allowed
+        let result = engine
+            .evaluate("example.com", "http:GET", "/safe", &[], "worker")
+            .unwrap();
+        assert!(result.allowed, "GET /safe should be allowed");
+
+        // Request to /secret with a header named "path" set to "/safe"
+        // must NOT bypass the policy — the header is namespaced as "header:path"
+        let malicious_headers = vec![("path".to_string(), "/safe".to_string())];
+        let result = engine
+            .evaluate(
+                "example.com",
+                "http:GET",
+                "/secret",
+                &malicious_headers,
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "GET /secret with path header should still be denied — header must not override context.path"
+        );
+    }
+
+    #[test]
+    fn header_named_host_does_not_override_host() {
+        // A header named "host" must NOT override the actual host in context.
+        let f = write_policy(
+            r#"
+@id("allow-example")
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource
+) when { context.host == "safe.example.com" };
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // Header named "host" should not override the actual host
+        let malicious_headers = vec![("host".to_string(), "safe.example.com".to_string())];
+        let result = engine
+            .evaluate(
+                "evil.example.com",
+                "http:GET",
+                "/",
+                &malicious_headers,
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "header named 'host' must not override context.host"
+        );
+    }
+
+    #[test]
+    fn header_named_method_does_not_override_method() {
+        // A header named "method" must NOT override the actual method in context.
+        let f = write_policy(
+            r#"
+@id("allow-get-only")
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource
+) when { context.method == "GET" };
+
+@id("allow-delete-action")
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:DELETE",
+    resource
+) when { context.method == "GET" };
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // Header named "method" set to "GET" should not make a DELETE appear as GET
+        let malicious_headers = vec![("method".to_string(), "GET".to_string())];
+        let result = engine
+            .evaluate(
+                "example.com",
+                "http:DELETE",
+                "/resource",
+                &malicious_headers,
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "header named 'method' must not override context.method"
+        );
+    }
+
+    #[test]
+    fn headers_appear_as_namespaced_keys_in_context() {
+        // Headers should appear in Cedar context with the "header:" prefix.
+        let f = write_policy(
+            r#"
+@id("check-auth-header")
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource
+) when { context["header:authorization"] == "Bearer token123" };
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let headers = vec![("Authorization".to_string(), "Bearer token123".to_string())];
+        let result = engine
+            .evaluate("example.com", "http:GET", "/api", &headers, "worker")
+            .unwrap();
+        assert!(
+            result.allowed,
+            "header should be accessible as context[\"header:authorization\"]"
+        );
+    }
+
+    #[test]
+    fn control_chars_in_header_values_are_escaped() {
+        // Control characters in header values should not cause panics.
+        let f = write_policy(
+            r#"
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // Header values with control characters should not panic
+        let headers = vec![
+            (
+                "x-test".to_string(),
+                "line1\nline2\rline3\ttab\0null".to_string(),
+            ),
+            ("x-quotes".to_string(), "has \"quotes\" inside".to_string()),
+            ("x-backslash".to_string(), "path\\to\\file".to_string()),
+        ];
+        let result = engine.evaluate("example.com", "http:GET", "/", &headers, "worker");
+        assert!(
+            result.is_ok(),
+            "control chars in headers should not cause panic: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn escape_cedar_string_handles_control_chars() {
+        assert_eq!(escape_cedar_string("hello\nworld"), "hello\\nworld");
+        assert_eq!(escape_cedar_string("tab\there"), "tab\\there");
+        assert_eq!(escape_cedar_string("cr\rhere"), "cr\\rhere");
+        assert_eq!(escape_cedar_string("null\0here"), "null\\0here");
+        assert_eq!(escape_cedar_string("quote\"here"), "quote\\\"here");
+        assert_eq!(escape_cedar_string("back\\slash"), "back\\\\slash");
+        // Multiple control chars in combination
+        assert_eq!(escape_cedar_string("a\nb\rc\td\0e"), "a\\nb\\rc\\td\\0e");
+    }
+
+    #[test]
+    fn restricted_expression_errors_propagate_not_panic() {
+        // Verify that the evaluate function returns Err (not panic)
+        // when given input that could produce invalid Cedar expressions.
+        // After the fix, RestrictedExpression::from_str errors propagate
+        // via ? rather than unwrap().
+        //
+        // Note: with proper escaping, well-formed strings won't trigger
+        // RestrictedExpression parse errors. This test verifies the overall
+        // error handling path works correctly for valid inputs with special chars.
+        let f = write_policy(
+            r#"
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // Various edge cases that should be handled gracefully
+        let edge_cases = vec![
+            ("x-empty".to_string(), "".to_string()),
+            ("x-unicode".to_string(), "héllo wörld".to_string()),
+            (
+                "x-special".to_string(),
+                "<script>alert(1)</script>".to_string(),
+            ),
+            ("x-long".to_string(), "a".repeat(10000)),
+        ];
+
+        for (key, value) in &edge_cases {
+            let headers = vec![(key.clone(), value.clone())];
+            let result = engine.evaluate("example.com", "http:GET", "/", &headers, "worker");
+            assert!(
+                result.is_ok(),
+                "evaluate should handle header '{}' gracefully, got: {:?}",
+                key,
+                result.err()
+            );
+        }
     }
 }

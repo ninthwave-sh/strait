@@ -405,16 +405,18 @@ fn build_http_context(host: &str, path: &str, method: &str) -> anyhow::Result<Co
     let mut pairs: Vec<(String, RestrictedExpression)> = vec![
         (
             "host".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(host))).unwrap(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(host)))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for host: {e}"))?,
         ),
         (
             "path".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path))).unwrap(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path)))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
         ),
         (
             "method".to_string(),
             RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(method)))
-                .unwrap(),
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for method: {e}"))?,
         ),
     ];
 
@@ -426,13 +428,15 @@ fn build_http_context(host: &str, path: &str, method: &str) -> anyhow::Result<Co
                 "\"{}\"",
                 escape_cedar_string(&aws_info.service)
             ))
-            .unwrap(),
+            .map_err(|e| anyhow::anyhow!("failed to build Cedar context for aws_service: {e}"))?,
         ));
         let region = aws_info.region.as_deref().unwrap_or("us-east-1");
         pairs.push((
             "aws_region".to_string(),
             RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(region)))
-                .unwrap(),
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to build Cedar context for aws_region: {e}")
+                })?,
         ));
     }
 
@@ -446,12 +450,13 @@ fn build_fs_context(path: &str, operation: &str) -> anyhow::Result<Context> {
     let pairs: Vec<(String, RestrictedExpression)> = vec![
         (
             "path".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path))).unwrap(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path)))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
         ),
         (
             "operation".to_string(),
             RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(operation)))
-                .unwrap(),
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for operation: {e}"))?,
         ),
     ];
 
@@ -464,7 +469,8 @@ fn build_fs_context(path: &str, operation: &str) -> anyhow::Result<Context> {
 fn build_proc_context(command: &str) -> anyhow::Result<Context> {
     let pairs: Vec<(String, RestrictedExpression)> = vec![(
         "command".to_string(),
-        RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(command))).unwrap(),
+        RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(command)))
+            .map_err(|e| anyhow::anyhow!("failed to build Cedar context for command: {e}"))?,
     )];
 
     Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build proc context: {e}"))
@@ -477,11 +483,13 @@ fn build_mount_context(path: &str, mode: &str) -> anyhow::Result<Context> {
     let pairs: Vec<(String, RestrictedExpression)> = vec![
         (
             "path".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path))).unwrap(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path)))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
         ),
         (
             "mode".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(mode))).unwrap(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(mode)))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for mode: {e}"))?,
         ),
     ];
 

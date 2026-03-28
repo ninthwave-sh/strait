@@ -19,6 +19,24 @@
 //! 9. Start container with TTY attached
 //! 10. Wait for agent exit
 //! 11. Stop proxy, clean up container, close observation stream
+//!
+//! # Security: Cooperative Enforcement Model
+//!
+//! Network enforcement relies on the container process honoring the
+//! `HTTPS_PROXY` / `HTTP_PROXY` environment variables. This is cooperative —
+//! not enforced at the network layer. A process that ignores the proxy
+//! variables can make direct outbound connections that bypass policy
+//! evaluation entirely. See [`crate::container`] module docs for details.
+//!
+//! **Observe mode caveat**: The working directory is mounted read-write
+//! with no Cedar policy restricting filesystem access. A warning is emitted
+//! to stderr at startup. In warn/enforce modes, filesystem access is
+//! restricted to paths permitted by the Cedar policy.
+//!
+//! **v0.4 roadmap**: Network-level enforcement via Docker `--internal`
+//! bridge network (no default route) with an explicit proxy route. This
+//! eliminates the cooperative assumption by ensuring all outbound traffic
+//! must traverse the Strait proxy.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -130,6 +148,13 @@ pub async fn run_launch_observe(
             cwd.to_string_lossy().to_string(),
         )],
     };
+
+    // Warn about observe mode's permissive cwd mount and cooperative enforcement
+    warn!(
+        path = %cwd.display(),
+        "observe mode: working directory mounted read-write with no policy restrictions"
+    );
+    eprintln!("{}", observe_cwd_warning(&cwd));
 
     // Build config with auto_remove=false so we can reliably capture the
     // exit code via wait_container. Docker's wait API returns status_code=0
@@ -390,6 +415,26 @@ pub async fn run_launch_with_policy(
     eprintln!("Observation log: {}", obs_log_path.display());
 
     Ok(exit_code)
+}
+
+// ---------------------------------------------------------------------------
+// Observe-mode warning
+// ---------------------------------------------------------------------------
+
+/// Build the stderr warning message for observe mode's read-write cwd mount.
+///
+/// Observe mode mounts the working directory read-write with no Cedar policy
+/// restricting filesystem access. Additionally, network enforcement relies on
+/// the container process honoring `HTTPS_PROXY` — a cooperative assumption.
+///
+/// This function is extracted to enable testing the warning content.
+pub(crate) fn observe_cwd_warning(cwd: &Path) -> String {
+    format!(
+        "Warning: observe mode mounts {} read-write — the container has full write \
+         access to your working directory. Network enforcement is cooperative \
+         (HTTPS_PROXY is advisory, not enforced at the network level).",
+        cwd.display()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -655,6 +700,81 @@ mod tests {
         assert_eq!(EnforcementMode::Enforce, EnforcementMode::Enforce);
         assert_ne!(EnforcementMode::Observe, EnforcementMode::Warn);
         assert_ne!(EnforcementMode::Warn, EnforcementMode::Enforce);
+    }
+
+    // -- Observe-mode warning tests ------------------------------------------
+
+    /// Verify observe mode warning mentions read-write access and cooperative enforcement.
+    #[test]
+    fn observe_cwd_warning_mentions_rw_and_cooperative() {
+        let cwd = PathBuf::from("/project");
+        let msg = observe_cwd_warning(&cwd);
+
+        assert!(
+            msg.contains("read-write"),
+            "warning should mention read-write: {msg}"
+        );
+        assert!(
+            msg.contains("write access"),
+            "warning should mention write access: {msg}"
+        );
+        assert!(
+            msg.contains("cooperative"),
+            "warning should mention cooperative enforcement: {msg}"
+        );
+        assert!(
+            msg.contains("advisory"),
+            "warning should mention HTTPS_PROXY is advisory: {msg}"
+        );
+        assert!(
+            msg.contains("/project"),
+            "warning should include the cwd path: {msg}"
+        );
+    }
+
+    /// Verify observe mode warning includes the actual cwd path.
+    #[test]
+    fn observe_cwd_warning_includes_path() {
+        let cwd = PathBuf::from("/home/user/my-project");
+        let msg = observe_cwd_warning(&cwd);
+        assert!(
+            msg.contains("/home/user/my-project"),
+            "warning should include the actual cwd: {msg}"
+        );
+    }
+
+    /// Verify observe mode builds a policy with FsWrite (not FsRead) for cwd.
+    #[test]
+    fn observe_mode_mounts_cwd_readwrite() {
+        use std::path::Path;
+
+        // This mirrors the logic in run_launch_observe: cwd gets FsWrite
+        let cwd = "/project";
+        let policy = ContainerPolicy {
+            permissions: vec![ContainerPermission::FsWrite(cwd.to_string())],
+        };
+
+        let config = ContainerManager::build_config(
+            &policy,
+            "alpine:latest",
+            &["sh".to_string()],
+            8080,
+            None,
+            Path::new("/project"),
+        )
+        .unwrap();
+
+        // Verify cwd is mounted read-write (not read-only)
+        assert!(
+            config.binds.iter().any(|b| b.contains(":rw")),
+            "observe mode should mount cwd as read-write: {:?}",
+            config.binds
+        );
+        assert!(
+            !config.binds.iter().any(|b| b.contains(":ro")),
+            "observe mode should NOT have read-only mounts: {:?}",
+            config.binds
+        );
     }
 
     // -- ProxyContext builder tests -------------------------------------------

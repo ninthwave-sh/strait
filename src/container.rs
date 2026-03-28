@@ -9,6 +9,32 @@
 //! `HTTP_PROXY`, `https_proxy`, and `http_proxy` environment variables
 //! pointing to `host.docker.internal:<port>`. All four variants are set
 //! because different tools check different casings.
+//!
+//! # Security Model: Cooperative Network Enforcement
+//!
+//! **Network enforcement is cooperative, not enforced at the network layer.**
+//! The container's outbound traffic is routed through the Strait proxy via
+//! the `HTTPS_PROXY` / `HTTP_PROXY` environment variables, but these are
+//! advisory — programs inside the container are free to ignore them and
+//! connect to arbitrary IP addresses directly.
+//!
+//! This means:
+//! - **Observe mode**: All traffic the agent voluntarily sends through the
+//!   proxy is recorded. Direct connections bypass observation entirely.
+//! - **Warn mode**: Cedar policy violations are logged as warnings, but only
+//!   for traffic that goes through the proxy. Direct connections are invisible.
+//! - **Enforce mode**: Cedar policy blocks disallowed traffic through the
+//!   proxy, but a container process that resolves hostnames itself and opens
+//!   direct TCP connections can bypass policy enforcement entirely.
+//!
+//! Docker's default bridge network provides full outbound internet access.
+//! There are no `iptables` rules, network namespace restrictions, or DNS
+//! interception preventing direct connections in v0.3.
+//!
+//! **v0.4 hardening plan**: Network-level enforcement via Docker
+//! user-defined bridge with `--internal` (no default route) + explicit
+//! proxy route. This will ensure all outbound traffic must traverse the
+//! proxy, making enforcement non-bypassable.
 
 use anyhow::Context as _;
 use bollard::container::{

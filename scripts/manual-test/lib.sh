@@ -24,6 +24,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STRAIT="$REPO_ROOT/target/release/strait"
 TMPDIR_BASE="${TMPDIR:-/tmp}/strait-manual-test-$$"
 
+# Auto-detect GITHUB_TOKEN from gh CLI if not already set
+if [[ -z "${GITHUB_TOKEN:-}" ]] && command -v gh &>/dev/null; then
+    GITHUB_TOKEN="$(gh auth token 2>/dev/null)" || true
+    if [[ -n "$GITHUB_TOKEN" ]]; then
+        export GITHUB_TOKEN
+    fi
+fi
+
 setup_tmpdir() {
     mkdir -p "$TMPDIR_BASE"
 }

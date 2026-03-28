@@ -100,6 +100,21 @@ pub async fn handle_connection(
             // Log passthrough event
             ctx.audit_logger.log_passthrough(&host, port);
 
+            // Emit observation event so passthrough connections are visible
+            // in `strait watch` and `strait generate`. Only host/port are
+            // known — method and path are unavailable since the tunnel is
+            // encrypted.
+            if let Some(ref obs) = ctx.observation_stream {
+                obs.emit(crate::observe::EventKind::NetworkRequest {
+                    method: "CONNECT".to_string(),
+                    host: host.to_string(),
+                    path: String::new(),
+                    decision: "passthrough".to_string(),
+                    latency_us: 0,
+                    enforcement_mode: ctx.enforcement_mode.clone(),
+                });
+            }
+
             info!(
                 host = host.as_str(),
                 port = port,
@@ -576,7 +591,7 @@ pub async fn handle_mitm(
                 path: path.clone(),
                 decision: decision_str.to_string(),
                 latency_us: eval_start.elapsed().as_micros() as u64,
-                enforcement_mode: String::new(),
+                enforcement_mode: ctx.enforcement_mode.clone(),
             });
         }
 

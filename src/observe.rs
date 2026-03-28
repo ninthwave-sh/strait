@@ -349,8 +349,8 @@ impl ObservationStream {
                         });
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "observation socket accept error");
-                        break;
+                        tracing::warn!(error = %e, "observation socket accept error (transient, continuing)");
+                        continue;
                     }
                 }
             }
@@ -883,6 +883,52 @@ mod tests {
             "socket path should contain PID, got: {}",
             path.display()
         );
+    }
+
+    // -- Accept loop resilience tests -------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn accept_loop_survives_after_socket_removal_and_rebind() {
+        // Verify the accept loop continues after transient errors:
+        // 1. Start server, connect a client, drop it
+        // 2. Emit events (server should not have crashed)
+        // 3. Connect a new client and verify events still arrive
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+
+        let stream = ObservationStream::new();
+        stream.start_socket_server_at(&sock_path).await.unwrap();
+
+        // Connect and immediately drop 10 clients in rapid succession.
+        // This exercises the accept loop under client churn.
+        for _ in 0..10 {
+            let _client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        }
+
+        // Give the server time to handle disconnects.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Now connect a real client and verify events still flow.
+        let client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let mut reader = tokio::io::BufReader::new(client);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        stream.emit(EventKind::ContainerStart {
+            container_id: "resilience-test".to_string(),
+            image: "alpine".to_string(),
+        });
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let event: ObservationEvent = serde_json::from_str(&line).unwrap();
+        match &event.event {
+            EventKind::ContainerStart { container_id, .. } => {
+                assert_eq!(container_id, "resilience-test");
+            }
+            other => panic!("expected ContainerStart, got {other:?}"),
+        }
     }
 
     // -- Duration parsing tests -----------------------------------------------

@@ -340,6 +340,14 @@ pub struct ProxyContext {
     /// a `NetworkRequest` event through this stream.
     pub observation_stream: Option<ObservationStream>,
 
+    /// Current enforcement mode: `"observe"`, `"warn"`, or `"enforce"`.
+    ///
+    /// Populated by the caller after construction (e.g. `launch` derives it
+    /// from the `EnforcementMode` enum). Emitted in `NetworkRequest`
+    /// observation events so downstream consumers (`strait watch`,
+    /// `strait generate`) can distinguish modes.
+    pub enforcement_mode: String,
+
     /// When true, MITM all connections regardless of the `mitm_hosts` list.
     ///
     /// Used by `launch` modes where all traffic must be observed or evaluated.
@@ -442,6 +450,15 @@ impl ProxyContext {
         // Resolve identity configuration
         let identity = config.identity.clone().unwrap_or_default();
 
+        // Derive enforcement mode from policy engine presence.
+        // `from_config` always sets warn_only=false, so the mode is either
+        // "enforce" (policy present) or "observe" (no policy).
+        let enforcement_mode = if policy_engine.is_some() {
+            "enforce".to_string()
+        } else {
+            "observe".to_string()
+        };
+
         Ok(Self {
             session_ca,
             policy_engine,
@@ -456,6 +473,7 @@ impl ProxyContext {
             git_policy,
             policy_config: config.policy.clone(),
             observation_stream: None,
+            enforcement_mode,
             mitm_all: false,
             warn_only: false,
             upstream_addr_override: None,
@@ -910,6 +928,31 @@ ca_cert_path = "/tmp/ca.pem"
         // Identity defaults when [identity] section is absent
         assert_eq!(ctx.identity_header, "X-Strait-Agent");
         assert_eq!(ctx.identity_default, "anonymous");
+        // No policy engine → observe mode
+        assert_eq!(ctx.enforcement_mode, "observe");
+    }
+
+    #[test]
+    fn proxy_context_enforcement_mode_enforce_with_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("policy.cedar");
+        std::fs::write(&policy_path, "permit(principal, action, resource);\n").unwrap();
+
+        let config_str = format!(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+
+[policy]
+file = "{}"
+"#,
+            policy_path.display()
+        );
+        let f = write_config(&config_str);
+        let config = StraitConfig::load(f.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        assert!(ctx.policy_engine.is_some());
+        assert_eq!(ctx.enforcement_mode, "enforce");
     }
 
     #[test]

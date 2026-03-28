@@ -2,7 +2,7 @@
 name = "strait"
 version = "0.1.0"
 edition = "2021"
-description = "HTTPS proxy with Cedar policy evaluation, credential injection, and audit logging"
+description = "Policy platform for AI agents - Cedar policy over network, filesystem, and process access"
 license = "Apache-2.0"
 repository = "https://github.com/ninthwave-sh/strait"
 readme = "README.md"

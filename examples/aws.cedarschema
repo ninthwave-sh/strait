@@ -6,6 +6,10 @@
 // AWS context attributes are set automatically by strait when the target
 // host matches *.amazonaws.com. For non-AWS hosts, use the base schema
 // (e.g. github.cedarschema) instead.
+//
+// HTTP headers are namespaced as "header:<name>" (e.g. context["header:authorization"])
+// and are not declared here since they vary per request. Add them to the
+// context block below if your policies reference specific headers.
 
 // The calling process. Only one principal identity exists today.
 entity Agent;

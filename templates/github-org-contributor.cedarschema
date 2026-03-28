@@ -5,6 +5,12 @@
 //   Agent    — the calling process (e.g. Agent::"worker")
 //   Resource — URL path hierarchy: Resource::"api.github.com/repos/org/repo"
 //   Action   — namespaced HTTP methods: Action::"http:GET", etc.
+//
+// Context attributes:
+//   host, path, method — built-in, always present for HTTP requests
+//   header:<name>      — HTTP headers are namespaced with the "header:" prefix
+//                         (e.g. context["header:authorization"], context["header:content-type"])
+//                         Add header attributes below if your policies reference them.
 
 entity Agent;
 

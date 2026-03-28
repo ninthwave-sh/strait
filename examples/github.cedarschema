@@ -6,8 +6,10 @@
 //   Action      — namespaced HTTP method: Action::"http:GET", Action::"http:POST", etc.
 //
 // Context attributes are set by strait on every request from the parsed
-// HTTP request line. Additional header attributes may be present at
-// runtime but are not declared here (they vary per request).
+// HTTP request line. HTTP headers are namespaced as "header:<name>"
+// (e.g. context["header:authorization"]) and are not declared here
+// since they vary per request. Add them to the context block below
+// if your policies reference specific headers.
 
 // The calling process. Only one principal identity exists today.
 entity Agent;

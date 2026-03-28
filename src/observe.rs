@@ -179,6 +179,39 @@ impl ObservationStream {
 }
 
 // ---------------------------------------------------------------------------
+// Observation reading (canonical implementation)
+// ---------------------------------------------------------------------------
+
+/// Read observation events from a JSONL log file.
+///
+/// Each line in the file should be a single JSON-serialized `ObservationEvent`.
+/// Blank lines are skipped. Returns an error with line numbers for parse failures.
+///
+/// This is the canonical implementation shared by `generate` and `replay`.
+pub fn read_observations(path: &Path) -> anyhow::Result<Vec<ObservationEvent>> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        anyhow::anyhow!("failed to open observation file '{}': {e}", path.display())
+    })?;
+    let reader = std::io::BufReader::new(file);
+    let mut events = Vec::new();
+
+    use std::io::BufRead;
+    for (line_num, line) in reader.lines().enumerate() {
+        let line =
+            line.map_err(|e| anyhow::anyhow!("failed to read line {}: {e}", line_num + 1))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let event: ObservationEvent = serde_json::from_str(trimmed)
+            .map_err(|e| anyhow::anyhow!("parse error on line {}: {e}", line_num + 1))?;
+        events.push(event);
+    }
+
+    Ok(events)
+}
+
+// ---------------------------------------------------------------------------
 // Duration parsing
 // ---------------------------------------------------------------------------
 
@@ -988,5 +1021,96 @@ mod tests {
     fn parse_duration_rejects_single_char() {
         let err = super::parse_duration("m").unwrap_err();
         assert!(err.to_string().contains("invalid duration"), "got: {err}");
+    }
+
+    // -- read_observations tests (M-ER-9) ---
+
+    #[test]
+    fn read_observations_parses_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        let events = vec![
+            ObservationEvent {
+                timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+                event: EventKind::NetworkRequest {
+                    method: "GET".to_string(),
+                    host: "api.github.com".to_string(),
+                    path: "/repos".to_string(),
+                    decision: "allow".to_string(),
+                    latency_us: 100,
+                    enforcement_mode: String::new(),
+                },
+            },
+            ObservationEvent {
+                timestamp: "2026-03-27T00:00:01.000Z".to_string(),
+                event: EventKind::FsAccess {
+                    path: "/workspace/src".to_string(),
+                    operation: "read".to_string(),
+                },
+            },
+        ];
+
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(&path).unwrap();
+            for event in &events {
+                writeln!(file, "{}", serde_json::to_string(event).unwrap()).unwrap();
+            }
+        }
+
+        let parsed = super::read_observations(&path).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], events[0]);
+        assert_eq!(parsed[1], events[1]);
+    }
+
+    #[test]
+    fn read_observations_skips_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+
+        let event = ObservationEvent {
+            timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            event: EventKind::ProcExec {
+                pid: 42,
+                command: "node index.js".to_string(),
+            },
+        };
+
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(&path).unwrap();
+            writeln!(file, "{}", serde_json::to_string(&event).unwrap()).unwrap();
+            writeln!(file).unwrap();
+            writeln!(file, "  ").unwrap();
+            writeln!(file, "{}", serde_json::to_string(&event).unwrap()).unwrap();
+        }
+
+        let parsed = super::read_observations(&path).unwrap();
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn read_observations_error_on_missing_file() {
+        let result = super::read_observations(Path::new("/nonexistent/test.jsonl"));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("failed to open observation file"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_observations_error_on_bad_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.jsonl");
+        std::fs::write(&path, "{{not valid json\n").unwrap();
+
+        let result = super::read_observations(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("parse error on line 1"), "got: {err}");
     }
 }

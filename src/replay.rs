@@ -6,19 +6,17 @@
 //!
 //! Exit code: 0 when all evaluable events match the policy, 1 on any mismatch.
 
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::str::FromStr;
 
 use cedar_policy::{
     Authorizer, Context, Decision, EntityId, EntityTypeName, EntityUid, PolicySet, Request,
-    RestrictedExpression,
 };
 
-use crate::credentials::parse_aws_host;
-use crate::observe::{EventKind, ObservationEvent};
+use crate::observe::{read_observations, EventKind, ObservationEvent};
 use crate::policy::{
-    build_fs_entities, build_http_entity_hierarchy, build_proc_entities, escape_cedar_string,
+    build_fs_context, build_fs_entities, build_http_context, build_http_entity_hierarchy,
+    build_mount_context, build_proc_context, build_proc_entities, build_resource_id,
 };
 
 // ---------------------------------------------------------------------------
@@ -153,32 +151,6 @@ pub fn print_results(result: &ReplayResult) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Observation reading
-// ---------------------------------------------------------------------------
-
-fn read_observations(path: &Path) -> anyhow::Result<Vec<ObservationEvent>> {
-    let file = std::fs::File::open(path).map_err(|e| {
-        anyhow::anyhow!("failed to open observation file '{}': {e}", path.display())
-    })?;
-    let reader = BufReader::new(file);
-    let mut events = Vec::new();
-
-    for (line_num, line) in reader.lines().enumerate() {
-        let line =
-            line.map_err(|e| anyhow::anyhow!("failed to read line {}: {e}", line_num + 1))?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let event: ObservationEvent = serde_json::from_str(trimmed)
-            .map_err(|e| anyhow::anyhow!("parse error on line {}: {e}", line_num + 1))?;
-        events.push(event);
-    }
-
-    Ok(events)
-}
-
-// ---------------------------------------------------------------------------
 // Event evaluation
 // ---------------------------------------------------------------------------
 
@@ -227,7 +199,7 @@ fn evaluate_event(
             let policy_allowed = cedar_evaluate(
                 agent_id,
                 &action_str,
-                &build_http_resource_id(host, path),
+                &build_resource_id(host, path),
                 &entities,
                 &context,
                 policy_set,
@@ -393,120 +365,6 @@ fn cedar_evaluate(
 
     let response = authorizer.is_authorized(&request, policy_set, entities);
     response.decision() == Decision::Allow
-}
-
-// ---------------------------------------------------------------------------
-// Context builders
-// ---------------------------------------------------------------------------
-
-/// Build a Cedar context for an HTTP network request.
-///
-/// Populates `host`, `path`, and `method` attributes, plus AWS-specific
-/// `aws_service` and `aws_region` when the host is an AWS endpoint.
-/// This mirrors the context construction in `PolicyEngine::evaluate()`.
-fn build_http_context(host: &str, path: &str, method: &str) -> anyhow::Result<Context> {
-    let mut pairs: Vec<(String, RestrictedExpression)> = vec![
-        (
-            "host".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(host)))
-                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for host: {e}"))?,
-        ),
-        (
-            "path".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path)))
-                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
-        ),
-        (
-            "method".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(method)))
-                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for method: {e}"))?,
-        ),
-    ];
-
-    // Add AWS-specific context attributes when the host is an AWS endpoint.
-    if let Some(aws_info) = parse_aws_host(host) {
-        pairs.push((
-            "aws_service".to_string(),
-            RestrictedExpression::from_str(&format!(
-                "\"{}\"",
-                escape_cedar_string(&aws_info.service)
-            ))
-            .map_err(|e| anyhow::anyhow!("failed to build Cedar context for aws_service: {e}"))?,
-        ));
-        let region = aws_info.region.as_deref().unwrap_or("us-east-1");
-        pairs.push((
-            "aws_region".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(region)))
-                .map_err(|e| {
-                    anyhow::anyhow!("failed to build Cedar context for aws_region: {e}")
-                })?,
-        ));
-    }
-
-    Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build HTTP context: {e}"))
-}
-
-/// Build a Cedar context for a filesystem access event.
-///
-/// Populates `path` and `operation` attributes.
-fn build_fs_context(path: &str, operation: &str) -> anyhow::Result<Context> {
-    let pairs: Vec<(String, RestrictedExpression)> = vec![
-        (
-            "path".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path)))
-                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
-        ),
-        (
-            "operation".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(operation)))
-                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for operation: {e}"))?,
-        ),
-    ];
-
-    Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build fs context: {e}"))
-}
-
-/// Build a Cedar context for a process execution event.
-///
-/// Populates `command` attribute.
-fn build_proc_context(command: &str) -> anyhow::Result<Context> {
-    let pairs: Vec<(String, RestrictedExpression)> = vec![(
-        "command".to_string(),
-        RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(command)))
-            .map_err(|e| anyhow::anyhow!("failed to build Cedar context for command: {e}"))?,
-    )];
-
-    Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build proc context: {e}"))
-}
-
-/// Build a Cedar context for a mount event.
-///
-/// Populates `path` and `mode` attributes.
-fn build_mount_context(path: &str, mode: &str) -> anyhow::Result<Context> {
-    let pairs: Vec<(String, RestrictedExpression)> = vec![
-        (
-            "path".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path)))
-                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
-        ),
-        (
-            "mode".to_string(),
-            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(mode)))
-                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for mode: {e}"))?,
-        ),
-    ];
-
-    Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build mount context: {e}"))
-}
-
-/// Build a resource ID for an HTTP request (mirrors `policy.rs::build_resource_id`).
-fn build_http_resource_id(host: &str, path: &str) -> String {
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        host.to_string()
-    } else {
-        format!("{host}/{trimmed}")
-    }
 }
 
 /// Format a one-line summary of an observation event.

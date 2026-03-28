@@ -132,77 +132,29 @@ impl PolicyEngine {
         // For "http:GET" → "GET"; for non-HTTP actions, use the full action string.
         let method = action.strip_prefix("http:").unwrap_or(action);
 
-        // Context: { host, path, method, header:<name>... }
-        // Headers are namespaced as "header:<name>" to prevent overwriting
-        // built-in context attributes (host, path, method).
-        let header_pairs: Vec<(String, RestrictedExpression)> = headers
-            .iter()
-            .map(|(k, v)| {
-                let lower = k.to_lowercase();
-                if BUILTIN_CONTEXT_KEYS.contains(&lower.as_str()) {
-                    tracing::warn!(
-                        header = %lower,
-                        "header key collides with built-in context attribute; namespaced as header:{}",
-                        lower
-                    );
-                }
-                let expr = RestrictedExpression::from_str(
-                    &format!("\"{}\"", escape_cedar_string(v)),
+        // Build base context pairs (host, path, method, AWS) using shared builder
+        let mut context_pairs = build_http_context_pairs(host, path, method)?;
+
+        // Add headers as namespaced "header:<name>" context attributes to prevent
+        // overwriting built-in context attributes (host, path, method).
+        for (k, v) in headers {
+            let lower = k.to_lowercase();
+            if BUILTIN_CONTEXT_KEYS.contains(&lower.as_str()) {
+                tracing::warn!(
+                    header = %lower,
+                    "header key collides with built-in context attribute; namespaced as header:{}",
+                    lower
+                );
+            }
+            let expr = RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(v)))
+                .map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid header value for Cedar context key '{}': {e}",
+                    lower
                 )
-                .map_err(|e| {
-                    anyhow::anyhow!("invalid header value for Cedar context key '{}': {e}", lower)
-                })?;
-                Ok((format!("header:{lower}"), expr))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        let mut context_pairs: Vec<(String, RestrictedExpression)> = vec![
-            (
-                "host".to_string(),
-                RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(host)))
-                    .map_err(|e| anyhow::anyhow!("failed to build Cedar context for host: {e}"))?,
-            ),
-            (
-                "path".to_string(),
-                RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path)))
-                    .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
-            ),
-            (
-                "method".to_string(),
-                RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(method)))
-                    .map_err(|e| {
-                        anyhow::anyhow!("failed to build Cedar context for method: {e}")
-                    })?,
-            ),
-        ];
-
-        // Add AWS-specific context attributes when the host is an AWS endpoint.
-        // This enables Cedar policies to use `context.aws_service` and
-        // `context.aws_region` for fine-grained AWS access control.
-        if let Some(aws_info) = parse_aws_host(host) {
-            context_pairs.push((
-                "aws_service".to_string(),
-                RestrictedExpression::from_str(&format!(
-                    "\"{}\"",
-                    escape_cedar_string(&aws_info.service)
-                ))
-                .map_err(|e| {
-                    anyhow::anyhow!("failed to build Cedar context for aws_service: {e}")
-                })?,
-            ));
-            // Always provide aws_region — default to us-east-1 for global endpoints
-            let region = aws_info.region.as_deref().unwrap_or("us-east-1");
-            context_pairs.push((
-                "aws_region".to_string(),
-                RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(region)))
-                    .map_err(|e| {
-                        anyhow::anyhow!("failed to build Cedar context for aws_region: {e}")
-                    })?,
-            ));
+            })?;
+            context_pairs.push((format!("header:{lower}"), expr));
         }
-
-        // Add individual headers as namespaced context attributes
-        context_pairs.extend(header_pairs);
 
         let context =
             Context::from_pairs(context_pairs).context("failed to build Cedar context")?;
@@ -275,31 +227,71 @@ impl PolicyEngine {
             EntityId::from_str(&resource_id).unwrap(),
         );
 
-        // Build context with path and operation attributes so Cedar policies
-        // using `when { context.path like ... }` or `context.operation` work
+        // Build context using shared builder so Cedar policies using
+        // `when { context.path like ... }` or `context.operation` work
         // consistently in both live enforcement and replay.
         let operation = action.strip_prefix("fs:").unwrap_or(action);
-        let context_pairs: Vec<(String, RestrictedExpression)> = vec![
-            (
-                "path".to_string(),
-                RestrictedExpression::from_str(&format!(
-                    "\"{}\"",
-                    escape_cedar_string(&normalized)
-                ))
-                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
-            ),
-            (
-                "operation".to_string(),
-                RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(operation)))
-                    .map_err(|e| {
-                        anyhow::anyhow!("failed to build Cedar context for operation: {e}")
-                    })?,
-            ),
-        ];
-        let context = Context::from_pairs(context_pairs)
-            .map_err(|e| anyhow::anyhow!("failed to build Cedar fs context: {e}"))?;
+        let context = build_fs_context(&normalized, operation)?;
         let request = Request::new(principal, action_uid, resource, context, None)
             .map_err(|e| anyhow::anyhow!("failed to build Cedar fs request: {e}"))?;
+
+        let response = self
+            .authorizer
+            .is_authorized(&request, &self.policy_set, &entities);
+
+        let mut policy_names = Vec::new();
+        let mut policy_reasons = Vec::new();
+        for pid in response.diagnostics().reason() {
+            let name = self
+                .policy_set
+                .annotation(pid, "id")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| pid.to_string());
+            policy_names.push(name);
+            if let Some(reason) = self.policy_set.annotation(pid, "reason") {
+                policy_reasons.push(reason.to_string());
+            }
+        }
+
+        Ok(PolicyDecision {
+            allowed: response.decision() == Decision::Allow,
+            policy_names,
+            policy_reasons,
+        })
+    }
+
+    /// Evaluate a process action against the loaded policy set.
+    ///
+    /// - `command`: command string (e.g. `"node index.js"`)
+    /// - `action`: proc action string (e.g. `proc:exec`)
+    /// - `agent_id`: identity of the requesting agent
+    pub fn evaluate_proc(
+        &self,
+        command: &str,
+        action: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<PolicyDecision> {
+        let entities = build_proc_entities(command, agent_id)?;
+
+        let principal = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Agent").unwrap(),
+            EntityId::from_str(agent_id).unwrap(),
+        );
+
+        let action_uid = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Action").unwrap(),
+            EntityId::from_str(action).unwrap(),
+        );
+
+        let resource_id = format!("proc::{command}");
+        let resource = EntityUid::from_type_name_and_id(
+            EntityTypeName::from_str("Resource").unwrap(),
+            EntityId::from_str(&resource_id).unwrap(),
+        );
+
+        let context = build_proc_context(command)?;
+        let request = Request::new(principal, action_uid, resource, context, None)
+            .map_err(|e| anyhow::anyhow!("failed to build Cedar proc request: {e}"))?;
 
         let response = self
             .authorizer
@@ -378,7 +370,7 @@ pub fn extract_fs_permissions(
 
 /// Build a resource ID string from host and path.
 /// e.g. host="api.github.com", path="/repos/org/repo" -> "api.github.com/repos/org/repo"
-fn build_resource_id(host: &str, path: &str) -> String {
+pub fn build_resource_id(host: &str, path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
     if trimmed.is_empty() {
         host.to_string()
@@ -603,17 +595,135 @@ pub fn build_proc_entities(command: &str, agent_id: &str) -> anyhow::Result<Enti
     );
     entities.push(Entity::new_no_attrs(agent_uid, HashSet::new()));
 
-    // Add action entities for process operations
-    for action in &["proc:exec", "proc:fork", "proc:signal"] {
+    // Add action entity for proc:exec (the only process action used).
+    {
         let action_uid = EntityUid::from_type_name_and_id(
             EntityTypeName::from_str("Action").unwrap(),
-            EntityId::from_str(action).unwrap(),
+            EntityId::from_str("proc:exec").unwrap(),
         );
         entities.push(Entity::new_no_attrs(action_uid, HashSet::new()));
     }
 
     Entities::from_entities(entities, None)
         .map_err(|e| anyhow::anyhow!("failed to build proc entity set: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Context builders (shared by evaluate methods and replay)
+// ---------------------------------------------------------------------------
+
+/// Build the base Cedar context pairs for an HTTP request.
+///
+/// Populates `host`, `path`, and `method` attributes, plus AWS-specific
+/// `aws_service` and `aws_region` when the host is an AWS endpoint.
+fn build_http_context_pairs(
+    host: &str,
+    path: &str,
+    method: &str,
+) -> anyhow::Result<Vec<(String, RestrictedExpression)>> {
+    let mut pairs: Vec<(String, RestrictedExpression)> = vec![
+        (
+            "host".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(host)))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for host: {e}"))?,
+        ),
+        (
+            "path".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path)))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
+        ),
+        (
+            "method".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(method)))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for method: {e}"))?,
+        ),
+    ];
+
+    // Add AWS-specific context attributes when the host is an AWS endpoint.
+    if let Some(aws_info) = parse_aws_host(host) {
+        pairs.push((
+            "aws_service".to_string(),
+            RestrictedExpression::from_str(&format!(
+                "\"{}\"",
+                escape_cedar_string(&aws_info.service)
+            ))
+            .map_err(|e| anyhow::anyhow!("failed to build Cedar context for aws_service: {e}"))?,
+        ));
+        let region = aws_info.region.as_deref().unwrap_or("us-east-1");
+        pairs.push((
+            "aws_region".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(region)))
+                .map_err(|e| {
+                    anyhow::anyhow!("failed to build Cedar context for aws_region: {e}")
+                })?,
+        ));
+    }
+
+    Ok(pairs)
+}
+
+/// Build a Cedar context for an HTTP network request.
+///
+/// Populates `host`, `path`, and `method` attributes, plus AWS-specific
+/// `aws_service` and `aws_region` when the host is an AWS endpoint.
+/// This is the canonical implementation shared by `PolicyEngine::evaluate()`
+/// and the replay engine.
+pub fn build_http_context(host: &str, path: &str, method: &str) -> anyhow::Result<Context> {
+    let pairs = build_http_context_pairs(host, path, method)?;
+    Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build HTTP context: {e}"))
+}
+
+/// Build a Cedar context for a filesystem access event.
+///
+/// Populates `path` and `operation` attributes.
+pub fn build_fs_context(path: &str, operation: &str) -> anyhow::Result<Context> {
+    let pairs: Vec<(String, RestrictedExpression)> = vec![
+        (
+            "path".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path)))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
+        ),
+        (
+            "operation".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(operation)))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for operation: {e}"))?,
+        ),
+    ];
+
+    Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build fs context: {e}"))
+}
+
+/// Build a Cedar context for a process execution event.
+///
+/// Populates `command` attribute.
+pub fn build_proc_context(command: &str) -> anyhow::Result<Context> {
+    let pairs: Vec<(String, RestrictedExpression)> = vec![(
+        "command".to_string(),
+        RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(command)))
+            .map_err(|e| anyhow::anyhow!("failed to build Cedar context for command: {e}"))?,
+    )];
+
+    Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build proc context: {e}"))
+}
+
+/// Build a Cedar context for a mount event.
+///
+/// Populates `path` and `mode` attributes.
+pub fn build_mount_context(path: &str, mode: &str) -> anyhow::Result<Context> {
+    let pairs: Vec<(String, RestrictedExpression)> = vec![
+        (
+            "path".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(path)))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for path: {e}"))?,
+        ),
+        (
+            "mode".to_string(),
+            RestrictedExpression::from_str(&format!("\"{}\"", escape_cedar_string(mode)))
+                .map_err(|e| anyhow::anyhow!("failed to build Cedar context for mode: {e}"))?,
+        ),
+    ];
+
+    Context::from_pairs(pairs).map_err(|e| anyhow::anyhow!("failed to build mount context: {e}"))
 }
 
 /// Built-in Cedar context attribute names that must not be overwritten by headers.
@@ -1602,8 +1712,8 @@ permit(
     fn proc_exec_action_entity_construction() {
         let entities = build_proc_entities("curl", "worker").unwrap();
         let count = entities.iter().count();
-        // Should have: 1 resource (proc::curl) + 1 agent + 3 proc actions = 5
-        assert_eq!(count, 5, "expected 5 proc entities, got {count}");
+        // Should have: 1 resource (proc::curl) + 1 agent + 1 proc action (proc:exec) = 3
+        assert_eq!(count, 3, "expected 3 proc entities, got {count}");
     }
 
     #[test]
@@ -2259,5 +2369,190 @@ permit(
                 result.err()
             );
         }
+    }
+
+    // --- Shared context builder tests (M-ER-9) ---
+
+    #[test]
+    fn shared_http_context_matches_evaluate_output() {
+        // Verify that the shared build_http_context produces an equivalent
+        // context to what evaluate() builds internally (same attributes).
+        // We do this by evaluating a policy that uses context.host, context.path,
+        // and context.method — if context is wrong, the policy won't match.
+        let f = write_policy(
+            r#"
+@id("match-all-context")
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource
+) when {
+    context.host == "api.github.com" &&
+    context.path == "/repos/org/repo" &&
+    context.method == "GET"
+};
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        // This exercises the shared context builder path in evaluate()
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "http:GET",
+                "/repos/org/repo",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            result.allowed,
+            "shared context builder should produce host/path/method for evaluate()"
+        );
+    }
+
+    #[test]
+    fn shared_http_context_aws_attrs_match_evaluate() {
+        // Verify AWS context attributes work through the shared builder
+        let f = write_policy(
+            r#"
+@id("match-aws-context")
+permit(
+    principal == Agent::"worker",
+    action == Action::"http:GET",
+    resource
+) when {
+    context.aws_service == "s3" &&
+    context.aws_region == "us-east-1"
+};
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let result = engine
+            .evaluate(
+                "s3.us-east-1.amazonaws.com",
+                "http:GET",
+                "/bucket",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            result.allowed,
+            "shared context builder should produce AWS attrs for evaluate()"
+        );
+    }
+
+    // --- evaluate_proc tests (M-ER-9) ---
+
+    #[test]
+    fn evaluate_proc_allows_matching_command() {
+        let f = write_policy(
+            r#"
+@id("allow-node")
+permit(
+    principal == Agent::"agent",
+    action == Action::"proc:exec",
+    resource == Resource::"proc::node index.js"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let result = engine
+            .evaluate_proc("node index.js", "proc:exec", "agent")
+            .unwrap();
+        assert!(
+            result.allowed,
+            "proc:exec should be allowed for matching command"
+        );
+        assert!(
+            result.policy_names.iter().any(|n| n.contains("allow-node")),
+            "expected allow-node policy, got {:?}",
+            result.policy_names
+        );
+    }
+
+    #[test]
+    fn evaluate_proc_denies_non_matching_command() {
+        let f = write_policy(
+            r#"
+@id("allow-node")
+permit(
+    principal == Agent::"agent",
+    action == Action::"proc:exec",
+    resource == Resource::"proc::node index.js"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let result = engine
+            .evaluate_proc("rm -rf /", "proc:exec", "agent")
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "proc:exec should be denied for non-matching command"
+        );
+    }
+
+    #[test]
+    fn evaluate_proc_context_command_condition() {
+        // Policy uses context.command to gate access
+        let f = write_policy(
+            r#"
+@id("allow-node-by-context")
+permit(
+    principal == Agent::"agent",
+    action == Action::"proc:exec",
+    resource
+) when { context.command like "node*" };
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let result = engine
+            .evaluate_proc("node index.js", "proc:exec", "agent")
+            .unwrap();
+        assert!(
+            result.allowed,
+            "proc:exec should be allowed when context.command matches"
+        );
+
+        let result = engine
+            .evaluate_proc("python script.py", "proc:exec", "agent")
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "proc:exec should be denied when context.command doesn't match"
+        );
+    }
+
+    // --- Dead entity removal tests (M-ER-9) ---
+
+    #[test]
+    fn proc_entities_do_not_include_fork_or_signal() {
+        let entities = build_proc_entities("curl", "worker").unwrap();
+        let entity_ids: Vec<String> = entities.iter().map(|e| e.uid().to_string()).collect();
+
+        // Should contain proc:exec
+        assert!(
+            entity_ids.iter().any(|id| id.contains("proc:exec")),
+            "should have proc:exec entity, got: {:?}",
+            entity_ids
+        );
+
+        // Should NOT contain proc:fork or proc:signal
+        assert!(
+            !entity_ids.iter().any(|id| id.contains("proc:fork")),
+            "should not have proc:fork entity, got: {:?}",
+            entity_ids
+        );
+        assert!(
+            !entity_ids.iter().any(|id| id.contains("proc:signal")),
+            "should not have proc:signal entity, got: {:?}",
+            entity_ids
+        );
     }
 }

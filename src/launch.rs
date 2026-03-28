@@ -166,6 +166,7 @@ pub async fn run_launch_observe(
     let exit_code = {
         let run_future = attach_and_wait(container_mgr.docker(), &container_name);
         let ctrl_c = tokio::signal::ctrl_c();
+        let sigterm = sigterm_signal();
 
         tokio::select! {
             result = run_future => {
@@ -177,6 +178,11 @@ pub async fn run_launch_observe(
                 eprintln!("\nInterrupted — cleaning up...");
                 container_mgr.stop_container().await.ok();
                 130 // Standard exit code for SIGINT
+            }
+            _ = sigterm => {
+                eprintln!("\nTerminated — cleaning up...");
+                container_mgr.stop_container().await.ok();
+                143 // Standard exit code for SIGTERM (128 + 15)
             }
         }
     };
@@ -360,6 +366,7 @@ pub async fn run_launch_with_policy(
     let exit_code = {
         let run_future = attach_and_wait(container_mgr.docker(), &container_name);
         let ctrl_c = tokio::signal::ctrl_c();
+        let sigterm = sigterm_signal();
 
         tokio::select! {
             result = run_future => {
@@ -369,6 +376,11 @@ pub async fn run_launch_with_policy(
                 eprintln!("\nInterrupted — cleaning up...");
                 container_mgr.stop_container().await.ok();
                 130
+            }
+            _ = sigterm => {
+                eprintln!("\nTerminated — cleaning up...");
+                container_mgr.stop_container().await.ok();
+                143 // Standard exit code for SIGTERM (128 + 15)
             }
         }
     };
@@ -467,6 +479,35 @@ fn build_launch_proxy_context(
         upstream_addr_override: None,
         upstream_tls_override: None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// SIGTERM signal helper
+// ---------------------------------------------------------------------------
+
+/// Return a future that completes when a SIGTERM signal is received.
+///
+/// On Unix, registers a real SIGTERM handler. On other platforms, returns
+/// a future that never completes (SIGTERM is Unix-only).
+#[cfg(unix)]
+async fn sigterm_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to register SIGTERM handler, ignoring");
+            // Never complete — effectively disables this select branch
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Non-Unix stub: SIGTERM is not supported, return a never-completing future.
+#[cfg(not(unix))]
+async fn sigterm_signal() {
+    std::future::pending::<()>().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -960,5 +1001,35 @@ permit(
             }
             other => panic!("expected NetworkRequest, got {other:?}"),
         }
+    }
+
+    // -- SIGTERM signal handler tests -----------------------------------------
+
+    /// Verify the sigterm_signal() helper completes when SIGTERM is received.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_signal_completes_on_sigterm() {
+        let handle = tokio::spawn(async {
+            sigterm_signal().await;
+        });
+
+        // Give the signal handler a moment to register
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Send SIGTERM to ourselves
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGTERM);
+        }
+
+        // The future should complete within a reasonable time
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            result.is_ok(),
+            "sigterm_signal should complete after SIGTERM"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "sigterm_signal task should not panic"
+        );
     }
 }

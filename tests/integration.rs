@@ -2905,6 +2905,347 @@ async fn mitm_content_length_body_still_works() {
     );
 }
 
+// --- H-ER-2: Input validation tests ---
+
+/// Test that a request with both Content-Length and Transfer-Encoding: chunked
+/// gets rejected with 400 Bad Request by the MITM pipeline.
+#[tokio::test]
+async fn mitm_rejects_conflicting_cl_te_headers() {
+    let ca = strait_test_helpers::generate_ca();
+    let ctx = strait_test_helpers::build_mitm_proxy_context(&ca, None);
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
+    });
+
+    // Connect to proxy and send CONNECT for a MITM host
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
+        .await
+        .unwrap();
+
+    // Read 200 Connection Established
+    let mut buf = BufReader::new(&mut client);
+    let mut response_line = String::new();
+    buf.read_line(&mut response_line).await.unwrap();
+    assert!(
+        response_line.contains("200"),
+        "Expected 200, got: {}",
+        response_line.trim()
+    );
+    loop {
+        let mut line = String::new();
+        buf.read_line(&mut line).await.unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+
+    // TLS handshake with the proxy's session CA
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut cursor = std::io::Cursor::new(ca_pem.as_bytes());
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let server_name = ServerName::try_from("api.github.com").unwrap();
+    let client_inner = buf.into_inner();
+    let mut tls = connector.connect(server_name, client_inner).await.unwrap();
+
+    // Send a request with BOTH Content-Length and Transfer-Encoding: chunked
+    tls.write_all(
+        b"POST /repos/test/repo HTTP/1.1\r\n\
+          Host: api.github.com\r\n\
+          Content-Length: 5\r\n\
+          Transfer-Encoding: chunked\r\n\
+          \r\n\
+          5\r\nhello\r\n0\r\n\r\n",
+    )
+    .await
+    .unwrap();
+
+    // Read the response — should be 400
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    assert!(
+        response_str.contains("400 Bad Request"),
+        "Expected 400 for CL/TE conflict, got: {}",
+        response_str
+    );
+    assert!(
+        response_str.contains("Conflicting Content-Length and Transfer-Encoding"),
+        "Expected CL/TE conflict message, got: {}",
+        response_str
+    );
+}
+
+/// Test that HTTP/0.9 requests are rejected with 400.
+#[tokio::test]
+async fn mitm_rejects_http_09_version() {
+    let ca = strait_test_helpers::generate_ca();
+    let ctx = strait_test_helpers::build_mitm_proxy_context(&ca, None);
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
+    });
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut buf = BufReader::new(&mut client);
+    let mut response_line = String::new();
+    buf.read_line(&mut response_line).await.unwrap();
+    assert!(response_line.contains("200"));
+    loop {
+        let mut line = String::new();
+        buf.read_line(&mut line).await.unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut cursor = std::io::Cursor::new(ca_pem.as_bytes());
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let server_name = ServerName::try_from("api.github.com").unwrap();
+    let client_inner = buf.into_inner();
+    let mut tls = connector.connect(server_name, client_inner).await.unwrap();
+
+    // Send a request with no HTTP version (HTTP/0.9 style — only 2 parts)
+    tls.write_all(b"GET /repos/test/repo\r\nHost: api.github.com\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    assert!(
+        response_str.contains("400 Bad Request"),
+        "Expected 400 for HTTP/0.9, got: {}",
+        response_str
+    );
+}
+
+/// Test that fabricated HTTP version strings (HTTP/9.9) are rejected with 400.
+#[tokio::test]
+async fn mitm_rejects_fabricated_http_version() {
+    let ca = strait_test_helpers::generate_ca();
+    let ctx = strait_test_helpers::build_mitm_proxy_context(&ca, None);
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
+    });
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut buf = BufReader::new(&mut client);
+    let mut response_line = String::new();
+    buf.read_line(&mut response_line).await.unwrap();
+    assert!(response_line.contains("200"));
+    loop {
+        let mut line = String::new();
+        buf.read_line(&mut line).await.unwrap();
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut cursor = std::io::Cursor::new(ca_pem.as_bytes());
+    for cert in rustls_pemfile::certs(&mut cursor) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let server_name = ServerName::try_from("api.github.com").unwrap();
+    let client_inner = buf.into_inner();
+    let mut tls = connector.connect(server_name, client_inner).await.unwrap();
+
+    // Send a request with fabricated HTTP version
+    tls.write_all(b"GET /repos/test/repo HTTP/9.9\r\nHost: api.github.com\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    assert!(
+        response_str.contains("400 Bad Request"),
+        "Expected 400 for HTTP/9.9, got: {}",
+        response_str
+    );
+    assert!(
+        response_str.contains("Unsupported HTTP version"),
+        "Expected version rejection message, got: {}",
+        response_str
+    );
+}
+
+/// Test that CONNECT to a non-MITM host returns 403 when policy engine is active.
+#[tokio::test]
+async fn passthrough_denied_when_policy_active() {
+    let ca = strait_test_helpers::generate_ca();
+    // Build a ProxyContext with a policy engine (using a simple allow-all policy)
+    let ctx = strait_test_helpers::build_mitm_proxy_context_with_policy(&ca);
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
+    });
+
+    // Connect and send CONNECT for a non-MITM host
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT evil.example.com:443 HTTP/1.1\r\nHost: evil.example.com:443\r\n\r\n")
+        .await
+        .unwrap();
+
+    // Read the response — should be 403
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    assert!(
+        response_str.contains("403 Forbidden"),
+        "Expected 403 for non-MITM host with policy active, got: {}",
+        response_str
+    );
+    assert!(
+        response_str.contains("passthrough_denied"),
+        "Expected passthrough_denied error, got: {}",
+        response_str
+    );
+}
+
+/// Test that CONNECT to a non-MITM host succeeds in observe mode (no policy).
+#[tokio::test]
+async fn passthrough_allowed_without_policy_engine() {
+    // Start a TCP echo server as the upstream
+    let echo_addr = start_tcp_echo_server().await;
+
+    let ca = strait_test_helpers::generate_ca();
+    // Build a ProxyContext WITHOUT a policy engine (observe mode)
+    let mut ctx = strait_test_helpers::build_mitm_proxy_context(&ca, None);
+    // Override upstream to point at the echo server
+    ctx.upstream_addr_override = Some(echo_addr);
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
+    });
+
+    // Connect and send CONNECT for a non-MITM host
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+        .await
+        .unwrap();
+
+    // Read the response — should get 200 (passthrough allowed)
+    let mut buf = BufReader::new(&mut client);
+    let mut response_line = String::new();
+    buf.read_line(&mut response_line).await.unwrap();
+    assert!(
+        response_line.contains("200"),
+        "Expected 200 for passthrough without policy, got: {}",
+        response_line.trim()
+    );
+}
+
+/// Test that CONNECT to a non-MITM host succeeds in warn-only mode even with policy.
+#[tokio::test]
+async fn passthrough_allowed_in_warn_only_mode() {
+    // Start a TCP echo server as the upstream
+    let echo_addr = start_tcp_echo_server().await;
+
+    let ca = strait_test_helpers::generate_ca();
+    // Build a ProxyContext with a policy engine BUT in warn-only mode
+    let mut ctx = strait_test_helpers::build_mitm_proxy_context_with_policy(&ca);
+    ctx.warn_only = true;
+    ctx.upstream_addr_override = Some(echo_addr);
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
+    });
+
+    // Connect and send CONNECT for a non-MITM host
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client
+        .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+        .await
+        .unwrap();
+
+    // Should get 200 (warn mode doesn't deny passthrough)
+    let mut buf = BufReader::new(&mut client);
+    let mut response_line = String::new();
+    buf.read_line(&mut response_line).await.unwrap();
+    assert!(
+        response_line.contains("200"),
+        "Expected 200 for passthrough in warn-only mode, got: {}",
+        response_line.trim()
+    );
+}
+
 /// Test helper module exposed for integration tests.
 mod strait_test_helpers {
     use super::*;
@@ -3616,6 +3957,76 @@ mod strait_test_helpers {
         }
 
         let _ = write_half.shutdown().await;
+    }
+
+    /// Build a minimal [`ProxyContext`] for testing `handle_connection` and `handle_mitm`.
+    ///
+    /// Creates a context with:
+    /// - A fresh session CA (from the provided `TestCa` — converted to a real `SessionCa`)
+    /// - `api.github.com` as the only MITM host
+    /// - No policy engine (observe mode)
+    /// - No credential store
+    /// - Optional upstream address override for the echo server
+    pub fn build_mitm_proxy_context(
+        _ca: &TestCa,
+        upstream_addr: Option<std::net::SocketAddr>,
+    ) -> strait::config::ProxyContext {
+        let session_ca = strait::ca::SessionCa::generate().unwrap();
+        let audit_logger = Arc::new(strait::audit::AuditLogger::new(None).unwrap());
+
+        strait::config::ProxyContext {
+            session_ca,
+            policy_engine: None,
+            credential_store: None,
+            audit_logger,
+            mitm_hosts: vec!["api.github.com".to_string()],
+            max_body_size: 10 * 1024 * 1024,
+            keepalive_timeout: std::time::Duration::from_secs(5),
+            startup_instant: std::time::Instant::now(),
+            identity_header: "X-Strait-Agent".to_string(),
+            identity_default: "anonymous".to_string(),
+            git_policy: None,
+            policy_config: None,
+            observation_stream: None,
+            mitm_all: false,
+            warn_only: false,
+            upstream_addr_override: upstream_addr,
+            upstream_tls_override: None,
+        }
+    }
+
+    /// Build a [`ProxyContext`] with a trivial Cedar policy engine for testing
+    /// passthrough deny behavior.
+    pub fn build_mitm_proxy_context_with_policy(_ca: &TestCa) -> strait::config::ProxyContext {
+        let session_ca = strait::ca::SessionCa::generate().unwrap();
+        let audit_logger = Arc::new(strait::audit::AuditLogger::new(None).unwrap());
+
+        // Write a trivial permit-all policy to a temp file
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("policy.cedar");
+        std::fs::write(&policy_path, "permit(principal, action, resource);\n").unwrap();
+
+        let engine = strait::policy::PolicyEngine::load(&policy_path, None).unwrap();
+
+        strait::config::ProxyContext {
+            session_ca,
+            policy_engine: Some(arc_swap::ArcSwap::from_pointee(engine)),
+            credential_store: None,
+            audit_logger,
+            mitm_hosts: vec!["api.github.com".to_string()],
+            max_body_size: 10 * 1024 * 1024,
+            keepalive_timeout: std::time::Duration::from_secs(5),
+            startup_instant: std::time::Instant::now(),
+            identity_header: "X-Strait-Agent".to_string(),
+            identity_default: "anonymous".to_string(),
+            git_policy: None,
+            policy_config: None,
+            observation_stream: None,
+            mitm_all: false,
+            warn_only: false,
+            upstream_addr_override: None,
+            upstream_tls_override: None,
+        }
     }
 
     /// Certificate verifier that accepts any certificate (for test echo server).

@@ -134,8 +134,14 @@ pub async fn run_launch_observe(
     // Build config with auto_remove=false so we can reliably capture the
     // exit code via wait_container. Docker's wait API returns status_code=0
     // for TTY containers with auto_remove=true (a Docker/bollard quirk).
-    let mut config =
-        ContainerManager::build_config(&policy, image, &command, proxy_port, Some(&ca_pem_path));
+    let mut config = ContainerManager::build_config(
+        &policy,
+        image,
+        &command,
+        proxy_port,
+        Some(&ca_pem_path),
+        &cwd,
+    )?;
     config.auto_remove = false;
 
     let container_id = container_mgr.create_container_from_config(&config).await?;
@@ -313,7 +319,8 @@ pub async fn run_launch_with_policy(
         &command,
         proxy_port,
         Some(&ca_pem_path),
-    );
+        &cwd,
+    )?;
     config.auto_remove = false;
 
     let container_id = container_mgr.create_container_from_config(&config).await?;

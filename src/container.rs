@@ -127,6 +127,79 @@ exec "$@"
 }
 
 // ---------------------------------------------------------------------------
+// Bind-mount path validation
+// ---------------------------------------------------------------------------
+
+/// Validate a filesystem path from Cedar policy for use as a Docker bind mount.
+///
+/// Prevents directory traversal attacks where paths like `/project/../../etc/shadow`
+/// could mount unintended host directories into the container.
+///
+/// Strategy:
+/// 1. Path must be absolute
+/// 2. If the path exists on disk: [`std::fs::canonicalize`] resolves symlinks and
+///    `..` components, then the canonical path is verified to be under `base_dir`
+/// 3. If the path does not exist: textual validation rejects `..` components and
+///    verifies the path starts with `base_dir`
+///
+/// Returns the validated (possibly canonicalized) path on success.
+pub fn validate_bind_mount_path(path: &str, base_dir: &std::path::Path) -> anyhow::Result<String> {
+    let p = std::path::Path::new(path);
+
+    if !p.is_absolute() {
+        warn!(path = %path, "rejecting relative bind-mount path");
+        anyhow::bail!("bind-mount path must be absolute: {path}");
+    }
+
+    // Canonicalize base_dir for reliable prefix checking.
+    // Falls back to the raw path when the base doesn't exist (e.g. in tests).
+    let canonical_base = std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
+
+    // Try filesystem-level canonicalization first (resolves symlinks and ..)
+    if let Ok(canonical) = std::fs::canonicalize(p) {
+        if canonical.starts_with(&canonical_base) {
+            return Ok(canonical.to_string_lossy().to_string());
+        }
+        warn!(
+            path = %path,
+            canonical = %canonical.display(),
+            base_dir = %canonical_base.display(),
+            "rejecting bind-mount path: resolves outside base directory"
+        );
+        anyhow::bail!(
+            "bind-mount path resolves outside base directory: {} -> {} (base: {})",
+            path,
+            canonical.display(),
+            canonical_base.display()
+        );
+    }
+
+    // Path doesn't exist on disk — fall back to textual validation.
+    for component in p.components() {
+        if component == std::path::Component::ParentDir {
+            warn!(path = %path, "rejecting bind-mount path: contains '..' component");
+            anyhow::bail!("bind-mount path contains directory traversal (..): {path}");
+        }
+    }
+
+    // Verify the path is textually under the base directory
+    if !p.starts_with(&canonical_base) {
+        warn!(
+            path = %path,
+            base_dir = %canonical_base.display(),
+            "rejecting bind-mount path: outside base directory"
+        );
+        anyhow::bail!(
+            "bind-mount path is outside base directory: {} (base: {})",
+            path,
+            canonical_base.display()
+        );
+    }
+
+    Ok(path.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // ContainerManager
 // ---------------------------------------------------------------------------
 
@@ -164,31 +237,35 @@ impl ContainerManager {
 
     /// Build a `ContainerConfig` from a Cedar-derived policy.
     ///
-    /// This is a pure function (no Docker calls) that translates permissions
-    /// into Docker bind-mounts, environment variables, and PATH entries.
+    /// Translates permissions into Docker bind-mounts, environment variables,
+    /// and PATH entries. All filesystem paths from the policy are validated
+    /// against `base_dir` to prevent directory traversal attacks (see
+    /// [`validate_bind_mount_path`]).
     ///
     /// When `ca_pem_host_path` is provided, the CA PEM file is bind-mounted
     /// into the container and a wrapper entrypoint script injects it into
-    /// the system CA bundle at startup.
+    /// the system CA bundle at startup. The CA PEM path is trusted (internally
+    /// generated) and not validated against `base_dir`.
     pub fn build_config(
         policy: &ContainerPolicy,
         image: &str,
         cmd: &[String],
         proxy_port: u16,
         ca_pem_host_path: Option<&std::path::Path>,
-    ) -> ContainerConfig {
+        base_dir: &std::path::Path,
+    ) -> anyhow::Result<ContainerConfig> {
         let mut binds = Vec::new();
         let mut extra_path_dirs: Vec<String> = Vec::new();
 
         for perm in &policy.permissions {
             match perm {
                 ContainerPermission::FsRead(path) => {
-                    // host_path:container_path:ro
-                    binds.push(format!("{path}:{path}:ro"));
+                    let validated = validate_bind_mount_path(path, base_dir)?;
+                    binds.push(format!("{validated}:{validated}:ro"));
                 }
                 ContainerPermission::FsWrite(path) => {
-                    // host_path:container_path:rw
-                    binds.push(format!("{path}:{path}:rw"));
+                    let validated = validate_bind_mount_path(path, base_dir)?;
+                    binds.push(format!("{validated}:{validated}:rw"));
                 }
                 ContainerPermission::ProcExec(binary) => {
                     // Derive the directory containing the binary and add to PATH.
@@ -247,7 +324,7 @@ impl ContainerManager {
             None
         };
 
-        ContainerConfig {
+        Ok(ContainerConfig {
             image: image.to_string(),
             cmd: cmd.to_vec(),
             env,
@@ -255,7 +332,7 @@ impl ContainerManager {
             tty: true,
             entrypoint,
             auto_remove: true,
-        }
+        })
     }
 
     /// Create a Docker container from a Cedar-derived policy.
@@ -264,10 +341,14 @@ impl ContainerManager {
     /// command configuration. The container is configured with `AutoRemove`
     /// so it is cleaned up automatically when stopped.
     ///
+    /// All filesystem paths from the policy are validated against `base_dir`
+    /// to prevent directory traversal attacks before any Docker API calls.
+    ///
     /// When `ca_pem_host_path` is provided, the Strait session CA is
     /// injected into the container's trust store via a wrapper entrypoint.
     ///
     /// Returns clear errors for:
+    /// - Bind-mount path traversal attempts
     /// - Docker daemon not running (connection failure)
     /// - Image not found (with pull suggestion)
     pub async fn create_container(
@@ -277,8 +358,10 @@ impl ContainerManager {
         cmd: &[String],
         proxy_port: u16,
         ca_pem_host_path: Option<&std::path::Path>,
+        base_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
-        let config = Self::build_config(policy, image, cmd, proxy_port, ca_pem_host_path);
+        let config =
+            Self::build_config(policy, image, cmd, proxy_port, ca_pem_host_path, base_dir)?;
         self.create_container_from_config(&config).await
     }
 
@@ -517,9 +600,15 @@ impl Drop for ContainerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn policy_with(perms: Vec<ContainerPermission>) -> ContainerPolicy {
         ContainerPolicy { permissions: perms }
+    }
+
+    /// Fake base directory for tests using non-existent `/project/...` paths.
+    fn test_base_dir() -> &'static Path {
+        Path::new("/project")
     }
 
     // -- Unit tests: Cedar policy → container config --------------------------
@@ -530,7 +619,9 @@ mod tests {
             "/project/src".to_string(),
         )]);
 
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, None);
+        let config =
+            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
+                .unwrap();
 
         assert_eq!(config.binds.len(), 1);
         assert_eq!(config.binds[0], "/project/src:/project/src:ro");
@@ -542,7 +633,9 @@ mod tests {
             "/project/out".to_string(),
         )]);
 
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, None);
+        let config =
+            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
+                .unwrap();
 
         assert_eq!(config.binds.len(), 1);
         assert_eq!(config.binds[0], "/project/out:/project/out:rw");
@@ -556,7 +649,9 @@ mod tests {
             ContainerPermission::FsRead("/project/config".to_string()),
         ]);
 
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, None);
+        let config =
+            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
+                .unwrap();
 
         assert_eq!(config.binds.len(), 3);
         assert_eq!(config.binds[0], "/project/src:/project/src:ro");
@@ -568,7 +663,9 @@ mod tests {
     fn proc_exec_bare_binary_adds_standard_path_dirs() {
         let policy = policy_with(vec![ContainerPermission::ProcExec("git".to_string())]);
 
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, None);
+        let config =
+            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
+                .unwrap();
 
         // Should have PATH with standard directories
         let path_env = config.env.iter().find(|e| e.starts_with("PATH="));
@@ -594,7 +691,9 @@ mod tests {
             "/usr/local/bin/node".to_string(),
         )]);
 
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, None);
+        let config =
+            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
+                .unwrap();
 
         let path_env = config.env.iter().find(|e| e.starts_with("PATH="));
         assert!(path_env.is_some(), "should have PATH env var");
@@ -608,7 +707,9 @@ mod tests {
     #[test]
     fn https_proxy_env_var_set_to_host() {
         let policy = policy_with(vec![]);
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, None);
+        let config =
+            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
+                .unwrap();
 
         assert!(
             config
@@ -622,7 +723,9 @@ mod tests {
     #[test]
     fn https_proxy_uses_configured_port() {
         let policy = policy_with(vec![]);
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 9999, None);
+        let config =
+            ContainerManager::build_config(&policy, "node:20", &[], 9999, None, test_base_dir())
+                .unwrap();
 
         assert!(
             config
@@ -637,7 +740,15 @@ mod tests {
     fn config_includes_image_and_cmd() {
         let policy = policy_with(vec![]);
         let cmd = vec!["npm".to_string(), "test".to_string()];
-        let config = ContainerManager::build_config(&policy, "node:20-slim", &cmd, 8080, None);
+        let config = ContainerManager::build_config(
+            &policy,
+            "node:20-slim",
+            &cmd,
+            8080,
+            None,
+            test_base_dir(),
+        )
+        .unwrap();
 
         assert_eq!(config.image, "node:20-slim");
         assert_eq!(config.cmd, vec!["npm", "test"]);
@@ -646,14 +757,18 @@ mod tests {
     #[test]
     fn tty_enabled_by_default() {
         let policy = policy_with(vec![]);
-        let config = ContainerManager::build_config(&policy, "alpine", &[], 8080, None);
+        let config =
+            ContainerManager::build_config(&policy, "alpine", &[], 8080, None, test_base_dir())
+                .unwrap();
         assert!(config.tty, "TTY should be enabled");
     }
 
     #[test]
     fn empty_policy_produces_no_binds() {
         let policy = policy_with(vec![]);
-        let config = ContainerManager::build_config(&policy, "alpine", &[], 8080, None);
+        let config =
+            ContainerManager::build_config(&policy, "alpine", &[], 8080, None, test_base_dir())
+                .unwrap();
         assert!(config.binds.is_empty(), "empty policy should have no binds");
     }
 
@@ -665,7 +780,9 @@ mod tests {
             ContainerPermission::ProcExec("node".to_string()),
         ]);
 
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, None);
+        let config =
+            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
+                .unwrap();
 
         let path_env = config.env.iter().find(|e| e.starts_with("PATH="));
         assert!(path_env.is_some());
@@ -688,7 +805,9 @@ mod tests {
         ]);
 
         let cmd = vec!["bash".to_string(), "-c".to_string(), "npm test".to_string()];
-        let config = ContainerManager::build_config(&policy, "node:20", &cmd, 8080, None);
+        let config =
+            ContainerManager::build_config(&policy, "node:20", &cmd, 8080, None, test_base_dir())
+                .unwrap();
 
         // Check binds
         assert_eq!(config.binds.len(), 2);
@@ -785,8 +904,16 @@ mod tests {
     #[test]
     fn build_config_with_ca_adds_bind_mount() {
         let policy = policy_with(vec![]);
-        let ca_path = std::path::Path::new("/tmp/test-ca.pem");
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, Some(ca_path));
+        let ca_path = Path::new("/tmp/test-ca.pem");
+        let config = ContainerManager::build_config(
+            &policy,
+            "node:20",
+            &[],
+            8080,
+            Some(ca_path),
+            test_base_dir(),
+        )
+        .unwrap();
 
         assert!(
             config
@@ -800,8 +927,16 @@ mod tests {
     #[test]
     fn build_config_with_ca_sets_trust_env_vars() {
         let policy = policy_with(vec![]);
-        let ca_path = std::path::Path::new("/tmp/test-ca.pem");
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, Some(ca_path));
+        let ca_path = Path::new("/tmp/test-ca.pem");
+        let config = ContainerManager::build_config(
+            &policy,
+            "node:20",
+            &[],
+            8080,
+            Some(ca_path),
+            test_base_dir(),
+        )
+        .unwrap();
 
         assert!(
             config
@@ -829,8 +964,16 @@ mod tests {
     #[test]
     fn build_config_with_ca_sets_entrypoint() {
         let policy = policy_with(vec![]);
-        let ca_path = std::path::Path::new("/tmp/test-ca.pem");
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, Some(ca_path));
+        let ca_path = Path::new("/tmp/test-ca.pem");
+        let config = ContainerManager::build_config(
+            &policy,
+            "node:20",
+            &[],
+            8080,
+            Some(ca_path),
+            test_base_dir(),
+        )
+        .unwrap();
 
         let ep = config.entrypoint.as_ref().expect("should have entrypoint");
         assert_eq!(ep[0], "/bin/sh");
@@ -845,7 +988,9 @@ mod tests {
     #[test]
     fn build_config_without_ca_has_no_entrypoint() {
         let policy = policy_with(vec![]);
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, None);
+        let config =
+            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
+                .unwrap();
 
         assert!(
             config.entrypoint.is_none(),
@@ -856,7 +1001,9 @@ mod tests {
     #[test]
     fn build_config_without_ca_has_no_trust_env_vars() {
         let policy = policy_with(vec![]);
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, None);
+        let config =
+            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
+                .unwrap();
 
         assert!(
             !config.env.iter().any(|e| e.starts_with("SSL_CERT_FILE=")),
@@ -884,8 +1031,16 @@ mod tests {
             ContainerPermission::FsRead("/project/src".to_string()),
             ContainerPermission::FsWrite("/project/out".to_string()),
         ]);
-        let ca_path = std::path::Path::new("/tmp/test-ca.pem");
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, Some(ca_path));
+        let ca_path = Path::new("/tmp/test-ca.pem");
+        let config = ContainerManager::build_config(
+            &policy,
+            "node:20",
+            &[],
+            8080,
+            Some(ca_path),
+            test_base_dir(),
+        )
+        .unwrap();
 
         // Should have policy binds + CA bind
         assert_eq!(
@@ -908,8 +1063,16 @@ mod tests {
     #[test]
     fn build_config_with_ca_preserves_proxy_env() {
         let policy = policy_with(vec![]);
-        let ca_path = std::path::Path::new("/tmp/test-ca.pem");
-        let config = ContainerManager::build_config(&policy, "node:20", &[], 8080, Some(ca_path));
+        let ca_path = Path::new("/tmp/test-ca.pem");
+        let config = ContainerManager::build_config(
+            &policy,
+            "node:20",
+            &[],
+            8080,
+            Some(ca_path),
+            test_base_dir(),
+        )
+        .unwrap();
 
         assert!(
             config
@@ -917,6 +1080,170 @@ mod tests {
                 .contains(&"HTTPS_PROXY=http://host.docker.internal:8080".to_string()),
             "HTTPS_PROXY should still be set with CA injection: {:?}",
             config.env
+        );
+    }
+
+    // -- Unit tests: bind-mount path validation (H-ER-3) ----------------------
+
+    #[test]
+    fn traversal_path_is_rejected() {
+        let result =
+            validate_bind_mount_path("/project/../../../etc/shadow", Path::new("/project"));
+        assert!(result.is_err(), "path with .. should be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("directory traversal") || err_msg.contains(".."),
+            "error should mention traversal: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn single_dotdot_component_is_rejected() {
+        let result = validate_bind_mount_path("/project/src/../secret", Path::new("/project"));
+        assert!(result.is_err(), "path with single .. should be rejected");
+    }
+
+    #[test]
+    fn relative_path_is_rejected() {
+        let result = validate_bind_mount_path("project/src", Path::new("/project"));
+        assert!(result.is_err(), "relative path should be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("absolute"),
+            "error should mention absolute: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn symlink_outside_base_is_rejected() {
+        // Create a temp directory structure:
+        //   base_dir/
+        //   base_dir/link -> /tmp  (points outside base)
+        let temp = tempfile::TempDir::new().unwrap();
+        let base_dir = temp.path().join("base");
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let link_path = base_dir.join("link");
+
+        #[cfg(unix)]
+        {
+            // Create a symlink pointing to /tmp (outside base)
+            std::os::unix::fs::symlink("/tmp", &link_path).unwrap();
+
+            let result = validate_bind_mount_path(&link_path.to_string_lossy(), &base_dir);
+            assert!(
+                result.is_err(),
+                "symlink pointing outside base should be rejected"
+            );
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("outside base directory"),
+                "error should mention base directory: {err_msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonexistent_path_with_clean_components_passes() {
+        let result =
+            validate_bind_mount_path("/project/nonexistent/deep/path", Path::new("/project"));
+        assert!(
+            result.is_ok(),
+            "non-existent clean path should pass: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap(), "/project/nonexistent/deep/path");
+    }
+
+    #[test]
+    fn valid_existing_path_inside_base_is_accepted() {
+        // Create a real directory structure and validate a path inside it
+        let temp = tempfile::TempDir::new().unwrap();
+        let sub_dir = temp.path().join("subdir");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let result = validate_bind_mount_path(&sub_dir.to_string_lossy(), temp.path());
+        assert!(
+            result.is_ok(),
+            "valid path inside base should be accepted: {:?}",
+            result.err()
+        );
+        // Canonical path should be returned
+        let validated = result.unwrap();
+        let canonical = std::fs::canonicalize(&sub_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(validated, canonical);
+    }
+
+    #[test]
+    fn path_outside_base_dir_is_rejected() {
+        let result = validate_bind_mount_path("/etc/shadow", Path::new("/project"));
+        assert!(result.is_err(), "path outside base dir should be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("outside base directory"),
+            "error should mention base directory: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_traversal_in_fs_read() {
+        let policy = policy_with(vec![ContainerPermission::FsRead(
+            "/project/../../../etc/shadow".to_string(),
+        )]);
+
+        let result = ContainerManager::build_config(
+            &policy,
+            "node:20",
+            &[],
+            8080,
+            None,
+            Path::new("/project"),
+        );
+        assert!(result.is_err(), "build_config should reject traversal path");
+    }
+
+    #[test]
+    fn build_config_rejects_traversal_in_fs_write() {
+        let policy = policy_with(vec![ContainerPermission::FsWrite(
+            "/project/../../etc/passwd".to_string(),
+        )]);
+
+        let result = ContainerManager::build_config(
+            &policy,
+            "node:20",
+            &[],
+            8080,
+            None,
+            Path::new("/project"),
+        );
+        assert!(
+            result.is_err(),
+            "build_config should reject traversal in write path"
+        );
+    }
+
+    #[test]
+    fn build_config_accepts_valid_paths() {
+        let policy = policy_with(vec![
+            ContainerPermission::FsRead("/project/src".to_string()),
+            ContainerPermission::FsWrite("/project/out".to_string()),
+        ]);
+
+        let result = ContainerManager::build_config(
+            &policy,
+            "node:20",
+            &[],
+            8080,
+            None,
+            Path::new("/project"),
+        );
+        assert!(
+            result.is_ok(),
+            "build_config should accept valid paths: {:?}",
+            result.err()
         );
     }
 }

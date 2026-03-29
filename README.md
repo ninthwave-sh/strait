@@ -1,5 +1,7 @@
 # strait
 
+> **Early development.** Strait is pre-v1, under active development, and not yet distributed or stable. APIs, config formats, and CLI flags will change. Not recommended for production use.
+
 Policy platform for AI agents. One Cedar policy governs network access, filesystem isolation, and process control. The agent never sees real credentials.
 
 ## The problem

@@ -5,37 +5,24 @@
 //! - `fs:write` policies map to read-write bind-mounts
 //! - `proc:exec` policies map to binaries available on the container PATH
 //!
-//! Network traffic routes through the host proxy via `HTTPS_PROXY`,
-//! `HTTP_PROXY`, `https_proxy`, and `http_proxy` environment variables
-//! pointing to `host.docker.internal:<port>`. All four variants are set
-//! because different tools check different casings.
+//! # Security Model: Network Isolation
 //!
-//! # Security Model: Cooperative Network Enforcement
+//! Containers run with `--network=none` (no network interfaces). All
+//! outbound traffic is forced through the Strait proxy via a bind-mounted
+//! Unix socket and the `strait-gateway` binary:
 //!
-//! **Network enforcement is cooperative, not enforced at the network layer.**
-//! The container's outbound traffic is routed through the Strait proxy via
-//! the `HTTPS_PROXY` / `HTTP_PROXY` environment variables, but these are
-//! advisory — programs inside the container are free to ignore them and
-//! connect to arbitrary IP addresses directly.
+//! 1. The proxy Unix socket is bind-mounted into the container at
+//!    `/strait/proxy.sock`.
+//! 2. The `strait-gateway` binary is bind-mounted at
+//!    `/strait/gateway/strait-gateway`. It listens on `127.0.0.1:3128`
+//!    and forwards TCP connections to the Unix socket.
+//! 3. `HTTPS_PROXY` / `HTTP_PROXY` env vars point to `http://127.0.0.1:3128`.
+//! 4. The gateway runs as the outermost entrypoint, wrapping the CA trust
+//!    injection and the user command.
 //!
-//! This means:
-//! - **Observe mode**: All traffic the agent voluntarily sends through the
-//!   proxy is recorded. Direct connections bypass observation entirely.
-//! - **Warn mode**: Cedar policy violations are logged as warnings, but only
-//!   for traffic that goes through the proxy. Direct connections are invisible.
-//! - **Enforce mode**: Cedar policy blocks disallowed traffic through the
-//!   proxy, but a container process that resolves hostnames itself and opens
-//!   direct TCP connections can bypass policy enforcement entirely.
-//!
-//! Docker's default bridge network provides full outbound internet access.
-//! There are no `iptables` rules, network namespace restrictions, or DNS
-//! interception preventing direct connections in v0.3.
-//!
-//! **v0.4 hardening plan**: Network-level enforcement via `--network=none`
-//! (zero network interfaces) + proxy access through a bind-mounted Unix
-//! socket. A small init wrapper inside the container bridges TCP to the
-//! socket, and `HTTPS_PROXY` points to the wrapper. This makes bypass
-//! impossible — there are no network interfaces to connect through.
+//! Because there are no network interfaces, a process inside the container
+//! cannot bypass the proxy by connecting to arbitrary IP addresses. All
+//! outbound traffic must traverse the gateway and the host proxy.
 
 use anyhow::Context as _;
 use bollard::container::{
@@ -84,14 +71,15 @@ pub struct ContainerConfig {
     pub image: String,
     /// Command to execute inside the container.
     pub cmd: Vec<String>,
-    /// Environment variables to set (e.g. `"HTTPS_PROXY=http://host.docker.internal:8080"`).
+    /// Environment variables to set (e.g. `"HTTPS_PROXY=http://127.0.0.1:3128"`).
     /// All four proxy variants (HTTPS_PROXY, HTTP_PROXY, https_proxy, http_proxy) are set.
     pub env: Vec<String>,
     /// Bind-mount strings in Docker format: `"host_path:container_path:ro"` or `":rw"`.
     pub binds: Vec<String>,
     /// Whether to attach a TTY.
     pub tty: bool,
-    /// Optional entrypoint override (e.g. for CA trust injection wrapper).
+    /// Entrypoint override. Always set by `build_config` to the gateway-based
+    /// entrypoint chain (gateway -> CA trust injection -> user command).
     pub entrypoint: Option<Vec<String>>,
     /// Whether Docker should auto-remove the container after it exits.
     ///
@@ -99,6 +87,8 @@ pub struct ContainerConfig {
     /// to inspect the container after exit (e.g., to read the exit code
     /// reliably via `wait_container`).
     pub auto_remove: bool,
+    /// Docker network mode. Set to `"none"` for network isolation.
+    pub network_mode: Option<String>,
 }
 
 /// Default graceful shutdown timeout (seconds) before force-killing.
@@ -109,6 +99,15 @@ const CONTAINER_CA_PEM_PATH: &str = "/strait/ca.pem";
 
 /// Path for the augmented CA bundle created at container startup.
 const CONTAINER_CA_BUNDLE_PATH: &str = "/tmp/strait-ca-bundle.pem";
+
+/// Path where the proxy Unix socket is bind-mounted inside the container.
+const CONTAINER_PROXY_SOCKET_PATH: &str = "/strait/proxy.sock";
+
+/// Path where the gateway binary is bind-mounted inside the container.
+const CONTAINER_GATEWAY_PATH: &str = "/strait/gateway/strait-gateway";
+
+/// Address the gateway listens on inside the container.
+const GATEWAY_LISTEN_ADDR: &str = "127.0.0.1:3128";
 
 /// Generate the shell entrypoint script that injects the Strait session CA
 /// into the container's trust store at startup.
@@ -274,15 +273,24 @@ impl ContainerManager {
     /// against `base_dir` to prevent directory traversal attacks (see
     /// [`validate_bind_mount_path`]).
     ///
+    /// The container runs with `--network=none` for network isolation. The
+    /// proxy Unix socket and gateway binary are bind-mounted into the
+    /// container. The gateway listens on `127.0.0.1:3128` and forwards
+    /// connections to the host proxy over the Unix socket.
+    ///
     /// When `ca_pem_host_path` is provided, the CA PEM file is bind-mounted
     /// into the container and a wrapper entrypoint script injects it into
-    /// the system CA bundle at startup. The CA PEM path is trusted (internally
+    /// the system CA bundle at startup. The entrypoint chain is:
+    /// gateway -> CA trust injection -> user command.
+    ///
+    /// The proxy socket and gateway binary paths are trusted (internally
     /// generated) and not validated against `base_dir`.
     pub fn build_config(
         policy: &ContainerPolicy,
         image: &str,
         cmd: &[String],
-        proxy_port: u16,
+        proxy_socket_host_path: &std::path::Path,
+        gateway_binary_host_path: &std::path::Path,
         ca_pem_host_path: Option<&std::path::Path>,
         base_dir: &std::path::Path,
     ) -> anyhow::Result<ContainerConfig> {
@@ -322,10 +330,25 @@ impl ContainerManager {
             }
         }
 
+        // Bind-mount proxy socket and gateway binary for network isolation.
+        // The proxy socket connects the in-container gateway to the host proxy.
+        // The gateway binary bridges TCP (127.0.0.1:3128) to the Unix socket.
+        binds.push(format!(
+            "{}:{}",
+            proxy_socket_host_path.display(),
+            CONTAINER_PROXY_SOCKET_PATH,
+        ));
+        binds.push(format!(
+            "{}:{}:ro",
+            gateway_binary_host_path.display(),
+            CONTAINER_GATEWAY_PATH,
+        ));
+
         // Build environment variables.
-        // Set all four proxy env var variants — different tools check different
-        // casings (e.g. curl checks http_proxy, Python checks HTTP_PROXY, etc.).
-        let proxy_url = format!("http://host.docker.internal:{proxy_port}");
+        // Proxy env vars point to the in-container gateway (127.0.0.1:3128).
+        // All four variants are set because different tools check different
+        // casings (e.g. curl checks http_proxy, Python checks HTTP_PROXY).
+        let proxy_url = format!("http://{GATEWAY_LISTEN_ADDR}");
         let mut env = vec![
             format!("HTTPS_PROXY={proxy_url}"),
             format!("HTTP_PROXY={proxy_url}"),
@@ -339,8 +362,8 @@ impl ContainerManager {
             env.push(format!("PATH={path_value}"));
         }
 
-        // CA trust injection: bind-mount the CA PEM, set env vars, wrap entrypoint
-        let entrypoint = if let Some(host_path) = ca_pem_host_path {
+        // CA trust injection: bind-mount the CA PEM, set env vars
+        let ca_script = if let Some(host_path) = ca_pem_host_path {
             binds.push(format!(
                 "{}:{}:ro",
                 host_path.display(),
@@ -351,16 +374,29 @@ impl ContainerManager {
             env.push(format!("NODE_EXTRA_CA_CERTS={CONTAINER_CA_BUNDLE_PATH}"));
             env.push(format!("REQUESTS_CA_BUNDLE={CONTAINER_CA_BUNDLE_PATH}"));
 
-            let script = generate_ca_entrypoint_script();
-            Some(vec![
+            Some(generate_ca_entrypoint_script())
+        } else {
+            None
+        };
+
+        // Build entrypoint chain: gateway -> [CA trust injection ->] user command.
+        // The gateway is always the outermost wrapper. It listens on
+        // 127.0.0.1:3128, forwarding to the proxy socket, then spawns the
+        // child command (everything after `--`).
+        let mut entrypoint = vec![
+            CONTAINER_GATEWAY_PATH.to_string(),
+            "--socket".to_string(),
+            CONTAINER_PROXY_SOCKET_PATH.to_string(),
+            "--".to_string(),
+        ];
+        if let Some(script) = ca_script {
+            entrypoint.extend([
                 "/bin/sh".to_string(),
                 "-c".to_string(),
                 script,
                 "--".to_string(),
-            ])
-        } else {
-            None
-        };
+            ]);
+        }
 
         Ok(ContainerConfig {
             image: image.to_string(),
@@ -368,16 +404,17 @@ impl ContainerManager {
             env,
             binds,
             tty: true,
-            entrypoint,
+            entrypoint: Some(entrypoint),
             auto_remove: true,
+            network_mode: Some("none".to_string()),
         })
     }
 
     /// Create a Docker container from a Cedar-derived policy.
     ///
     /// Translates the policy into bind-mounts, environment variables, and
-    /// command configuration. The container is configured with `AutoRemove`
-    /// so it is cleaned up automatically when stopped.
+    /// command configuration. The container runs with `--network=none` and
+    /// uses the gateway binary for proxy access via the Unix socket.
     ///
     /// All filesystem paths from the policy are validated against `base_dir`
     /// to prevent directory traversal attacks before any Docker API calls.
@@ -389,17 +426,26 @@ impl ContainerManager {
     /// - Bind-mount path traversal attempts
     /// - Docker daemon not running (connection failure)
     /// - Image not found (with pull suggestion)
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_container(
         &mut self,
         policy: &ContainerPolicy,
         image: &str,
         cmd: &[String],
-        proxy_port: u16,
+        proxy_socket_host_path: &std::path::Path,
+        gateway_binary_host_path: &std::path::Path,
         ca_pem_host_path: Option<&std::path::Path>,
         base_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
-        let config =
-            Self::build_config(policy, image, cmd, proxy_port, ca_pem_host_path, base_dir)?;
+        let config = Self::build_config(
+            policy,
+            image,
+            cmd,
+            proxy_socket_host_path,
+            gateway_binary_host_path,
+            ca_pem_host_path,
+            base_dir,
+        )?;
         self.create_container_from_config(&config).await
     }
 
@@ -446,6 +492,7 @@ impl ContainerManager {
                 Some(config.binds.clone())
             },
             auto_remove: Some(config.auto_remove),
+            network_mode: config.network_mode.clone(),
             ..Default::default()
         };
 
@@ -715,7 +762,97 @@ mod tests {
         Path::new("/project")
     }
 
-    // -- Unit tests: Cedar policy → container config --------------------------
+    /// Fake proxy socket path for tests.
+    fn test_proxy_socket() -> &'static Path {
+        Path::new("/tmp/test-proxy.sock")
+    }
+
+    /// Fake gateway binary path for tests.
+    fn test_gateway_binary() -> &'static Path {
+        Path::new("/usr/local/bin/strait-gateway")
+    }
+
+    /// Helper: call build_config with test proxy socket and gateway binary.
+    fn build_test_config(
+        policy: &ContainerPolicy,
+        image: &str,
+        cmd: &[String],
+        ca_pem_host_path: Option<&Path>,
+        base_dir: &Path,
+    ) -> anyhow::Result<ContainerConfig> {
+        ContainerManager::build_config(
+            policy,
+            image,
+            cmd,
+            test_proxy_socket(),
+            test_gateway_binary(),
+            ca_pem_host_path,
+            base_dir,
+        )
+    }
+
+    // -- Unit tests: network isolation ------------------------------------------
+
+    #[test]
+    fn network_mode_is_none() {
+        let policy = policy_with(vec![]);
+        let config = build_test_config(&policy, "alpine", &[], None, test_base_dir()).unwrap();
+        assert_eq!(
+            config.network_mode.as_deref(),
+            Some("none"),
+            "container must use --network=none"
+        );
+    }
+
+    #[test]
+    fn proxy_socket_is_bind_mounted() {
+        let policy = policy_with(vec![]);
+        let config = build_test_config(&policy, "alpine", &[], None, test_base_dir()).unwrap();
+        let expected = format!(
+            "{}:{}",
+            test_proxy_socket().display(),
+            CONTAINER_PROXY_SOCKET_PATH,
+        );
+        assert!(
+            config.binds.contains(&expected),
+            "should bind-mount proxy socket: {:?}",
+            config.binds
+        );
+    }
+
+    #[test]
+    fn gateway_binary_is_bind_mounted() {
+        let policy = policy_with(vec![]);
+        let config = build_test_config(&policy, "alpine", &[], None, test_base_dir()).unwrap();
+        let expected = format!(
+            "{}:{}:ro",
+            test_gateway_binary().display(),
+            CONTAINER_GATEWAY_PATH,
+        );
+        assert!(
+            config.binds.contains(&expected),
+            "should bind-mount gateway binary: {:?}",
+            config.binds
+        );
+    }
+
+    #[test]
+    fn proxy_env_vars_point_to_gateway() {
+        let policy = policy_with(vec![]);
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
+
+        let proxy_url = format!("http://{GATEWAY_LISTEN_ADDR}");
+        for var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
+            let expected = format!("{var}={proxy_url}");
+            assert!(
+                config.env.contains(&expected),
+                "should have {var} pointing to gateway: {:?}",
+                config.env
+            );
+        }
+    }
+
+    // -- Unit tests: Cedar policy -> container config --------------------------
 
     #[test]
     fn fs_read_produces_readonly_bind_mount() {
@@ -723,12 +860,15 @@ mod tests {
             "/project/src".to_string(),
         )]);
 
-        let config =
-            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
-                .unwrap();
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
 
-        assert_eq!(config.binds.len(), 1);
-        assert_eq!(config.binds[0], "/project/src:/project/src:ro");
+        assert!(
+            config
+                .binds
+                .contains(&"/project/src:/project/src:ro".to_string()),
+            "should have read-only bind mount: {:?}",
+            config.binds
+        );
     }
 
     #[test]
@@ -737,12 +877,15 @@ mod tests {
             "/project/out".to_string(),
         )]);
 
-        let config =
-            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
-                .unwrap();
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
 
-        assert_eq!(config.binds.len(), 1);
-        assert_eq!(config.binds[0], "/project/out:/project/out:rw");
+        assert!(
+            config
+                .binds
+                .contains(&"/project/out:/project/out:rw".to_string()),
+            "should have read-write bind mount: {:?}",
+            config.binds
+        );
     }
 
     #[test]
@@ -753,23 +896,24 @@ mod tests {
             ContainerPermission::FsRead("/project/config".to_string()),
         ]);
 
-        let config =
-            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
-                .unwrap();
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
 
-        assert_eq!(config.binds.len(), 3);
-        assert_eq!(config.binds[0], "/project/src:/project/src:ro");
-        assert_eq!(config.binds[1], "/project/out:/project/out:rw");
-        assert_eq!(config.binds[2], "/project/config:/project/config:ro");
+        assert!(config
+            .binds
+            .contains(&"/project/src:/project/src:ro".to_string()));
+        assert!(config
+            .binds
+            .contains(&"/project/out:/project/out:rw".to_string()));
+        assert!(config
+            .binds
+            .contains(&"/project/config:/project/config:ro".to_string()));
     }
 
     #[test]
     fn proc_exec_bare_binary_adds_standard_path_dirs() {
         let policy = policy_with(vec![ContainerPermission::ProcExec("git".to_string())]);
 
-        let config =
-            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
-                .unwrap();
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
 
         // Should have PATH with standard directories
         let path_env = config.env.iter().find(|e| e.starts_with("PATH="));
@@ -795,9 +939,7 @@ mod tests {
             "/usr/local/bin/node".to_string(),
         )]);
 
-        let config =
-            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
-                .unwrap();
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
 
         let path_env = config.env.iter().find(|e| e.starts_with("PATH="));
         assert!(path_env.is_some(), "should have PATH env var");
@@ -809,54 +951,11 @@ mod tests {
     }
 
     #[test]
-    fn all_proxy_env_vars_set_to_host() {
-        let policy = policy_with(vec![]);
-        let config =
-            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
-                .unwrap();
-
-        let proxy_url = "http://host.docker.internal:8080";
-        for var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
-            let expected = format!("{var}={proxy_url}");
-            assert!(
-                config.env.contains(&expected),
-                "should have {var} env var: {:?}",
-                config.env
-            );
-        }
-    }
-
-    #[test]
-    fn all_proxy_vars_use_configured_port() {
-        let policy = policy_with(vec![]);
-        let config =
-            ContainerManager::build_config(&policy, "node:20", &[], 9999, None, test_base_dir())
-                .unwrap();
-
-        let proxy_url = "http://host.docker.internal:9999";
-        for var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
-            let expected = format!("{var}={proxy_url}");
-            assert!(
-                config.env.contains(&expected),
-                "{var} should use port 9999: {:?}",
-                config.env
-            );
-        }
-    }
-
-    #[test]
     fn config_includes_image_and_cmd() {
         let policy = policy_with(vec![]);
         let cmd = vec!["npm".to_string(), "test".to_string()];
-        let config = ContainerManager::build_config(
-            &policy,
-            "node:20-slim",
-            &cmd,
-            8080,
-            None,
-            test_base_dir(),
-        )
-        .unwrap();
+        let config =
+            build_test_config(&policy, "node:20-slim", &cmd, None, test_base_dir()).unwrap();
 
         assert_eq!(config.image, "node:20-slim");
         assert_eq!(config.cmd, vec!["npm", "test"]);
@@ -865,19 +964,21 @@ mod tests {
     #[test]
     fn tty_enabled_by_default() {
         let policy = policy_with(vec![]);
-        let config =
-            ContainerManager::build_config(&policy, "alpine", &[], 8080, None, test_base_dir())
-                .unwrap();
+        let config = build_test_config(&policy, "alpine", &[], None, test_base_dir()).unwrap();
         assert!(config.tty, "TTY should be enabled");
     }
 
     #[test]
-    fn empty_policy_produces_no_binds() {
+    fn empty_policy_has_gateway_binds_only() {
         let policy = policy_with(vec![]);
-        let config =
-            ContainerManager::build_config(&policy, "alpine", &[], 8080, None, test_base_dir())
-                .unwrap();
-        assert!(config.binds.is_empty(), "empty policy should have no binds");
+        let config = build_test_config(&policy, "alpine", &[], None, test_base_dir()).unwrap();
+        // Should have exactly the proxy socket + gateway binary binds
+        assert_eq!(
+            config.binds.len(),
+            2,
+            "empty policy should have proxy socket + gateway binary binds only: {:?}",
+            config.binds
+        );
     }
 
     #[test]
@@ -888,15 +989,13 @@ mod tests {
             ContainerPermission::ProcExec("node".to_string()),
         ]);
 
-        let config =
-            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
-                .unwrap();
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
 
         let path_env = config.env.iter().find(|e| e.starts_with("PATH="));
         assert!(path_env.is_some());
         let path_value = path_env.unwrap().strip_prefix("PATH=").unwrap();
 
-        // Count occurrences of /usr/bin — should appear only once
+        // Count occurrences of /usr/bin -- should appear only once
         let usr_bin_count = path_value.split(':').filter(|d| *d == "/usr/bin").count();
         assert_eq!(
             usr_bin_count, 1,
@@ -913,12 +1012,9 @@ mod tests {
         ]);
 
         let cmd = vec!["bash".to_string(), "-c".to_string(), "npm test".to_string()];
-        let config =
-            ContainerManager::build_config(&policy, "node:20", &cmd, 8080, None, test_base_dir())
-                .unwrap();
+        let config = build_test_config(&policy, "node:20", &cmd, None, test_base_dir()).unwrap();
 
-        // Check binds
-        assert_eq!(config.binds.len(), 2);
+        // Check policy binds are present
         assert!(config
             .binds
             .contains(&"/project/src:/project/src:ro".to_string()));
@@ -926,8 +1022,8 @@ mod tests {
             .binds
             .contains(&"/project/out:/project/out:rw".to_string()));
 
-        // Check all proxy env vars
-        let proxy_url = "http://host.docker.internal:8080";
+        // Check proxy env vars point to gateway
+        let proxy_url = format!("http://{GATEWAY_LISTEN_ADDR}");
         for var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
             assert!(
                 config.env.contains(&format!("{var}={proxy_url}")),
@@ -944,8 +1040,13 @@ mod tests {
         assert_eq!(config.image, "node:20");
         assert_eq!(config.cmd, vec!["bash", "-c", "npm test"]);
 
-        // Check TTY
+        // Check TTY and network mode
         assert!(config.tty);
+        assert_eq!(config.network_mode.as_deref(), Some("none"));
+
+        // Check gateway entrypoint
+        let ep = config.entrypoint.as_ref().expect("should have entrypoint");
+        assert_eq!(ep[0], CONTAINER_GATEWAY_PATH);
     }
 
     // -- Unit tests: CA trust injection ----------------------------------------
@@ -1018,15 +1119,8 @@ mod tests {
     fn build_config_with_ca_adds_bind_mount() {
         let policy = policy_with(vec![]);
         let ca_path = Path::new("/tmp/test-ca.pem");
-        let config = ContainerManager::build_config(
-            &policy,
-            "node:20",
-            &[],
-            8080,
-            Some(ca_path),
-            test_base_dir(),
-        )
-        .unwrap();
+        let config =
+            build_test_config(&policy, "node:20", &[], Some(ca_path), test_base_dir()).unwrap();
 
         assert!(
             config
@@ -1041,15 +1135,8 @@ mod tests {
     fn build_config_with_ca_sets_trust_env_vars() {
         let policy = policy_with(vec![]);
         let ca_path = Path::new("/tmp/test-ca.pem");
-        let config = ContainerManager::build_config(
-            &policy,
-            "node:20",
-            &[],
-            8080,
-            Some(ca_path),
-            test_base_dir(),
-        )
-        .unwrap();
+        let config =
+            build_test_config(&policy, "node:20", &[], Some(ca_path), test_base_dir()).unwrap();
 
         assert!(
             config
@@ -1075,48 +1162,45 @@ mod tests {
     }
 
     #[test]
-    fn build_config_with_ca_sets_entrypoint() {
+    fn build_config_with_ca_entrypoint_has_gateway_then_ca() {
         let policy = policy_with(vec![]);
         let ca_path = Path::new("/tmp/test-ca.pem");
-        let config = ContainerManager::build_config(
-            &policy,
-            "node:20",
-            &[],
-            8080,
-            Some(ca_path),
-            test_base_dir(),
-        )
-        .unwrap();
+        let config =
+            build_test_config(&policy, "node:20", &[], Some(ca_path), test_base_dir()).unwrap();
 
         let ep = config.entrypoint.as_ref().expect("should have entrypoint");
-        assert_eq!(ep[0], "/bin/sh");
-        assert_eq!(ep[1], "-c");
+        // Gateway is the outermost wrapper
+        assert_eq!(ep[0], CONTAINER_GATEWAY_PATH);
+        assert_eq!(ep[1], "--socket");
+        assert_eq!(ep[2], CONTAINER_PROXY_SOCKET_PATH);
+        assert_eq!(ep[3], "--");
+        // Then CA trust injection
+        assert_eq!(ep[4], "/bin/sh");
+        assert_eq!(ep[5], "-c");
         assert!(
-            ep[2].contains("exec \"$@\""),
-            "entrypoint script should exec original command"
+            ep[6].contains("exec \"$@\""),
+            "CA script should exec original command"
         );
-        assert_eq!(ep[3], "--", "entrypoint should end with -- separator");
+        assert_eq!(ep[7], "--", "CA script should end with -- separator");
     }
 
     #[test]
-    fn build_config_without_ca_has_no_entrypoint() {
+    fn build_config_without_ca_has_gateway_only_entrypoint() {
         let policy = policy_with(vec![]);
-        let config =
-            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
-                .unwrap();
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
 
-        assert!(
-            config.entrypoint.is_none(),
-            "should not have entrypoint without CA"
-        );
+        let ep = config.entrypoint.as_ref().expect("should have entrypoint");
+        assert_eq!(ep.len(), 4, "gateway-only entrypoint: {:?}", ep);
+        assert_eq!(ep[0], CONTAINER_GATEWAY_PATH);
+        assert_eq!(ep[1], "--socket");
+        assert_eq!(ep[2], CONTAINER_PROXY_SOCKET_PATH);
+        assert_eq!(ep[3], "--");
     }
 
     #[test]
     fn build_config_without_ca_has_no_trust_env_vars() {
         let policy = policy_with(vec![]);
-        let config =
-            ContainerManager::build_config(&policy, "node:20", &[], 8080, None, test_base_dir())
-                .unwrap();
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
 
         assert!(
             !config.env.iter().any(|e| e.starts_with("SSL_CERT_FILE=")),
@@ -1145,21 +1229,14 @@ mod tests {
             ContainerPermission::FsWrite("/project/out".to_string()),
         ]);
         let ca_path = Path::new("/tmp/test-ca.pem");
-        let config = ContainerManager::build_config(
-            &policy,
-            "node:20",
-            &[],
-            8080,
-            Some(ca_path),
-            test_base_dir(),
-        )
-        .unwrap();
+        let config =
+            build_test_config(&policy, "node:20", &[], Some(ca_path), test_base_dir()).unwrap();
 
-        // Should have policy binds + CA bind
+        // Should have policy binds + proxy socket + gateway binary + CA bind
         assert_eq!(
             config.binds.len(),
-            3,
-            "should have 2 policy binds + 1 CA bind: {:?}",
+            5,
+            "should have 2 policy + 2 gateway + 1 CA bind: {:?}",
             config.binds
         );
         assert!(config
@@ -1177,17 +1254,10 @@ mod tests {
     fn build_config_with_ca_preserves_proxy_env() {
         let policy = policy_with(vec![]);
         let ca_path = Path::new("/tmp/test-ca.pem");
-        let config = ContainerManager::build_config(
-            &policy,
-            "node:20",
-            &[],
-            8080,
-            Some(ca_path),
-            test_base_dir(),
-        )
-        .unwrap();
+        let config =
+            build_test_config(&policy, "node:20", &[], Some(ca_path), test_base_dir()).unwrap();
 
-        let proxy_url = "http://host.docker.internal:8080";
+        let proxy_url = format!("http://{GATEWAY_LISTEN_ADDR}");
         for var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
             assert!(
                 config.env.contains(&format!("{var}={proxy_url}")),
@@ -1308,14 +1378,7 @@ mod tests {
             "/project/../../../etc/shadow".to_string(),
         )]);
 
-        let result = ContainerManager::build_config(
-            &policy,
-            "node:20",
-            &[],
-            8080,
-            None,
-            Path::new("/project"),
-        );
+        let result = build_test_config(&policy, "node:20", &[], None, Path::new("/project"));
         assert!(result.is_err(), "build_config should reject traversal path");
     }
 
@@ -1325,14 +1388,7 @@ mod tests {
             "/project/../../etc/passwd".to_string(),
         )]);
 
-        let result = ContainerManager::build_config(
-            &policy,
-            "node:20",
-            &[],
-            8080,
-            None,
-            Path::new("/project"),
-        );
+        let result = build_test_config(&policy, "node:20", &[], None, Path::new("/project"));
         assert!(
             result.is_err(),
             "build_config should reject traversal in write path"
@@ -1346,14 +1402,7 @@ mod tests {
             ContainerPermission::FsWrite("/project/out".to_string()),
         ]);
 
-        let result = ContainerManager::build_config(
-            &policy,
-            "node:20",
-            &[],
-            8080,
-            None,
-            Path::new("/project"),
-        );
+        let result = build_test_config(&policy, "node:20", &[], None, Path::new("/project"));
         assert!(
             result.is_ok(),
             "build_config should accept valid paths: {:?}",

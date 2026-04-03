@@ -68,3 +68,41 @@ jobs:
         with:
           name: strait-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/strait
+
+  build-gateway:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install musl tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Install aarch64 musl cross-compiler
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          curl -sSfL https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C /tmp
+          echo "/tmp/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> $GITHUB_ENV
+      - run: cargo build --release --package strait-gateway --target ${{ matrix.target }}
+      - name: Verify static linking
+        run: |
+          file target/${{ matrix.target }}/release/strait-gateway
+          if file target/${{ matrix.target }}/release/strait-gateway | grep -q "dynamically linked"; then
+            echo "::error::strait-gateway is not statically linked"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: strait-gateway-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/strait-gateway

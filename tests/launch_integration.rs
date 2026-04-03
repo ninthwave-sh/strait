@@ -26,23 +26,50 @@ async fn docker_available() -> bool {
     docker.inspect_image("alpine:latest").await.is_ok()
 }
 
+/// Check if the gateway binary can run inside a Linux container.
+///
+/// The gateway binary is compiled for the host platform and bind-mounted
+/// into the container. On macOS, the binary is Mach-O format, which cannot
+/// execute inside a Linux container (ELF required). On Linux hosts the
+/// binary format matches and the gateway runs directly.
+fn gateway_compatible_with_container() -> bool {
+    // On Linux hosts, the binary format matches the container.
+    // On non-Linux hosts (macOS, Windows), the host binary can't execute
+    // inside a Linux container.
+    cfg!(target_os = "linux")
+}
+
 /// Require Docker for an integration test.
 ///
 /// - **CI** (`CI` env var set): panics if Docker+alpine is unavailable, since
 ///   the CI workflow pulls `alpine:latest` before running tests.
 /// - **Developer machines**: returns `false` so the test can skip gracefully.
+///
+/// Also checks gateway binary compatibility: tests that launch containers
+/// with the gateway entrypoint need a Linux-format binary. On macOS hosts,
+/// the gateway binary is Mach-O and can't execute inside the Linux container,
+/// so these tests skip gracefully.
 async fn require_docker() -> bool {
-    if docker_available().await {
-        return true;
+    if !docker_available().await {
+        if std::env::var("CI").is_ok() {
+            panic!(
+                "Docker with alpine:latest is required in CI but not available. \
+                 Ensure the CI workflow runs `docker pull alpine:latest` before tests."
+            );
+        }
+        eprintln!("Skipping: Docker not available (run `docker pull alpine:latest` to enable)");
+        return false;
     }
-    if std::env::var("CI").is_ok() {
-        panic!(
-            "Docker with alpine:latest is required in CI but not available. \
-             Ensure the CI workflow runs `docker pull alpine:latest` before tests."
+    if !gateway_compatible_with_container() {
+        eprintln!(
+            "Skipping: gateway binary is not Linux ELF format (host is {}). \
+             These tests require a Linux host where the gateway binary can execute \
+             inside the container.",
+            std::env::consts::OS
         );
+        return false;
     }
-    eprintln!("Skipping: Docker not available (run `docker pull alpine:latest` to enable)");
-    false
+    true
 }
 
 /// Helper to read an observation JSONL file into parsed events.

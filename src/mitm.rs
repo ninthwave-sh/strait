@@ -6,7 +6,7 @@
 //! either returns a 403 or forwards it upstream with credential injection.
 //! For all other hosts the connection is tunneled transparently without any decryption.
 
-use std::net::SocketAddr;
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -31,11 +31,17 @@ pub fn should_mitm(host: &str, mitm_hosts: &[String]) -> bool {
 /// - When `ctx.mitm_all` is true: always MITM (used by `launch` modes).
 /// - When the host is in `ctx.mitm_hosts`: MITM for policy inspection.
 /// - All other hosts: transparent TCP tunnel (no decryption).
-pub async fn handle_connection(
-    mut client: TcpStream,
-    peer: SocketAddr,
+///
+/// Generic over the stream type so both TCP and Unix socket connections
+/// can share the same handling path.
+pub async fn handle_connection<S>(
+    mut client: S,
+    peer: impl Display,
     ctx: &ProxyContext,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
     let mut buf_client = BufReader::new(&mut client);
     let mut request_line = String::new();
     buf_client.read_line(&mut request_line).await?;
@@ -166,12 +172,15 @@ pub fn parse_connect_target(target: &str) -> anyhow::Result<(String, u16)> {
 /// - The upstream sends `Connection: close` in its response.
 /// - The configurable idle timeout fires (default 30 s).
 /// - An unrecoverable error occurs (e.g. 413 Payload Too Large).
-pub async fn handle_mitm(
-    client: TcpStream,
+pub async fn handle_mitm<S>(
+    client: S,
     host: &str,
     port: u16,
     ctx: &ProxyContext,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
     // Generate a leaf certificate for this host
     let (cert_chain, key) = ctx
         .session_ca

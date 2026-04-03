@@ -39,10 +39,11 @@ fn gateway_compatible_with_container() -> bool {
     cfg!(target_os = "linux")
 }
 
-/// Require Docker for an integration test.
+/// Require Docker and the gateway binary for an integration test.
 ///
-/// - **CI** (`CI` env var set): panics if Docker+alpine is unavailable, since
-///   the CI workflow pulls `alpine:latest` before running tests.
+/// - **CI** (`CI` env var set): panics if Docker+alpine is unavailable or
+///   the gateway binary is missing, since CI should build the gateway before
+///   running tests.
 /// - **Developer machines**: returns `false` so the test can skip gracefully.
 ///
 /// Also checks gateway binary compatibility: tests that launch containers
@@ -66,6 +67,19 @@ async fn require_docker() -> bool {
              These tests require a Linux host where the gateway binary can execute \
              inside the container.",
             std::env::consts::OS
+        );
+        return false;
+    }
+    if strait::launch::find_gateway_binary().is_err() {
+        if std::env::var("CI").is_ok() {
+            panic!(
+                "strait-gateway binary not found in CI. \
+                 Ensure the CI workflow runs `cargo build -p strait-gateway` before tests."
+            );
+        }
+        eprintln!(
+            "Skipping: strait-gateway binary not found \
+             (run `cargo build -p strait-gateway` to enable)"
         );
         return false;
     }

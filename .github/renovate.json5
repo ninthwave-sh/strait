@@ -1,0 +1,44 @@
+// Renovate configuration for the strait repo.
+// Docs: https://docs.renovatebot.com/configuration-options/
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+
+  // ── Global settings ──────────────────────────────────────────────────
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":separateMajorReleases"
+  ],
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 4,
+  "branchPrefix": "deps/",
+  "commitMessagePrefix": "chore(deps):",
+  "labels": ["dependencies"],
+  "ignorePaths": ["**/target/**"],
+  "platformAutomerge": true,
+
+  // ── Package rules ────────────────────────────────────────────────────
+  "packageRules": [
+    // GitHub Actions -- auto-merge patch and minor
+    {
+      "groupName": "GitHub Actions",
+      "matchManagers": ["github-actions"],
+      "automerge": true,
+      "matchUpdateTypes": ["patch", "minor", "pinDigest", "digest"]
+    },
+
+    // Cargo dev-dependencies: auto-merge patch and minor
+    {
+      "matchManagers": ["cargo"],
+      "matchDepTypes": ["dev-dependencies"],
+      "automerge": true,
+      "matchUpdateTypes": ["patch", "minor"]
+    },
+
+    // Major updates anywhere: never auto-merge
+    {
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    }
+  ]
+}

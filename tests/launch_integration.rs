@@ -1,7 +1,7 @@
 //! Integration tests for `strait launch` (observe, warn, and enforce modes).
 //!
-//! These tests require Docker to be running with `alpine:latest` pulled.
-//! - **CI**: the workflow pulls alpine:latest before tests; missing Docker panics.
+//! These tests require Docker to be running with the test image pulled.
+//! - **CI**: the workflow pulls the test image before tests; missing Docker panics.
 //! - **Local dev**: tests skip gracefully if Docker is not available.
 //!
 //! Run explicitly with: `cargo test --test launch_integration`
@@ -9,10 +9,19 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
+/// Container image used for integration tests.
+///
+/// Uses a glibc-based image (not Alpine/musl) because the `strait-gateway`
+/// binary is compiled for the host platform and bind-mounted into the
+/// container. On CI (Ubuntu), this produces a glibc-linked ELF binary
+/// that can't execute inside musl-based containers like Alpine. Debian
+/// Bookworm uses glibc, matching the CI host.
+const TEST_IMAGE: &str = "debian:bookworm-slim";
+
 /// Check if Docker is available with the required image for integration tests.
 ///
 /// Returns true if we can connect to the Docker daemon, ping it, and the
-/// `alpine:latest` image is already pulled. We don't auto-pull images in
+/// test image is already pulled. We don't auto-pull images in
 /// tests to keep them fast and avoid network dependencies in CI.
 async fn docker_available() -> bool {
     let docker = match bollard::Docker::connect_with_local_defaults() {
@@ -23,7 +32,7 @@ async fn docker_available() -> bool {
         return false;
     }
     // Check that the required test image is available locally
-    docker.inspect_image("alpine:latest").await.is_ok()
+    docker.inspect_image(TEST_IMAGE).await.is_ok()
 }
 
 /// Check if the gateway binary can run inside a Linux container.
@@ -41,7 +50,7 @@ fn gateway_compatible_with_container() -> bool {
 
 /// Require Docker and the gateway binary for an integration test.
 ///
-/// - **CI** (`CI` env var set): panics if Docker+alpine is unavailable or
+/// - **CI** (`CI` env var set): panics if Docker+test image is unavailable or
 ///   the gateway binary is missing, since CI should build the gateway before
 ///   running tests.
 /// - **Developer machines**: returns `false` so the test can skip gracefully.
@@ -54,11 +63,11 @@ async fn require_docker() -> bool {
     if !docker_available().await {
         if std::env::var("CI").is_ok() {
             panic!(
-                "Docker with alpine:latest is required in CI but not available. \
-                 Ensure the CI workflow runs `docker pull alpine:latest` before tests."
+                "Docker with {TEST_IMAGE} is required in CI but not available. \
+                 Ensure the CI workflow pulls the test image before tests."
             );
         }
-        eprintln!("Skipping: Docker not available (run `docker pull alpine:latest` to enable)");
+        eprintln!("Skipping: Docker not available (run `docker pull {TEST_IMAGE}` to enable)");
         return false;
     }
     if !gateway_compatible_with_container() {
@@ -127,7 +136,7 @@ async fn launch_observe_echo_hello() {
 
     let exit_code = strait::launch::run_launch_observe(
         vec!["echo".to_string(), "hello".to_string()],
-        Some("alpine:latest"),
+        Some(TEST_IMAGE),
         Some(obs_path.clone()),
         None,
         Vec::new(),
@@ -152,7 +161,7 @@ async fn launch_observe_echo_hello() {
     // container_start should have image field
     assert_eq!(
         starts[0]["image"].as_str(),
-        Some("alpine:latest"),
+        Some(TEST_IMAGE),
         "container_start should record the image"
     );
 
@@ -177,7 +186,7 @@ async fn launch_observe_contains_lifecycle_events() {
 
     let exit_code = strait::launch::run_launch_observe(
         vec!["echo".to_string(), "lifecycle".to_string()],
-        Some("alpine:latest"),
+        Some(TEST_IMAGE),
         Some(obs_path.clone()),
         None,
         Vec::new(),
@@ -224,7 +233,7 @@ async fn launch_observe_bad_command_exit_code() {
 
     let exit_code = strait::launch::run_launch_observe(
         vec!["false".to_string()], // `false` exits with code 1
-        Some("alpine:latest"),
+        Some(TEST_IMAGE),
         Some(obs_path.clone()),
         None,
         Vec::new(),
@@ -298,7 +307,7 @@ async fn launch_policy_invalid_file_fails_fast() {
         strait::launch::EnforcementMode::Enforce,
         &policy_path,
         vec!["echo".to_string(), "hello".to_string()],
-        Some("alpine:latest"),
+        Some(TEST_IMAGE),
         Some(obs_path.clone()),
         None,
         Vec::new(),
@@ -329,7 +338,7 @@ async fn launch_policy_missing_file_fails_fast() {
         strait::launch::EnforcementMode::Enforce,
         Path::new("/nonexistent/policy.cedar"),
         vec!["echo".to_string(), "hello".to_string()],
-        Some("alpine:latest"),
+        Some(TEST_IMAGE),
         Some(obs_path),
         None,
         Vec::new(),
@@ -385,7 +394,7 @@ permit(
         &policy_path,
         // Try to list the cwd — should fail because it's not mounted
         vec!["ls".to_string(), "/workspace".to_string()],
-        Some("alpine:latest"),
+        Some(TEST_IMAGE),
         Some(obs_path.clone()),
         None,
         Vec::new(),
@@ -442,7 +451,7 @@ permit(
         strait::launch::EnforcementMode::Warn,
         &policy_path,
         vec!["echo".to_string(), "warn-test".to_string()],
-        Some("alpine:latest"),
+        Some(TEST_IMAGE),
         Some(obs_path.clone()),
         None,
         Vec::new(),

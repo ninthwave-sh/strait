@@ -13,10 +13,10 @@ use std::path::Path;
 ///
 /// Uses a glibc-based image (not Alpine/musl) because the `strait-gateway`
 /// binary is compiled for the host platform and bind-mounted into the
-/// container. On CI (Ubuntu), this produces a glibc-linked ELF binary
-/// that can't execute inside musl-based containers like Alpine. Debian
-/// Bookworm uses glibc, matching the CI host.
-const TEST_IMAGE: &str = "debian:bookworm-slim";
+/// container. On CI (Ubuntu 24.04), this produces a glibc-linked ELF
+/// binary that requires glibc 2.39+. The container image must have a
+/// matching or newer glibc version.
+const TEST_IMAGE: &str = "ubuntu:24.04";
 
 /// Check if Docker is available with the required image for integration tests.
 ///

@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "gateway"]
+resolver = "2"
+
 [package]
 name = "strait"
 version = "0.1.0"

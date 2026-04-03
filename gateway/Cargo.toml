@@ -1,0 +1,17 @@
+[package]
+name = "strait-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "In-container TCP-to-Unix-socket forwarder for strait"
+license = "Apache-2.0"
+
+[[bin]]
+name = "strait-gateway"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "process", "signal", "io-util", "sync"] }
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "process", "signal", "io-util", "sync", "time"] }

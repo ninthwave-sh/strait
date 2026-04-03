@@ -612,12 +612,11 @@ where
             continue;
         }
 
-        // --- Forward to upstream ---
+        // --- Forward to upstream (TCP + TLS under connect timeout) ---
         let upstream_addr = match ctx.upstream_addr_override {
             Some(addr) => addr.to_string(),
             None => format!("{host}:{port}"),
         };
-        let upstream_tcp = TcpStream::connect(&upstream_addr).await?;
 
         let tls_config = match ctx.upstream_tls_override {
             Some(ref cfg) => cfg.clone(),
@@ -632,9 +631,38 @@ where
             }
         };
 
-        let connector = tokio_rustls::TlsConnector::from(tls_config);
-        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())?;
-        let tls_upstream = connector.connect(server_name, upstream_tcp).await?;
+        let host_owned = host.to_string();
+        let connect_fut = async {
+            let upstream_tcp = TcpStream::connect(&upstream_addr).await?;
+            let connector = tokio_rustls::TlsConnector::from(tls_config);
+            let server_name = rustls::pki_types::ServerName::try_from(host_owned)?;
+            connector
+                .connect(server_name, upstream_tcp)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+        };
+
+        let tls_upstream =
+            match tokio::time::timeout(ctx.upstream_connect_timeout, connect_fut).await {
+                Ok(Ok(tls)) => tls,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    warn!(
+                        host = host,
+                        method = method.as_str(),
+                        path = path.as_str(),
+                        timeout_secs = ctx.upstream_connect_timeout.as_secs(),
+                        "upstream connect timeout"
+                    );
+                    let response = build_gateway_timeout_response(
+                        "upstream connect timeout",
+                        ctx.upstream_connect_timeout.as_secs(),
+                    );
+                    write_half.write_all(response.as_bytes()).await?;
+                    write_half.flush().await?;
+                    break;
+                }
+            };
 
         let (upstream_read, mut upstream_write) = tokio::io::split(tls_upstream);
 
@@ -654,8 +682,31 @@ where
 
         // Read the upstream response and relay it back to the client
         let mut upstream_reader = BufReader::new(upstream_read);
-        let response_info =
-            relay_upstream_response(&method, &mut upstream_reader, &mut write_half).await?;
+        let response_info = match tokio::time::timeout(
+            ctx.upstream_response_timeout,
+            relay_upstream_response(&method, &mut upstream_reader, &mut write_half),
+        )
+        .await
+        {
+            Ok(Ok(info)) => info,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                warn!(
+                    host = host,
+                    method = method.as_str(),
+                    path = path.as_str(),
+                    timeout_secs = ctx.upstream_response_timeout.as_secs(),
+                    "upstream response timeout"
+                );
+                let response = build_gateway_timeout_response(
+                    "upstream response timeout",
+                    ctx.upstream_response_timeout.as_secs(),
+                );
+                write_half.write_all(response.as_bytes()).await?;
+                write_half.flush().await?;
+                break;
+            }
+        };
 
         // Check exit conditions
         if client_wants_close || response_info.upstream_wants_close {
@@ -920,6 +971,30 @@ fn build_passthrough_denied_response(host: &str) -> String {
     let body_bytes = serde_json::to_string(&body).expect("JSON serialization cannot fail");
     format!(
         "HTTP/1.1 403 Forbidden\r\n\
+Content-Type: application/json\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\
+\r\n\
+{}",
+        body_bytes.len(),
+        body_bytes
+    )
+}
+
+/// Build an HTTP 504 Gateway Timeout response string.
+///
+/// Returned when the upstream server does not respond within the configured
+/// timeout (either connect or response phase). Includes `Connection: close`
+/// because the upstream connection state is indeterminate.
+fn build_gateway_timeout_response(reason: &str, timeout_secs: u64) -> String {
+    let body = serde_json::json!({
+        "error": "gateway_timeout",
+        "message": reason,
+        "timeout_secs": timeout_secs,
+    });
+    let body_bytes = serde_json::to_string(&body).expect("JSON serialization cannot fail");
+    format!(
+        "HTTP/1.1 504 Gateway Timeout\r\n\
 Content-Type: application/json\r\n\
 Content-Length: {}\r\n\
 Connection: close\r\n\

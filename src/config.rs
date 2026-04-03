@@ -88,6 +88,12 @@ const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 /// Default keep-alive idle timeout (seconds).
 const DEFAULT_KEEPALIVE_TIMEOUT_SECS: u64 = 30;
 
+/// Default upstream connection timeout (seconds).
+const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Default upstream response timeout (seconds).
+const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_SECS: u64 = 60;
+
 /// `[mitm]` section — which hosts to intercept.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -107,6 +113,18 @@ pub struct MitmConfig {
     /// this interval after the last response. Defaults to 30 seconds.
     #[serde(default = "default_keepalive_timeout_secs")]
     pub keepalive_timeout_secs: u64,
+
+    /// Timeout (seconds) for establishing a TCP connection to the upstream
+    /// server. Requests that exceed this limit receive HTTP 504.
+    /// Defaults to 30 seconds.
+    #[serde(default = "default_upstream_connect_timeout_secs")]
+    pub upstream_connect_timeout_secs: u64,
+
+    /// Timeout (seconds) for receiving the complete HTTP response from the
+    /// upstream server after the request has been sent. Requests that exceed
+    /// this limit receive HTTP 504. Defaults to 60 seconds.
+    #[serde(default = "default_upstream_response_timeout_secs")]
+    pub upstream_response_timeout_secs: u64,
 }
 
 impl Default for MitmConfig {
@@ -115,6 +133,8 @@ impl Default for MitmConfig {
             hosts: Vec::new(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             keepalive_timeout_secs: DEFAULT_KEEPALIVE_TIMEOUT_SECS,
+            upstream_connect_timeout_secs: DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS,
+            upstream_response_timeout_secs: DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_SECS,
         }
     }
 }
@@ -125,6 +145,14 @@ fn default_max_body_size() -> usize {
 
 fn default_keepalive_timeout_secs() -> u64 {
     DEFAULT_KEEPALIVE_TIMEOUT_SECS
+}
+
+fn default_upstream_connect_timeout_secs() -> u64 {
+    DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS
+}
+
+fn default_upstream_response_timeout_secs() -> u64 {
+    DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_SECS
 }
 
 /// `[policy]` section — Cedar policy source (local file or git repository).
@@ -324,6 +352,10 @@ pub struct ProxyContext {
     pub max_body_size: usize,
     /// Keep-alive idle timeout for MITM connections.
     pub keepalive_timeout: Duration,
+    /// Timeout for establishing a TCP connection to the upstream server.
+    pub upstream_connect_timeout: Duration,
+    /// Timeout for receiving the complete HTTP response from upstream.
+    pub upstream_response_timeout: Duration,
     /// Instant when the proxy context was created (for uptime calculation).
     pub startup_instant: Instant,
     /// HTTP header name to extract agent identity from.
@@ -467,6 +499,12 @@ impl ProxyContext {
             mitm_hosts: config.mitm.hosts.clone(),
             max_body_size: config.mitm.max_body_size,
             keepalive_timeout: Duration::from_secs(config.mitm.keepalive_timeout_secs),
+            upstream_connect_timeout: Duration::from_secs(
+                config.mitm.upstream_connect_timeout_secs,
+            ),
+            upstream_response_timeout: Duration::from_secs(
+                config.mitm.upstream_response_timeout_secs,
+            ),
             startup_instant: Instant::now(),
             identity_header: identity.header,
             identity_default: identity.default,
@@ -1896,5 +1934,52 @@ action "http:GET"
         assert!(!handle.is_finished(), "reload task should still be running");
 
         handle.abort();
+    }
+
+    // --- Upstream timeout config tests ---
+
+    #[test]
+    fn upstream_timeout_defaults() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        assert_eq!(config.mitm.upstream_connect_timeout_secs, 30);
+        assert_eq!(config.mitm.upstream_response_timeout_secs, 60);
+    }
+
+    #[test]
+    fn upstream_timeout_custom_values() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+
+[mitm]
+upstream_connect_timeout_secs = 10
+upstream_response_timeout_secs = 120
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        assert_eq!(config.mitm.upstream_connect_timeout_secs, 10);
+        assert_eq!(config.mitm.upstream_response_timeout_secs, 120);
+    }
+
+    #[test]
+    fn proxy_context_upstream_timeout_from_config() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+
+[mitm]
+upstream_connect_timeout_secs = 15
+upstream_response_timeout_secs = 90
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+        assert_eq!(ctx.upstream_connect_timeout, Duration::from_secs(15));
+        assert_eq!(ctx.upstream_response_timeout, Duration::from_secs(90));
     }
 }

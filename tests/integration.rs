@@ -681,6 +681,8 @@ fn build_sigv4_proxy_context(
         warn_only: false,
         upstream_addr_override: Some(echo_addr),
         upstream_tls_override: Some(tls_config),
+        upstream_connect_timeout: Duration::from_secs(30),
+        upstream_response_timeout: Duration::from_secs(60),
     }
 }
 
@@ -2444,6 +2446,8 @@ fn build_test_proxy_context() -> strait::config::ProxyContext {
         warn_only: false,
         upstream_addr_override: None,
         upstream_tls_override: None,
+        upstream_connect_timeout: std::time::Duration::from_secs(30),
+        upstream_response_timeout: std::time::Duration::from_secs(60),
     }
 }
 
@@ -3074,6 +3078,309 @@ async fn passthrough_allowed_in_warn_only_mode() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Upstream timeout tests
+// ---------------------------------------------------------------------------
+
+/// Start a TCP listener that accepts connections but never sends any data,
+/// simulating a stalled upstream that holds the connection open forever.
+async fn start_stalled_tcp_server() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Hold the connection open but never send data
+            tokio::spawn(async move {
+                let _held = stream;
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            });
+        }
+    });
+
+    addr
+}
+
+/// Start a TLS echo server that accepts the TLS handshake and reads the HTTP
+/// request, but never sends a response back. Used to test upstream response
+/// timeout behavior.
+async fn start_stalled_response_tls_server() -> (std::net::SocketAddr, CertificateDer<'static>) {
+    let key_pair = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::default();
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "test-stall-ca");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&key_pair).unwrap();
+    let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
+
+    let leaf_key = KeyPair::generate().unwrap();
+    let mut leaf_params = CertificateParams::default();
+    leaf_params
+        .distinguished_name
+        .push(DnType::CommonName, "api.github.com");
+    leaf_params.subject_alt_names.push(rcgen::SanType::DnsName(
+        "api.github.com".try_into().unwrap(),
+    ));
+    leaf_params
+        .subject_alt_names
+        .push(rcgen::SanType::DnsName("localhost".try_into().unwrap()));
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &ca_cert, &key_pair)
+        .unwrap();
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![
+                CertificateDer::from(leaf_cert.der().to_vec()),
+                ca_cert_der.clone(),
+            ],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+        )
+        .unwrap();
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let mut tls = match acceptor.accept(stream).await {
+                    Ok(tls) => tls,
+                    Err(_) => return,
+                };
+
+                // Read the request but never respond
+                let mut buf = [0u8; 4096];
+                let _ = tls.read(&mut buf).await;
+
+                // Stall indefinitely
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            });
+        }
+    });
+
+    (addr, ca_cert_der)
+}
+
+#[tokio::test]
+async fn upstream_connect_timeout_returns_504() {
+    // Start a server that accepts TCP connections but never responds
+    let stalled_addr = start_stalled_tcp_server().await;
+
+    let session_ca = strait::ca::SessionCa::generate().unwrap();
+    let ca_pem = session_ca.ca_cert_pem.clone();
+    let audit_logger = Arc::new(strait::audit::AuditLogger::new(None).unwrap());
+
+    // Use NoVerify since the stalled server won't complete TLS anyway
+    let tls_config = Arc::new(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(strait_test_helpers::NoVerify))
+            .with_no_client_auth(),
+    );
+
+    let ctx = Arc::new(strait::config::ProxyContext {
+        session_ca,
+        policy_engine: None,
+        credential_store: None,
+        audit_logger,
+        mitm_hosts: vec!["api.github.com".to_string()],
+        max_body_size: 10 * 1024 * 1024,
+        keepalive_timeout: std::time::Duration::from_secs(5),
+        startup_instant: std::time::Instant::now(),
+        identity_header: "X-Strait-Agent".to_string(),
+        identity_default: "anonymous".to_string(),
+        git_policy: None,
+        policy_config: None,
+        observation_stream: None,
+        enforcement_mode: "observe".to_string(),
+        mitm_all: false,
+        warn_only: false,
+        upstream_addr_override: Some(stalled_addr),
+        upstream_tls_override: Some(tls_config),
+        // Very short timeout so the test completes quickly
+        upstream_connect_timeout: std::time::Duration::from_millis(100),
+        upstream_response_timeout: std::time::Duration::from_secs(60),
+    });
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
+    });
+
+    let mut tls = connect_through_mitm(proxy_addr, &ca_pem, "api.github.com").await;
+
+    tls.write_all(b"GET /repos/test HTTP/1.1\r\nHost: api.github.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    assert!(
+        response_str.contains("504 Gateway Timeout"),
+        "Expected 504 Gateway Timeout, got: {}",
+        response_str
+    );
+    assert!(
+        response_str.contains("gateway_timeout"),
+        "Expected gateway_timeout error in body, got: {}",
+        response_str
+    );
+}
+
+#[tokio::test]
+async fn upstream_response_timeout_returns_504() {
+    // Start a TLS server that accepts but never responds
+    let (stalled_addr, _ca_der) = start_stalled_response_tls_server().await;
+
+    let session_ca = strait::ca::SessionCa::generate().unwrap();
+    let ca_pem = session_ca.ca_cert_pem.clone();
+    let audit_logger = Arc::new(strait::audit::AuditLogger::new(None).unwrap());
+
+    let tls_config = Arc::new(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(strait_test_helpers::NoVerify))
+            .with_no_client_auth(),
+    );
+
+    let ctx = Arc::new(strait::config::ProxyContext {
+        session_ca,
+        policy_engine: None,
+        credential_store: None,
+        audit_logger,
+        mitm_hosts: vec!["api.github.com".to_string()],
+        max_body_size: 10 * 1024 * 1024,
+        keepalive_timeout: std::time::Duration::from_secs(5),
+        startup_instant: std::time::Instant::now(),
+        identity_header: "X-Strait-Agent".to_string(),
+        identity_default: "anonymous".to_string(),
+        git_policy: None,
+        policy_config: None,
+        observation_stream: None,
+        enforcement_mode: "observe".to_string(),
+        mitm_all: false,
+        warn_only: false,
+        upstream_addr_override: Some(stalled_addr),
+        upstream_tls_override: Some(tls_config),
+        upstream_connect_timeout: std::time::Duration::from_secs(30),
+        // Very short response timeout so the test completes quickly
+        upstream_response_timeout: std::time::Duration::from_millis(200),
+    });
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
+    });
+
+    let mut tls = connect_through_mitm(proxy_addr, &ca_pem, "api.github.com").await;
+
+    tls.write_all(b"GET /repos/test HTTP/1.1\r\nHost: api.github.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    assert!(
+        response_str.contains("504 Gateway Timeout"),
+        "Expected 504 Gateway Timeout, got: {}",
+        response_str
+    );
+    assert!(
+        response_str.contains("gateway_timeout"),
+        "Expected gateway_timeout error in body, got: {}",
+        response_str
+    );
+}
+
+#[tokio::test]
+async fn normal_upstream_succeeds_with_timeouts_configured() {
+    // Verify that normal traffic works when timeouts are configured but do not fire.
+    let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
+
+    let session_ca = strait::ca::SessionCa::generate().unwrap();
+    let ca_pem = session_ca.ca_cert_pem.clone();
+    let audit_logger = Arc::new(strait::audit::AuditLogger::new(None).unwrap());
+
+    let tls_config = Arc::new(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(strait_test_helpers::NoVerify))
+            .with_no_client_auth(),
+    );
+
+    let ctx = Arc::new(strait::config::ProxyContext {
+        session_ca,
+        policy_engine: None,
+        credential_store: None,
+        audit_logger,
+        mitm_hosts: vec!["api.github.com".to_string()],
+        max_body_size: 10 * 1024 * 1024,
+        keepalive_timeout: std::time::Duration::from_secs(5),
+        startup_instant: std::time::Instant::now(),
+        identity_header: "X-Strait-Agent".to_string(),
+        identity_default: "anonymous".to_string(),
+        git_policy: None,
+        policy_config: None,
+        observation_stream: None,
+        enforcement_mode: "observe".to_string(),
+        mitm_all: false,
+        warn_only: false,
+        upstream_addr_override: Some(echo_addr),
+        upstream_tls_override: Some(tls_config),
+        upstream_connect_timeout: std::time::Duration::from_secs(5),
+        upstream_response_timeout: std::time::Duration::from_secs(5),
+    });
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
+    });
+
+    let mut tls = connect_through_mitm(proxy_addr, &ca_pem, "api.github.com").await;
+
+    tls.write_all(b"GET /repos/test HTTP/1.1\r\nHost: api.github.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+
+    assert!(
+        response_str.contains("200 OK"),
+        "Expected 200 OK, got: {}",
+        response_str
+    );
+    assert!(
+        response_str.contains("GET /repos/test"),
+        "Expected echoed request line, got: {}",
+        response_str
+    );
+}
+
 /// Test helper module exposed for integration tests.
 mod strait_test_helpers {
     use super::*;
@@ -3140,6 +3447,8 @@ mod strait_test_helpers {
             warn_only: false,
             upstream_addr_override: Some(echo_addr),
             upstream_tls_override: Some(tls_config),
+            upstream_connect_timeout: std::time::Duration::from_secs(30),
+            upstream_response_timeout: std::time::Duration::from_secs(60),
         }
     }
 
@@ -3200,6 +3509,8 @@ when {{ context.path == "{deny_path}" }};
             warn_only: false,
             upstream_addr_override: Some(echo_addr),
             upstream_tls_override: Some(tls_config),
+            upstream_connect_timeout: std::time::Duration::from_secs(30),
+            upstream_response_timeout: std::time::Duration::from_secs(60),
         }
     }
 
@@ -3237,6 +3548,8 @@ when {{ context.path == "{deny_path}" }};
             warn_only: false,
             upstream_addr_override: upstream_addr,
             upstream_tls_override: None,
+            upstream_connect_timeout: std::time::Duration::from_secs(30),
+            upstream_response_timeout: std::time::Duration::from_secs(60),
         }
     }
 
@@ -3272,6 +3585,8 @@ when {{ context.path == "{deny_path}" }};
             warn_only: false,
             upstream_addr_override: None,
             upstream_tls_override: None,
+            upstream_connect_timeout: std::time::Duration::from_secs(30),
+            upstream_response_timeout: std::time::Duration::from_secs(60),
         }
     }
 

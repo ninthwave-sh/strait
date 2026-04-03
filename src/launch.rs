@@ -619,6 +619,8 @@ pub fn build_launch_proxy_context(
         warn_only,
         upstream_addr_override: None,
         upstream_tls_override: None,
+        upstream_connect_timeout: std::time::Duration::from_secs(30),
+        upstream_response_timeout: std::time::Duration::from_secs(60),
     })
 }
 
@@ -1273,6 +1275,8 @@ permit(
             warn_only: false,
             upstream_addr_override: None,
             upstream_tls_override: None,
+            upstream_connect_timeout: std::time::Duration::from_secs(30),
+            upstream_response_timeout: std::time::Duration::from_secs(60),
         });
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -47,6 +47,8 @@ use arc_swap::ArcSwap;
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tracing::{info, warn};
 
 use crate::audit::AuditLogger;
@@ -82,6 +84,20 @@ impl EnforcementMode {
 
 /// Default Docker image for the container sandbox.
 const DEFAULT_IMAGE: &str = "alpine:latest";
+
+/// Filename for the proxy Unix socket inside the session temp directory.
+///
+/// Container setup code can bind-mount this socket into the container so
+/// traffic reaches the host proxy without a host TCP port.
+pub const PROXY_SOCKET_NAME: &str = "proxy.sock";
+
+/// Return the proxy Unix socket path for a given session temp directory.
+///
+/// This is the path that container setup should bind-mount into the container
+/// so the agent process can reach the host proxy over a Unix socket.
+pub fn proxy_socket_path(temp_dir: &Path) -> PathBuf {
+    temp_dir.join(PROXY_SOCKET_NAME)
+}
 
 /// Run the `launch --observe` workflow.
 ///
@@ -145,7 +161,20 @@ pub async fn run_launch_observe(
         credential_store,
         mitm_hosts,
     )?);
-    let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx));
+    let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx.clone()));
+
+    // 5b. Start Unix socket proxy listener so containers can reach the proxy
+    //     without a host TCP port (bind-mount the socket into the container).
+    #[cfg(unix)]
+    let proxy_socket_path = proxy_socket_path(temp_dir.path());
+    #[cfg(unix)]
+    let unix_proxy_handle = {
+        let listener =
+            UnixListener::bind(&proxy_socket_path).context("failed to bind Unix proxy socket")?;
+        info!(path = %proxy_socket_path.display(), "proxy Unix socket listening");
+        eprintln!("Proxy socket: {}", proxy_socket_path.display());
+        tokio::spawn(run_mitm_unix_proxy_loop(listener, proxy_ctx))
+    };
 
     // 6. Build observe-mode container config
     //    In observe mode, mount the working directory read-write (no restrictions)
@@ -228,6 +257,8 @@ pub async fn run_launch_observe(
     // 10. Cleanup: remove container (not auto-removed) and stop proxy
     container_mgr.remove_container().await;
     proxy_handle.abort();
+    #[cfg(unix)]
+    unix_proxy_handle.abort();
 
     // Flush observation log before returning so callers can read the file.
     obs_stream.flush();
@@ -323,7 +354,19 @@ pub async fn run_launch_with_policy(
         credential_store,
         mitm_hosts,
     )?);
-    let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx));
+    let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx.clone()));
+
+    // 6b. Start Unix socket proxy listener for container traffic
+    #[cfg(unix)]
+    let proxy_socket_path = proxy_socket_path(temp_dir.path());
+    #[cfg(unix)]
+    let unix_proxy_handle = {
+        let listener =
+            UnixListener::bind(&proxy_socket_path).context("failed to bind Unix proxy socket")?;
+        info!(path = %proxy_socket_path.display(), "proxy Unix socket listening");
+        eprintln!("Proxy socket: {}", proxy_socket_path.display());
+        tokio::spawn(run_mitm_unix_proxy_loop(listener, proxy_ctx))
+    };
 
     // 7. Extract filesystem permissions from Cedar policy
     let candidate_paths = vec![cwd.to_string_lossy().to_string()];
@@ -436,6 +479,8 @@ pub async fn run_launch_with_policy(
     // 12. Cleanup: remove container and stop proxy
     container_mgr.remove_container().await;
     proxy_handle.abort();
+    #[cfg(unix)]
+    unix_proxy_handle.abort();
 
     // Flush observation log before returning so callers can read the file.
     obs_stream.flush();
@@ -495,6 +540,30 @@ async fn run_mitm_proxy_loop(listener: TcpListener, ctx: Arc<ProxyContext>) {
             }
             Err(e) => {
                 warn!(error = %e, "proxy accept error");
+                break;
+            }
+        }
+    }
+}
+
+/// Accept loop for Unix socket connections, dispatching through the same
+/// `handle_connection` path as TCP. Used by launch modes so container
+/// traffic can reach the proxy via a bind-mounted socket instead of a
+/// host TCP port.
+#[cfg(unix)]
+async fn run_mitm_unix_proxy_loop(listener: UnixListener, ctx: Arc<ProxyContext>) {
+    loop {
+        match listener.accept().await {
+            Ok((client, _addr)) => {
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(client, "unix", &ctx).await {
+                        tracing::debug!(error = %e, "proxy unix connection error");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "proxy unix accept error");
                 break;
             }
         }
@@ -1288,6 +1357,87 @@ permit(
         assert!(
             result.unwrap().is_ok(),
             "sigterm_signal task should not panic"
+        );
+    }
+
+    // -- Unix socket proxy tests ----------------------------------------------
+
+    /// Verify that `run_mitm_unix_proxy_loop` accepts a connection over a
+    /// Unix socket and dispatches it through the same `handle_connection`
+    /// path as the TCP proxy loop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_proxy_accepts_connect() {
+        let obs_stream = ObservationStream::new();
+
+        let session_ca = SessionCa::generate().unwrap();
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let socket_path = proxy_socket_path(temp_dir.path());
+
+        let ctx = Arc::new(
+            build_launch_proxy_context(
+                session_ca,
+                None,
+                obs_stream.clone(),
+                false,
+                None,
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        assert!(socket_path.exists(), "socket file should exist after bind");
+
+        let proxy_handle = tokio::spawn(run_mitm_unix_proxy_loop(listener, ctx));
+
+        // Connect over the Unix socket and send a CONNECT request.
+        let mut client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        client
+            .write_all(b"CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+            .await
+            .unwrap();
+
+        // Read the 200 Connection Established response (proves handle_connection
+        // ran and the MITM path was triggered because mitm_all=true).
+        let mut response = vec![0u8; 1024];
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let n = client.try_read(&mut response).unwrap_or(0);
+        let response_str = String::from_utf8_lossy(&response[..n]);
+        assert!(
+            response_str.contains("200"),
+            "should get 200 Connection Established via Unix socket, got: {response_str}"
+        );
+
+        proxy_handle.abort();
+    }
+
+    /// Verify that the proxy socket file is created at the expected path
+    /// inside the temp directory and cleaned up when the temp dir is dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_socket_path_lifecycle() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let socket = proxy_socket_path(temp_dir.path());
+
+        assert_eq!(
+            socket.file_name().unwrap(),
+            PROXY_SOCKET_NAME,
+            "socket filename should be the constant"
+        );
+
+        // Bind the listener to create the socket file.
+        let _listener = UnixListener::bind(&socket).unwrap();
+        assert!(socket.exists(), "socket file should exist after bind");
+
+        // Drop the temp dir; the socket file should be removed.
+        let path_clone = socket.clone();
+        drop(_listener);
+        drop(temp_dir);
+        assert!(
+            !path_clone.exists(),
+            "socket file should be cleaned up with temp dir"
         );
     }
 }

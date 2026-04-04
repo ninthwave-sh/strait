@@ -40,6 +40,12 @@ pub const TEMPLATES: &[Template] = &[
         schema: include_str!("../templates/aws-s3-readwrite.cedarschema"),
     },
     Template {
+        name: "claude-code",
+        description: "Claude Code agent: Anthropic + GitHub API, filesystem, dev tools",
+        policy: include_str!("../templates/claude-code.cedar"),
+        schema: include_str!("../templates/strait.cedarschema"),
+    },
+    Template {
         name: "container-sandbox",
         description: "Container sandbox: fs read/write + scoped HTTP access",
         policy: include_str!("../templates/container-sandbox.cedar"),
@@ -164,6 +170,7 @@ mod tests {
         assert!(find("github-org-contributor").is_some());
         assert!(find("aws-s3-readonly").is_some());
         assert!(find("aws-s3-readwrite").is_some());
+        assert!(find("claude-code").is_some());
         assert!(find("container-sandbox").is_some());
     }
 
@@ -208,12 +215,13 @@ mod tests {
 
     #[test]
     fn template_list_contains_all_templates() {
-        assert_eq!(TEMPLATES.len(), 5);
+        assert_eq!(TEMPLATES.len(), 6);
         let names: Vec<&str> = TEMPLATES.iter().map(|t| t.name).collect();
         assert!(names.contains(&"github-org-readonly"));
         assert!(names.contains(&"github-org-contributor"));
         assert!(names.contains(&"aws-s3-readonly"));
         assert!(names.contains(&"aws-s3-readwrite"));
+        assert!(names.contains(&"claude-code"));
         assert!(names.contains(&"container-sandbox"));
     }
 
@@ -634,5 +642,227 @@ permit(
             .evaluate("example.com", "http:GET", "/", &[], "worker")
             .unwrap();
         assert!(!result.allowed, "http:GET to example.com should be denied");
+    }
+
+    // --- claude-code behavioral tests ---
+
+    #[test]
+    fn claude_code_permits_anthropic_api() {
+        let t = find("claude-code").unwrap();
+        let policy = t.policy.replace("your-org", "test-org");
+        let engine = engine_from_policy(&policy);
+
+        let result = engine
+            .evaluate(
+                "api.anthropic.com",
+                "http:POST",
+                "/v1/messages",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            result.allowed,
+            "POST /v1/messages to Anthropic should be allowed"
+        );
+
+        let result = engine
+            .evaluate("api.anthropic.com", "http:GET", "/v1/models", &[], "worker")
+            .unwrap();
+        assert!(
+            result.allowed,
+            "GET /v1/models to Anthropic should be allowed"
+        );
+    }
+
+    #[test]
+    fn claude_code_permits_github_read_write_delete() {
+        let t = find("claude-code").unwrap();
+        let policy = t.policy.replace("your-org", "test-org");
+        let engine = engine_from_policy(&policy);
+
+        // GET should be allowed
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "http:GET",
+                "/repos/test-org/my-repo/pulls",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(result.allowed, "GET to GitHub org repos should be allowed");
+
+        // POST should be allowed
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "http:POST",
+                "/repos/test-org/my-repo/pulls",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(result.allowed, "POST to GitHub org repos should be allowed");
+
+        // DELETE should be allowed (e.g. delete branch)
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "http:DELETE",
+                "/repos/test-org/my-repo/git/refs/heads/feature",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            result.allowed,
+            "DELETE branch on GitHub org repos should be allowed"
+        );
+    }
+
+    #[test]
+    fn claude_code_denies_push_main() {
+        let t = find("claude-code").unwrap();
+        let policy = t.policy.replace("your-org", "test-org");
+        let engine = engine_from_policy(&policy);
+
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "http:POST",
+                "/repos/test-org/my-repo/git/refs/heads/main",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "POST to git/refs/heads/main should be denied"
+        );
+    }
+
+    #[test]
+    fn claude_code_denies_repo_delete() {
+        let t = find("claude-code").unwrap();
+        let policy = t.policy.replace("your-org", "test-org");
+        let engine = engine_from_policy(&policy);
+
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "http:DELETE",
+                "/repos/test-org/my-repo",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(!result.allowed, "DELETE on repo should be denied");
+    }
+
+    #[test]
+    fn claude_code_denies_outside_org() {
+        let t = find("claude-code").unwrap();
+        let policy = t.policy.replace("your-org", "test-org");
+        let engine = engine_from_policy(&policy);
+
+        let result = engine
+            .evaluate(
+                "api.github.com",
+                "http:POST",
+                "/repos/other-org/repo/pulls",
+                &[],
+                "worker",
+            )
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "POST to repos outside org should be denied"
+        );
+    }
+
+    #[test]
+    fn claude_code_permits_fs_workspace() {
+        let t = find("claude-code").unwrap();
+        let engine = engine_from_policy(t.policy);
+
+        let result = engine
+            .evaluate_fs("/project/src/main.rs", "fs:read", "worker")
+            .unwrap();
+        assert!(result.allowed, "fs:read in workspace should be allowed");
+
+        let result = engine
+            .evaluate_fs("/project/src/main.rs", "fs:write", "worker")
+            .unwrap();
+        assert!(result.allowed, "fs:write in workspace should be allowed");
+    }
+
+    #[test]
+    fn claude_code_permits_fs_read_system() {
+        let t = find("claude-code").unwrap();
+        let engine = engine_from_policy(t.policy);
+
+        let result = engine
+            .evaluate_fs("/usr/lib/libc.so", "fs:read", "worker")
+            .unwrap();
+        assert!(result.allowed, "fs:read system libraries should be allowed");
+    }
+
+    #[test]
+    fn claude_code_denies_fs_write_system() {
+        let t = find("claude-code").unwrap();
+        let engine = engine_from_policy(t.policy);
+
+        let result = engine
+            .evaluate_fs("/etc/passwd", "fs:write", "worker")
+            .unwrap();
+        assert!(!result.allowed, "fs:write to system paths should be denied");
+    }
+
+    #[test]
+    fn claude_code_permits_dev_tools() {
+        let t = find("claude-code").unwrap();
+        let engine = engine_from_policy(t.policy);
+
+        for cmd in &["git status", "node index.js", "npm install", "cargo test"] {
+            let result = engine.evaluate_proc(cmd, "proc:exec", "worker").unwrap();
+            assert!(result.allowed, "proc:exec '{cmd}' should be allowed");
+        }
+    }
+
+    #[test]
+    fn claude_code_permits_claude_cli() {
+        let t = find("claude-code").unwrap();
+        let engine = engine_from_policy(t.policy);
+
+        let result = engine
+            .evaluate_proc("claude chat", "proc:exec", "worker")
+            .unwrap();
+        assert!(result.allowed, "proc:exec 'claude chat' should be allowed");
+    }
+
+    #[test]
+    fn claude_code_denies_rm_rf() {
+        let t = find("claude-code").unwrap();
+        let engine = engine_from_policy(t.policy);
+
+        let result = engine
+            .evaluate_proc("rm -rf /", "proc:exec", "worker")
+            .unwrap();
+        assert!(!result.allowed, "proc:exec 'rm -rf /' should be denied");
+    }
+
+    #[test]
+    fn claude_code_denies_force_push() {
+        let t = find("claude-code").unwrap();
+        let engine = engine_from_policy(t.policy);
+
+        let result = engine
+            .evaluate_proc("git push --force origin main", "proc:exec", "worker")
+            .unwrap();
+        assert!(
+            !result.allowed,
+            "proc:exec 'git push --force' should be denied"
+        );
     }
 }

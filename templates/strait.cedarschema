@@ -51,5 +51,7 @@ action "proc:exec", "proc:fork", "proc:signal"
     appliesTo {
         principal: Agent,
         resource: Resource,
-        context: {},
+        context: {
+            "command": String,
+        },
     };

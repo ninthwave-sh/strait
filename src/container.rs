@@ -317,6 +317,7 @@ impl ContainerManager {
     ///
     /// The proxy socket and gateway binary paths are trusted (internally
     /// generated) and not validated against `base_dir`.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_config(
         policy: &ContainerPolicy,
         image: &str,
@@ -325,6 +326,7 @@ impl ContainerManager {
         gateway_binary_host_path: &std::path::Path,
         ca_pem_host_path: Option<&std::path::Path>,
         base_dir: &std::path::Path,
+        tty: bool,
     ) -> anyhow::Result<ContainerConfig> {
         let mut binds = Vec::new();
         let mut extra_path_dirs: Vec<String> = Vec::new();
@@ -448,7 +450,7 @@ impl ContainerManager {
             cmd: cmd.to_vec(),
             env,
             binds,
-            tty: true,
+            tty,
             entrypoint: Some(entrypoint),
             auto_remove: true,
             network_mode: Some("none".to_string()),
@@ -481,6 +483,7 @@ impl ContainerManager {
         gateway_binary_host_path: &std::path::Path,
         ca_pem_host_path: Option<&std::path::Path>,
         base_dir: &std::path::Path,
+        tty: bool,
     ) -> anyhow::Result<String> {
         let config = Self::build_config(
             policy,
@@ -490,6 +493,7 @@ impl ContainerManager {
             gateway_binary_host_path,
             ca_pem_host_path,
             base_dir,
+            tty,
         )?;
         self.create_container_from_config(&config).await
     }
@@ -825,6 +829,18 @@ mod tests {
         ca_pem_host_path: Option<&Path>,
         base_dir: &Path,
     ) -> anyhow::Result<ContainerConfig> {
+        build_test_config_with_tty(policy, image, cmd, ca_pem_host_path, base_dir, true)
+    }
+
+    /// Helper: call build_config with explicit TTY control.
+    fn build_test_config_with_tty(
+        policy: &ContainerPolicy,
+        image: &str,
+        cmd: &[String],
+        ca_pem_host_path: Option<&Path>,
+        base_dir: &Path,
+        tty: bool,
+    ) -> anyhow::Result<ContainerConfig> {
         ContainerManager::build_config(
             policy,
             image,
@@ -833,6 +849,7 @@ mod tests {
             test_gateway_binary(),
             ca_pem_host_path,
             base_dir,
+            tty,
         )
     }
 
@@ -1012,7 +1029,16 @@ mod tests {
     fn tty_enabled_by_default() {
         let policy = policy_with(vec![]);
         let config = build_test_config(&policy, "alpine", &[], None, test_base_dir()).unwrap();
-        assert!(config.tty, "TTY should be enabled");
+        assert!(config.tty, "TTY should be enabled by default");
+    }
+
+    #[test]
+    fn tty_disabled_when_requested() {
+        let policy = policy_with(vec![]);
+        let config =
+            build_test_config_with_tty(&policy, "alpine", &[], None, test_base_dir(), false)
+                .unwrap();
+        assert!(!config.tty, "TTY should be disabled when tty=false");
     }
 
     #[test]

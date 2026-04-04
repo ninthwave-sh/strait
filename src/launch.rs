@@ -261,6 +261,7 @@ pub async fn run_launch_observe(
     credential_store: Option<Arc<CredentialStore>>,
     mitm_hosts: Vec<String>,
     extra_env: Vec<String>,
+    tty: bool,
 ) -> anyhow::Result<i32> {
     let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
@@ -353,6 +354,7 @@ pub async fn run_launch_observe(
         &gateway_binary,
         Some(&ca_pem_path),
         &cwd,
+        tty,
     )?;
     config.auto_remove = false;
     config.env.extend(extra_env);
@@ -447,6 +449,7 @@ pub async fn run_launch_with_policy(
     credential_store: Option<Arc<CredentialStore>>,
     mitm_hosts: Vec<String>,
     extra_env: Vec<String>,
+    tty: bool,
 ) -> anyhow::Result<i32> {
     let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
@@ -572,6 +575,7 @@ pub async fn run_launch_with_policy(
         &gateway_binary,
         Some(&ca_pem_path),
         &cwd,
+        tty,
     )?;
     config.auto_remove = false;
     config.env.extend(extra_env);
@@ -1059,6 +1063,7 @@ mod tests {
             Path::new("/usr/local/bin/strait-gateway"),
             None,
             Path::new("/project"),
+            true,
         )
         .unwrap();
 

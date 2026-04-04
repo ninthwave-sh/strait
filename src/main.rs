@@ -188,6 +188,14 @@ TLS TRUST:
         #[arg(long, default_value = "observations.jsonl")]
         output: PathBuf,
 
+        /// Disable TTY allocation in the container.
+        ///
+        /// By default, the container runs with a pseudo-TTY attached. Use this
+        /// flag when stdin is not a terminal (e.g., CI pipelines, headless
+        /// adapters, background processes).
+        #[arg(long)]
+        no_tty: bool,
+
         /// Set environment variables in the container (repeatable).
         #[arg(long, value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -301,6 +309,7 @@ async fn main() -> anyhow::Result<()> {
             config,
             image,
             output,
+            no_tty,
             env,
             command,
         } => {
@@ -328,6 +337,7 @@ async fn main() -> anyhow::Result<()> {
             };
 
             // clap's ArgGroup "mode" guarantees exactly one of these is set.
+            let tty = !no_tty;
             let exit_code = if let Some(policy_path) = policy {
                 // Enforce mode: deny disallowed access
                 strait::launch::run_launch_with_policy(
@@ -339,6 +349,7 @@ async fn main() -> anyhow::Result<()> {
                     credential_store,
                     mitm_hosts,
                     env,
+                    tty,
                 )
                 .await?
             } else if let Some(warn_path) = warn {
@@ -352,6 +363,7 @@ async fn main() -> anyhow::Result<()> {
                     credential_store,
                     mitm_hosts,
                     env,
+                    tty,
                 )
                 .await?
             } else {
@@ -364,6 +376,7 @@ async fn main() -> anyhow::Result<()> {
                     credential_store,
                     mitm_hosts,
                     env,
+                    tty,
                 )
                 .await?
             };
@@ -874,6 +887,30 @@ mod tests {
         match cli.command {
             Commands::Launch { env, .. } => {
                 assert_eq!(env, vec!["FOO=bar=baz"]);
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_no_tty_flag() {
+        let cli =
+            Cli::try_parse_from(["strait", "launch", "--observe", "--no-tty", "echo", "hello"])
+                .unwrap();
+        match cli.command {
+            Commands::Launch { no_tty, .. } => {
+                assert!(no_tty, "--no-tty flag should be true");
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_tty_default() {
+        let cli = Cli::try_parse_from(["strait", "launch", "--observe", "echo", "hello"]).unwrap();
+        match cli.command {
+            Commands::Launch { no_tty, .. } => {
+                assert!(!no_tty, "--no-tty should default to false");
             }
             _ => panic!("expected Launch subcommand"),
         }

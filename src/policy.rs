@@ -377,7 +377,80 @@ pub fn extract_fs_permissions(
     perms
 }
 
-/// Build a resource ID string from host and path.
+/// Extract process execution permissions from a Cedar policy for container configuration.
+///
+/// Iterates over all permit policies in the set, identifies those that allow
+/// `proc:exec`, and extracts the binary name from the resource constraint.
+/// Returns a `Vec<ContainerPermission::ProcExec>` with one entry per permitted binary.
+///
+/// Supports resource constraints of the form:
+/// - `resource == Resource::"proc::<binary>"` (exact match)
+/// - `resource in Resource::"proc::<binary>"` (hierarchy match, treated as exact)
+///
+/// Policies with `resource is ...` or unconstrained resources are skipped
+/// (we cannot determine a specific binary to mount).
+pub fn extract_proc_permissions(
+    engine: &PolicyEngine,
+    _agent_id: &str,
+) -> Vec<crate::container::ContainerPermission> {
+    use crate::container::ContainerPermission;
+    use cedar_policy::{ActionConstraint, Effect, ResourceConstraint};
+
+    let mut perms = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for policy in engine.policy_set.policies() {
+        if policy.effect() != Effect::Permit {
+            continue;
+        }
+
+        // Check if this policy involves proc:exec
+        let is_proc_exec = match policy.action_constraint() {
+            ActionConstraint::Eq(uid) => uid.to_string().contains("proc:exec"),
+            ActionConstraint::In(uids) => uids.iter().any(|u| u.to_string().contains("proc:exec")),
+            ActionConstraint::Any => false, // Too broad to extract a specific binary
+        };
+        if !is_proc_exec {
+            continue;
+        }
+
+        // Extract binary name from resource constraint
+        let resource_str = match policy.resource_constraint() {
+            ResourceConstraint::Eq(uid) => Some(uid.to_string()),
+            ResourceConstraint::In(uid) => Some(uid.to_string()),
+            _ => None,
+        };
+
+        if let Some(resource_id) = resource_str {
+            // Resource IDs look like: Resource::"proc::git"
+            // Extract the binary name after "proc::"
+            if let Some(binary) = extract_binary_from_resource_id(&resource_id) {
+                if seen.insert(binary.clone()) {
+                    perms.push(ContainerPermission::ProcExec(binary));
+                }
+            }
+        }
+    }
+    perms
+}
+
+/// Extract a binary name from a Cedar resource ID string.
+///
+/// Handles the format `Resource::"proc::<binary>"`, returning the binary name.
+/// Returns `None` if the resource ID doesn't match the proc namespace format.
+fn extract_binary_from_resource_id(resource_id: &str) -> Option<String> {
+    // The to_string() representation of a resource UID is:
+    //   Resource::"proc::git"
+    // We need to extract "git" from this.
+    let inner = resource_id
+        .strip_prefix("Resource::\"")
+        .and_then(|s| s.strip_suffix('"'))?;
+    let binary = inner.strip_prefix("proc::")?;
+    if binary.is_empty() {
+        return None;
+    }
+    Some(binary.to_string())
+}
 /// e.g. host="api.github.com", path="/repos/org/repo" -> "api.github.com/repos/org/repo"
 pub fn build_resource_id(host: &str, path: &str) -> String {
     let trimmed = path.trim_start_matches('/');
@@ -2153,6 +2226,145 @@ permit(
             perms.is_empty(),
             "HTTP-only policy should produce no fs mounts"
         );
+    }
+
+    // --- extract_proc_permissions tests (H-DF-2) ---
+
+    #[test]
+    fn extract_proc_permissions_finds_proc_exec_rules() {
+        use crate::container::ContainerPermission;
+
+        let f = write_policy(
+            r#"
+@id("allow-git")
+permit(
+    principal == Agent::"agent",
+    action == Action::"proc:exec",
+    resource == Resource::"proc::git"
+);
+
+@id("allow-curl")
+permit(
+    principal == Agent::"agent",
+    action == Action::"proc:exec",
+    resource == Resource::"proc::curl"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let perms = extract_proc_permissions(&engine, "agent");
+
+        assert_eq!(perms.len(), 2, "should find 2 proc:exec permissions");
+        let names: Vec<&str> = perms
+            .iter()
+            .map(|p| match p {
+                ContainerPermission::ProcExec(name) => name.as_str(),
+                _ => panic!("expected ProcExec"),
+            })
+            .collect();
+        assert!(names.contains(&"git"), "should contain git: {:?}", names);
+        assert!(names.contains(&"curl"), "should contain curl: {:?}", names);
+    }
+
+    #[test]
+    fn extract_proc_permissions_ignores_non_proc_policies() {
+        let f = write_policy(
+            r#"
+@id("allow-http")
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource in Resource::"api.github.com"
+);
+
+@id("allow-fs")
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:read",
+    resource in Resource::"fs::/project"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let perms = extract_proc_permissions(&engine, "agent");
+
+        assert!(
+            perms.is_empty(),
+            "should return empty for non-proc policies: {:?}",
+            perms
+        );
+    }
+
+    #[test]
+    fn extract_proc_permissions_deduplicates() {
+        use crate::container::ContainerPermission;
+
+        let f = write_policy(
+            r#"
+@id("allow-git-1")
+permit(
+    principal == Agent::"agent",
+    action == Action::"proc:exec",
+    resource == Resource::"proc::git"
+);
+
+@id("allow-git-2")
+permit(
+    principal == Agent::"worker",
+    action == Action::"proc:exec",
+    resource == Resource::"proc::git"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let perms = extract_proc_permissions(&engine, "agent");
+
+        assert_eq!(perms.len(), 1, "should deduplicate: {:?}", perms);
+        assert_eq!(perms[0], ContainerPermission::ProcExec("git".to_string()));
+    }
+
+    #[test]
+    fn extract_proc_permissions_ignores_forbid_rules() {
+        let f = write_policy(
+            r#"
+@id("forbid-git")
+forbid(
+    principal == Agent::"agent",
+    action == Action::"proc:exec",
+    resource == Resource::"proc::git"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let perms = extract_proc_permissions(&engine, "agent");
+
+        assert!(perms.is_empty(), "should ignore forbid rules: {:?}", perms);
+    }
+
+    #[test]
+    fn extract_proc_permissions_handles_resource_in_constraint() {
+        use crate::container::ContainerPermission;
+
+        let f = write_policy(
+            r#"
+@id("allow-node")
+permit(
+    principal == Agent::"agent",
+    action == Action::"proc:exec",
+    resource in Resource::"proc::node"
+);
+"#,
+        );
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let perms = extract_proc_permissions(&engine, "agent");
+
+        assert_eq!(perms.len(), 1, "should find resource in constraint");
+        assert_eq!(perms[0], ContainerPermission::ProcExec("node".to_string()));
     }
 
     // --- Header namespace security tests (H-ER-1) ---

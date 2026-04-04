@@ -3,7 +3,7 @@
 //! Translates Cedar policy into Docker container configuration:
 //! - `fs:read` policies map to read-only bind-mounts
 //! - `fs:write` policies map to read-write bind-mounts
-//! - `proc:exec` policies map to binaries available on the container PATH
+//! - `proc:exec` policies map to host binaries bind-mounted read-only into the container
 //!
 //! # Security Model: Network Isolation
 //!
@@ -231,6 +231,38 @@ pub fn validate_bind_mount_path(path: &str, base_dir: &std::path::Path) -> anyho
 }
 
 // ---------------------------------------------------------------------------
+// Host binary resolution
+// ---------------------------------------------------------------------------
+
+/// Container directory where host binaries are bind-mounted.
+const CONTAINER_BIN_DIR: &str = "/usr/local/bin";
+
+/// Resolve a binary name to its absolute path on the host by searching PATH.
+///
+/// Looks up `name` in each directory listed in the `PATH` environment variable.
+/// Returns the first match that exists and is a file. Returns `None` if the
+/// binary is not found (callers should warn, not fail).
+pub fn resolve_host_binary(name: &str) -> Option<std::path::PathBuf> {
+    resolve_host_binary_with_path(name, std::env::var("PATH").ok().as_deref())
+}
+
+/// Inner resolver that accepts an explicit PATH string (testable without
+/// depending on the real environment).
+pub(crate) fn resolve_host_binary_with_path(
+    name: &str,
+    path_var: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let path_var = path_var?;
+    for dir in path_var.split(':') {
+        let candidate = std::path::Path::new(dir).join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // ContainerManager
 // ---------------------------------------------------------------------------
 
@@ -308,22 +340,35 @@ impl ContainerManager {
                     binds.push(format!("{validated}:{validated}:rw"));
                 }
                 ContainerPermission::ProcExec(binary) => {
-                    // Derive the directory containing the binary and add to PATH.
-                    // If the binary is a bare name (e.g. "git"), assume it lives
-                    // in a standard location and add /usr/bin to PATH.
-                    if let Some(dir) = std::path::Path::new(binary).parent() {
-                        let dir_str = dir.to_string_lossy();
-                        if !dir_str.is_empty() {
-                            if !extra_path_dirs.contains(&dir_str.to_string()) {
-                                extra_path_dirs.push(dir_str.to_string());
-                            }
-                        } else {
-                            // Bare binary name — add standard locations
-                            for std_dir in ["/usr/local/bin", "/usr/bin", "/bin"] {
-                                if !extra_path_dirs.contains(&std_dir.to_string()) {
-                                    extra_path_dirs.push(std_dir.to_string());
-                                }
-                            }
+                    // Resolve the binary on the host and bind-mount it into
+                    // /usr/local/bin/<name>:ro inside the container.
+                    let binary_name = std::path::Path::new(binary)
+                        .file_name()
+                        .unwrap_or_else(|| std::ffi::OsStr::new(binary))
+                        .to_string_lossy()
+                        .to_string();
+
+                    if let Some(host_path) = resolve_host_binary(&binary_name) {
+                        let container_path = format!("{CONTAINER_BIN_DIR}/{binary_name}");
+                        binds.push(format!("{}:{}:ro", host_path.display(), container_path,));
+                        info!(
+                            binary = %binary_name,
+                            host_path = %host_path.display(),
+                            container_path = %container_path,
+                            "mounting host binary into container"
+                        );
+                    } else {
+                        warn!(
+                            binary = %binary_name,
+                            "host binary not found in PATH, skipping mount"
+                        );
+                    }
+
+                    // Always add /usr/local/bin to PATH (where we mount binaries)
+                    // plus standard dirs as fallback.
+                    for std_dir in [CONTAINER_BIN_DIR, "/usr/bin", "/bin"] {
+                        if !extra_path_dirs.contains(&std_dir.to_string()) {
+                            extra_path_dirs.push(std_dir.to_string());
                         }
                     }
                 }
@@ -934,7 +979,9 @@ mod tests {
     }
 
     #[test]
-    fn proc_exec_absolute_path_adds_parent_to_path() {
+    fn proc_exec_absolute_path_extracts_binary_name() {
+        // When ProcExec contains a full path, the file_name is extracted
+        // and used for host PATH lookup and container mount path.
         let policy = policy_with(vec![ContainerPermission::ProcExec(
             "/usr/local/bin/node".to_string(),
         )]);
@@ -946,7 +993,7 @@ mod tests {
         let path_value = path_env.unwrap().strip_prefix("PATH=").unwrap();
         assert!(
             path_value.contains("/usr/local/bin"),
-            "PATH should include parent dir: {path_value}"
+            "PATH should include mount location: {path_value}"
         );
     }
 
@@ -1022,6 +1069,18 @@ mod tests {
             .binds
             .contains(&"/project/out:/project/out:rw".to_string()));
 
+        // If git is available on the host, it should be bind-mounted
+        if resolve_host_binary("git").is_some() {
+            assert!(
+                config
+                    .binds
+                    .iter()
+                    .any(|b| b.contains("/usr/local/bin/git:ro")),
+                "should bind-mount git when available on host: {:?}",
+                config.binds
+            );
+        }
+
         // Check proxy env vars point to gateway
         let proxy_url = format!("http://{GATEWAY_LISTEN_ADDR}");
         for var in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
@@ -1032,7 +1091,7 @@ mod tests {
             );
         }
 
-        // Check PATH includes git directories
+        // Check PATH includes mount location and standard dirs
         let path_env = config.env.iter().find(|e| e.starts_with("PATH="));
         assert!(path_env.is_some());
 
@@ -1478,6 +1537,126 @@ mod tests {
         assert!(
             err.contains("failed to pull"),
             "error should mention pull failure: {err}"
+        );
+    }
+
+    // -- Unit tests: resolve_host_binary_with_path ----------------------------
+
+    #[test]
+    fn resolve_host_binary_finds_known_binary() {
+        // "sh" exists on every Unix system
+        let result = resolve_host_binary_with_path("sh", Some("/bin:/usr/bin"));
+        assert!(result.is_some(), "should find 'sh' in /bin or /usr/bin");
+        let path = result.unwrap();
+        assert!(
+            path.ends_with("sh"),
+            "resolved path should end with 'sh': {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn resolve_host_binary_returns_none_for_nonexistent() {
+        let result = resolve_host_binary_with_path(
+            "this-binary-absolutely-does-not-exist-xyz",
+            Some("/bin:/usr/bin:/usr/local/bin"),
+        );
+        assert!(
+            result.is_none(),
+            "should return None for nonexistent binary"
+        );
+    }
+
+    #[test]
+    fn resolve_host_binary_returns_none_for_empty_path() {
+        let result = resolve_host_binary_with_path("sh", Some(""));
+        assert!(result.is_none(), "should return None when PATH is empty");
+    }
+
+    #[test]
+    fn resolve_host_binary_returns_none_when_no_path() {
+        let result = resolve_host_binary_with_path("sh", None);
+        assert!(result.is_none(), "should return None when PATH is not set");
+    }
+
+    #[test]
+    fn resolve_host_binary_uses_first_match() {
+        // Create a temp dir with a fake binary
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_bin = tmp.path().join("mybin");
+        std::fs::write(&fake_bin, b"fake").unwrap();
+
+        let path_var = format!("{}:/usr/bin", tmp.path().display());
+        let result = resolve_host_binary_with_path("mybin", Some(&path_var));
+        assert!(result.is_some(), "should find mybin in temp dir");
+        assert_eq!(result.unwrap(), fake_bin);
+    }
+
+    // -- Unit tests: ProcExec bind-mount in build_config ----------------------
+
+    #[test]
+    fn proc_exec_mounts_host_binary_into_container() {
+        // Create a temp dir with a fake binary to simulate host PATH
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_git = tmp.path().join("git");
+        std::fs::write(&fake_git, b"fake").unwrap();
+
+        // Temporarily set PATH to include our temp dir
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{original_path}", tmp.path().display()));
+
+        let policy = policy_with(vec![ContainerPermission::ProcExec("git".to_string())]);
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
+
+        // Restore PATH
+        std::env::set_var("PATH", &original_path);
+
+        // Should have a bind-mount for git
+        let git_bind = format!("{}:/usr/local/bin/git:ro", fake_git.display());
+        assert!(
+            config.binds.contains(&git_bind),
+            "should bind-mount git from host: {:?}",
+            config.binds
+        );
+    }
+
+    #[test]
+    fn proc_exec_missing_binary_does_not_fail() {
+        let policy = policy_with(vec![ContainerPermission::ProcExec(
+            "this-binary-absolutely-does-not-exist-xyz".to_string(),
+        )]);
+
+        // Should not fail, just warn and skip the mount
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
+
+        // Should still have PATH set (standard dirs)
+        let path_env = config.env.iter().find(|e| e.starts_with("PATH="));
+        assert!(path_env.is_some(), "should have PATH even without mount");
+
+        // Should not have a bind for the missing binary
+        assert!(
+            !config
+                .binds
+                .iter()
+                .any(|b| b.contains("this-binary-absolutely-does-not-exist-xyz")),
+            "should not bind-mount missing binary: {:?}",
+            config.binds
+        );
+    }
+
+    #[test]
+    fn proc_exec_path_includes_mount_location() {
+        let policy = policy_with(vec![ContainerPermission::ProcExec("git".to_string())]);
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
+
+        let path_env = config.env.iter().find(|e| e.starts_with("PATH="));
+        assert!(path_env.is_some(), "should have PATH env var");
+        let path_value = path_env.unwrap().strip_prefix("PATH=").unwrap();
+
+        // /usr/local/bin (CONTAINER_BIN_DIR) should be in PATH
+        assert!(
+            path_value.contains("/usr/local/bin"),
+            "PATH should include mount location (/usr/local/bin): {path_value}"
         );
     }
 }

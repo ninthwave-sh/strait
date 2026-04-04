@@ -147,6 +147,7 @@ async fn launch_observe_echo_hello() {
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await
     .expect("launch should succeed");
@@ -197,6 +198,7 @@ async fn launch_observe_contains_lifecycle_events() {
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await
     .unwrap();
@@ -244,6 +246,7 @@ async fn launch_observe_bad_command_exit_code() {
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await
     .unwrap();
@@ -318,6 +321,7 @@ async fn launch_policy_invalid_file_fails_fast() {
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await;
 
@@ -349,6 +353,7 @@ async fn launch_policy_missing_file_fails_fast() {
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await;
 
@@ -405,6 +410,7 @@ permit(
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await
     .unwrap();
@@ -462,6 +468,7 @@ permit(
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await
     .unwrap();
@@ -557,6 +564,7 @@ async fn enforce_proxy_path_end_to_end() {
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await
     .unwrap();
@@ -606,6 +614,7 @@ async fn enforce_direct_outbound_tcp_blocked() {
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await
     .unwrap();
@@ -640,6 +649,7 @@ async fn observe_direct_outbound_tcp_blocked() {
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await
     .unwrap();
@@ -683,6 +693,7 @@ async fn observe_proxy_path_end_to_end() {
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await
     .unwrap();
@@ -718,6 +729,7 @@ async fn enforce_exit_code_propagation() {
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await
     .unwrap();
@@ -762,6 +774,7 @@ async fn enforce_clean_exit_zero() {
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await
     .unwrap();
@@ -821,6 +834,7 @@ async fn warn_proxy_path_end_to_end() {
         None,
         Vec::new(),
         vec![],
+        true,
     )
     .await
     .unwrap();

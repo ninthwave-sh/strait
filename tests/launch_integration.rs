@@ -10,12 +10,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
 /// Container image used for integration tests.
-///
-/// Uses a glibc-based image (not Alpine/musl) because the `strait-gateway`
-/// binary is compiled for the host platform and bind-mounted into the
-/// container. On CI (Ubuntu 24.04), this produces a glibc-linked ELF
-/// binary that requires glibc 2.39+. The container image must have a
-/// matching or newer glibc version.
 const TEST_IMAGE: &str = "ubuntu:24.04";
 
 /// Check if Docker is available with the required image for integration tests.
@@ -79,7 +73,19 @@ async fn require_docker() -> bool {
         );
         return false;
     }
-    if strait::launch::find_gateway_binary().is_err() {
+    // Use the host target triple for pre-flight check. Integration tests only
+    // run on Linux hosts (gateway_compatible_with_container check above), and
+    // CI builds the gateway with `cargo build -p strait-gateway` (native arch).
+    let host_target = if cfg!(target_arch = "x86_64") {
+        "x86_64-unknown-linux-musl"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64-unknown-linux-musl"
+    } else {
+        // Unknown arch — skip gracefully
+        eprintln!("Skipping: unsupported host architecture for gateway binary lookup");
+        return false;
+    };
+    if strait::launch::resolve_gateway_binary(host_target).is_err() {
         if std::env::var("CI").is_ok() {
             panic!(
                 "strait-gateway binary not found in CI. \

@@ -3,6 +3,10 @@
 # MITM-intercepts Anthropic and GitHub API traffic for policy evaluation
 # and credential injection. The agent inside the container never sees
 # the real API keys.
+#
+# No custom Dockerfile needed. strait mounts host binaries (claude, git,
+# node) into the container when your Cedar policy includes proc:exec
+# rules. See policy.cedar for the full example.
 
 ca_cert_path = "/tmp/strait-ca.pem"
 
@@ -10,6 +14,9 @@ ca_cert_path = "/tmp/strait-ca.pem"
 hosts = [
     "api.anthropic.com",
     "api.github.com",
+    "statsig.anthropic.com",
+    "sentry.io",
+    "registry.npmjs.org",
 ]
 
 # Anthropic API — inject x-api-key header

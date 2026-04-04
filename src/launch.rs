@@ -10,7 +10,7 @@
 //! Startup sequence:
 //! 1. Load and validate Cedar policy (warn/enforce modes -- fail fast if invalid)
 //! 2. Verify Docker is running (fail fast)
-//! 3. Locate the `strait-gateway` binary (next to the current executable)
+//! 3. Detect the container architecture and locate the matching `strait-gateway` binary
 //! 4. Start HTTPS proxy on a random port + bind a Unix socket for the proxy
 //! 5. Write session CA to temp file
 //! 6. Create container with `--network=none`, bind-mounted proxy socket and
@@ -78,10 +78,6 @@ impl EnforcementMode {
 }
 
 /// Default Docker image for the container sandbox.
-///
-/// Must be glibc-based (not Alpine/musl) because the `strait-gateway`
-/// binary is dynamically linked against glibc on the host and bind-mounted
-/// into the container. Alpine uses musl, which cannot load glibc binaries.
 const DEFAULT_IMAGE: &str = "ubuntu:24.04";
 
 /// Filename for the proxy Unix socket inside the session temp directory.
@@ -98,49 +94,156 @@ pub fn proxy_socket_path(temp_dir: &Path) -> PathBuf {
     temp_dir.join(PROXY_SOCKET_NAME)
 }
 
-/// Locate the `strait-gateway` binary.
+// ---------------------------------------------------------------------------
+// Gateway binary resolution
+// ---------------------------------------------------------------------------
+
+/// Map a Docker daemon architecture string to the Rust target triple used
+/// for the statically-linked gateway binary.
 ///
-/// The gateway binary is a separate Cargo binary (`strait-gateway`) that
-/// is bind-mounted into the container to bridge TCP connections to the
-/// proxy Unix socket.
+/// Docker reports architecture via the `Arch` field in system info, using
+/// Go's `runtime.GOARCH` names (e.g. `"amd64"`, `"arm64"`). We map these
+/// to the musl target triples used by CI to build the gateway.
+pub fn docker_arch_to_target(arch: &str) -> anyhow::Result<&'static str> {
+    match arch {
+        "x86_64" | "amd64" => Ok("x86_64-unknown-linux-musl"),
+        "aarch64" | "arm64" => Ok("aarch64-unknown-linux-musl"),
+        other => anyhow::bail!(
+            "unsupported container architecture '{other}' -- \
+             strait supports x86_64 and aarch64 Linux containers"
+        ),
+    }
+}
+
+/// Locate the correct `strait-gateway` binary for the given target triple.
 ///
-/// Search order:
-/// 1. Same directory as the current executable (production install)
-/// 2. Parent directory of the executable (handles `target/debug/deps/`
-///    when run from `cargo test`)
-pub fn find_gateway_binary() -> anyhow::Result<PathBuf> {
+/// The gateway binary runs inside the container and must match the
+/// container's architecture, not the host's. CI builds statically-linked
+/// musl binaries for each supported arch.
+///
+/// Search order (first match wins):
+/// 1. `<exe_dir>/strait-gateway-<target>` (installed layout)
+/// 2. `<exe_dir>/../lib/strait/strait-gateway-<target>` (Homebrew/package layout)
+/// 3. `<exe_dir>/../<target>/release/strait-gateway` (cargo release build)
+/// 4. `<exe_dir>/../<target>/debug/strait-gateway` (cargo debug build)
+/// 5. `<exe_dir>/../../<target>/release/strait-gateway` (cargo test from deps/)
+/// 6. `<exe_dir>/../../<target>/debug/strait-gateway` (cargo test from deps/)
+///
+/// Falls back to architecture-agnostic names for local development when
+/// the host and container architectures match:
+/// 7. `<exe_dir>/strait-gateway` (same-dir, no arch suffix)
+/// 8. `<exe_dir>/../strait-gateway` (parent-dir, cargo test fallback)
+pub fn resolve_gateway_binary(target: &str) -> anyhow::Result<PathBuf> {
     let exe = std::env::current_exe().context("failed to get current executable path")?;
-    let dir = exe
+    let exe_dir = exe
         .parent()
         .context("current executable has no parent directory")?;
 
-    // Check same directory (production: both binaries in /usr/local/bin)
-    let gateway = dir.join("strait-gateway");
-    if gateway.exists() {
-        return Ok(gateway);
+    resolve_gateway_binary_from(exe_dir, target)
+}
+
+/// Inner resolver that takes an explicit base directory (testable without
+/// depending on the current executable path).
+pub(crate) fn resolve_gateway_binary_from(exe_dir: &Path, target: &str) -> anyhow::Result<PathBuf> {
+    let arch_name = format!("strait-gateway-{target}");
+    let mut searched = Vec::new();
+
+    // 1. <exe_dir>/strait-gateway-<target>  (installed layout)
+    let candidate = exe_dir.join(&arch_name);
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+    searched.push(candidate);
+
+    // 2. <exe_dir>/../lib/strait/strait-gateway-<target>  (Homebrew/package layout)
+    if let Some(parent) = exe_dir.parent() {
+        let candidate = parent.join("lib").join("strait").join(&arch_name);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        searched.push(candidate);
     }
 
-    // Check parent directory (cargo test: exe is in target/debug/deps/,
-    // gateway is in target/debug/)
-    if let Some(parent) = dir.parent() {
-        let parent_gateway = parent.join("strait-gateway");
-        if parent_gateway.exists() {
-            return Ok(parent_gateway);
+    // 3-4. <exe_dir>/../<target>/{release,debug}/strait-gateway
+    //      (cargo build: exe is in target/debug/, parent is target/)
+    if let Some(parent) = exe_dir.parent() {
+        for profile in &["release", "debug"] {
+            let candidate = parent.join(target).join(profile).join("strait-gateway");
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+            searched.push(candidate);
         }
     }
 
-    let searched = if let Some(parent) = dir.parent() {
-        format!(
-            "{} and {}",
-            gateway.display(),
-            parent.join("strait-gateway").display()
-        )
-    } else {
-        gateway.display().to_string()
-    };
+    // 5-6. <exe_dir>/../../<target>/{release,debug}/strait-gateway
+    //      (cargo test: exe is in target/debug/deps/, grandparent is target/)
+    if let Some(grandparent) = exe_dir.parent().and_then(|p| p.parent()) {
+        for profile in &["release", "debug"] {
+            let candidate = grandparent
+                .join(target)
+                .join(profile)
+                .join("strait-gateway");
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+            searched.push(candidate);
+        }
+    }
+
+    // 7. <exe_dir>/strait-gateway  (architecture-agnostic fallback for local dev)
+    let candidate = exe_dir.join("strait-gateway");
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+    searched.push(candidate);
+
+    // 8. <exe_dir>/../strait-gateway  (cargo test parent-dir fallback)
+    if let Some(parent) = exe_dir.parent() {
+        let candidate = parent.join("strait-gateway");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        searched.push(candidate);
+    }
+
+    let searched_list = searched
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     anyhow::bail!(
-        "strait-gateway binary not found (searched {searched}) -- build it with: cargo build -p strait-gateway"
+        "strait-gateway binary for {target} not found.\n\
+         Searched: {searched_list}\n\
+         To build it: cargo zigbuild --release --package strait-gateway --target {target}\n\
+         Or for local development: cargo build -p strait-gateway"
     )
+}
+
+/// Query the Docker daemon for the container runtime architecture and
+/// return the corresponding Rust target triple.
+pub async fn detect_container_arch(container_mgr: &ContainerManager) -> anyhow::Result<String> {
+    let info = container_mgr
+        .docker()
+        .info()
+        .await
+        .context("failed to query Docker daemon for system info")?;
+
+    let arch = info
+        .architecture
+        .as_deref()
+        .context("Docker daemon did not report an architecture")?;
+
+    docker_arch_to_target(arch).map(|t| t.to_string())
+}
+
+/// Locate the `strait-gateway` binary for the container runtime architecture.
+///
+/// Queries the Docker daemon, maps the architecture to a target triple,
+/// and resolves the binary using the standard search paths.
+pub async fn find_gateway_binary(container_mgr: &ContainerManager) -> anyhow::Result<PathBuf> {
+    let target = detect_container_arch(container_mgr).await?;
+    resolve_gateway_binary(&target)
 }
 
 /// Run the `launch --observe` workflow.
@@ -168,8 +271,8 @@ pub async fn run_launch_observe(
     container_mgr.verify_connection().await?;
     info!("Docker daemon connected");
 
-    // 2. Locate the gateway binary (fail fast if not found)
-    let gateway_binary = find_gateway_binary()?;
+    // 2. Locate the gateway binary for the container architecture
+    let gateway_binary = find_gateway_binary(&container_mgr).await?;
     info!(path = %gateway_binary.display(), "gateway binary found");
 
     // 3. Create temp directory for ephemeral files (CA pem, entrypoint script)
@@ -368,8 +471,8 @@ pub async fn run_launch_with_policy(
     container_mgr.verify_connection().await?;
     info!("Docker daemon connected");
 
-    // 3. Locate the gateway binary (fail fast if not found)
-    let gateway_binary = find_gateway_binary()?;
+    // 3. Locate the gateway binary for the container architecture
+    let gateway_binary = find_gateway_binary(&container_mgr).await?;
     info!(path = %gateway_binary.display(), "gateway binary found");
 
     // 4. Create temp directory for ephemeral files (CA pem, entrypoint script)
@@ -1492,6 +1595,213 @@ permit(
         assert!(
             !path_clone.exists(),
             "socket file should be cleaned up with temp dir"
+        );
+    }
+
+    // -- docker_arch_to_target tests ------------------------------------------
+
+    #[test]
+    fn docker_arch_x86_64() {
+        assert_eq!(
+            docker_arch_to_target("x86_64").unwrap(),
+            "x86_64-unknown-linux-musl"
+        );
+        assert_eq!(
+            docker_arch_to_target("amd64").unwrap(),
+            "x86_64-unknown-linux-musl"
+        );
+    }
+
+    #[test]
+    fn docker_arch_aarch64() {
+        assert_eq!(
+            docker_arch_to_target("aarch64").unwrap(),
+            "aarch64-unknown-linux-musl"
+        );
+        assert_eq!(
+            docker_arch_to_target("arm64").unwrap(),
+            "aarch64-unknown-linux-musl"
+        );
+    }
+
+    #[test]
+    fn docker_arch_unsupported() {
+        let err = docker_arch_to_target("s390x").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported container architecture"),
+            "error should describe unsupported arch: {msg}"
+        );
+        assert!(
+            msg.contains("s390x"),
+            "error should include the arch: {msg}"
+        );
+    }
+
+    // -- resolve_gateway_binary_from tests ------------------------------------
+
+    #[test]
+    fn resolve_finds_arch_binary_in_exe_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "x86_64-unknown-linux-musl";
+        let binary_path = tmp.path().join(format!("strait-gateway-{target}"));
+        std::fs::write(&binary_path, b"fake").unwrap();
+
+        let result = resolve_gateway_binary_from(tmp.path(), target).unwrap();
+        assert_eq!(result, binary_path);
+    }
+
+    #[test]
+    fn resolve_finds_arch_binary_in_lib_strait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "aarch64-unknown-linux-musl";
+
+        // Simulate: exe is in <prefix>/bin/, gateway in <prefix>/lib/strait/
+        let bin_dir = tmp.path().join("bin");
+        let lib_dir = tmp.path().join("lib").join("strait");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let binary_path = lib_dir.join(format!("strait-gateway-{target}"));
+        std::fs::write(&binary_path, b"fake").unwrap();
+
+        let result = resolve_gateway_binary_from(&bin_dir, target).unwrap();
+        assert_eq!(result, binary_path);
+    }
+
+    #[test]
+    fn resolve_finds_binary_in_cargo_target_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "x86_64-unknown-linux-musl";
+
+        // Simulate: exe is in <workspace>/target/debug/, cross-compiled gateway
+        // is in <workspace>/target/<target>/release/
+        let exe_dir = tmp.path().join("target").join("debug");
+        let gateway_dir = tmp.path().join("target").join(target).join("release");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&gateway_dir).unwrap();
+        let binary_path = gateway_dir.join("strait-gateway");
+        std::fs::write(&binary_path, b"fake").unwrap();
+
+        let result = resolve_gateway_binary_from(&exe_dir, target).unwrap();
+        assert_eq!(result, binary_path);
+    }
+
+    #[test]
+    fn resolve_finds_binary_in_cargo_target_debug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "aarch64-unknown-linux-musl";
+
+        let exe_dir = tmp.path().join("target").join("debug");
+        let gateway_dir = tmp.path().join("target").join(target).join("debug");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&gateway_dir).unwrap();
+        let binary_path = gateway_dir.join("strait-gateway");
+        std::fs::write(&binary_path, b"fake").unwrap();
+
+        let result = resolve_gateway_binary_from(&exe_dir, target).unwrap();
+        assert_eq!(result, binary_path);
+    }
+
+    #[test]
+    fn resolve_finds_binary_from_cargo_test_deps_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "x86_64-unknown-linux-musl";
+
+        // Simulate: exe is in <workspace>/target/debug/deps/, cross-compiled
+        // gateway is in <workspace>/target/<target>/release/
+        let exe_dir = tmp.path().join("target").join("debug").join("deps");
+        let gateway_dir = tmp.path().join("target").join(target).join("release");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&gateway_dir).unwrap();
+        let binary_path = gateway_dir.join("strait-gateway");
+        std::fs::write(&binary_path, b"fake").unwrap();
+
+        let result = resolve_gateway_binary_from(&exe_dir, target).unwrap();
+        assert_eq!(result, binary_path);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_unqualified_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "x86_64-unknown-linux-musl";
+
+        // No arch-specific binary, but plain `strait-gateway` exists
+        let binary_path = tmp.path().join("strait-gateway");
+        std::fs::write(&binary_path, b"fake").unwrap();
+
+        let result = resolve_gateway_binary_from(tmp.path(), target).unwrap();
+        assert_eq!(result, binary_path);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_parent_unqualified_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "x86_64-unknown-linux-musl";
+
+        // Simulate cargo test: exe in deps/, gateway in parent
+        let deps_dir = tmp.path().join("deps");
+        std::fs::create_dir_all(&deps_dir).unwrap();
+        let binary_path = tmp.path().join("strait-gateway");
+        std::fs::write(&binary_path, b"fake").unwrap();
+
+        let result = resolve_gateway_binary_from(&deps_dir, target).unwrap();
+        assert_eq!(result, binary_path);
+    }
+
+    #[test]
+    fn resolve_prefers_arch_specific_over_unqualified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "x86_64-unknown-linux-musl";
+
+        // Both arch-specific and plain exist; arch-specific should win
+        let arch_binary = tmp.path().join(format!("strait-gateway-{target}"));
+        let plain_binary = tmp.path().join("strait-gateway");
+        std::fs::write(&arch_binary, b"arch").unwrap();
+        std::fs::write(&plain_binary, b"plain").unwrap();
+
+        let result = resolve_gateway_binary_from(tmp.path(), target).unwrap();
+        assert_eq!(result, arch_binary);
+    }
+
+    #[test]
+    fn resolve_missing_binary_error_has_build_instructions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "aarch64-unknown-linux-musl";
+
+        let err = resolve_gateway_binary_from(tmp.path(), target).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(target),
+            "error should mention the target: {msg}"
+        );
+        assert!(
+            msg.contains("cargo zigbuild"),
+            "error should include cross-compile build command: {msg}"
+        );
+        assert!(
+            msg.contains("cargo build -p strait-gateway"),
+            "error should include local dev build command: {msg}"
+        );
+        assert!(
+            msg.contains("not found"),
+            "error should say not found: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_missing_binary_error_lists_searched_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "x86_64-unknown-linux-musl";
+
+        let err = resolve_gateway_binary_from(tmp.path(), target).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Searched:"),
+            "error should list searched paths: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("strait-gateway-{target}")),
+            "error should mention arch-qualified name: {msg}"
         );
     }
 }

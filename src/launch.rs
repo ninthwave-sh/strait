@@ -8,35 +8,30 @@
 //! - **Enforce**: evaluate Cedar policy, deny disallowed access
 //!
 //! Startup sequence:
-//! 1. Load and validate Cedar policy (warn/enforce modes — fail fast if invalid)
+//! 1. Load and validate Cedar policy (warn/enforce modes -- fail fast if invalid)
 //! 2. Verify Docker is running (fail fast)
-//! 3. Start lightweight HTTPS proxy on a random port
-//! 4. Write session CA to temp file
-//! 5. Create container with bind-mounts (policy-derived in warn/enforce modes)
-//! 6. Inject CA into container's system bundle (via entrypoint wrapper)
-//! 7. Set HTTPS_PROXY in container pointing to host proxy
+//! 3. Locate the `strait-gateway` binary (next to the current executable)
+//! 4. Start HTTPS proxy on a random port + bind a Unix socket for the proxy
+//! 5. Write session CA to temp file
+//! 6. Create container with `--network=none`, bind-mounted proxy socket and
+//!    gateway binary, policy-derived filesystem mounts
+//! 7. Gateway entrypoint wraps CA trust injection and user command
 //! 8. Start observation stream (JSONL file + Unix socket)
 //! 9. Start container with TTY attached
 //! 10. Wait for agent exit
 //! 11. Stop proxy, clean up container, close observation stream
 //!
-//! # Security: Cooperative Enforcement Model
+//! # Security: Network Isolation
 //!
-//! Network enforcement relies on the container process honoring the
-//! `HTTPS_PROXY` / `HTTP_PROXY` environment variables. This is cooperative —
-//! not enforced at the network layer. A process that ignores the proxy
-//! variables can make direct outbound connections that bypass policy
-//! evaluation entirely. See [`crate::container`] module docs for details.
+//! Containers run with `--network=none` (no network interfaces). All
+//! outbound traffic is forced through the host proxy via a bind-mounted
+//! Unix socket and the `strait-gateway` binary inside the container. See
+//! [`crate::container`] module docs for details.
 //!
 //! **Observe mode caveat**: The working directory is mounted read-write
 //! with no Cedar policy restricting filesystem access. A warning is emitted
 //! to stderr at startup. In warn/enforce modes, filesystem access is
 //! restricted to paths permitted by the Cedar policy.
-//!
-//! **v0.4 roadmap**: Network-level enforcement via Docker `--internal`
-//! bridge network (no default route) with an explicit proxy route. This
-//! eliminates the cooperative assumption by ensuring all outbound traffic
-//! must traverse the Strait proxy.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -83,7 +78,11 @@ impl EnforcementMode {
 }
 
 /// Default Docker image for the container sandbox.
-const DEFAULT_IMAGE: &str = "alpine:latest";
+///
+/// Must be glibc-based (not Alpine/musl) because the `strait-gateway`
+/// binary is dynamically linked against glibc on the host and bind-mounted
+/// into the container. Alpine uses musl, which cannot load glibc binaries.
+const DEFAULT_IMAGE: &str = "ubuntu:24.04";
 
 /// Filename for the proxy Unix socket inside the session temp directory.
 ///
@@ -97,6 +96,51 @@ pub const PROXY_SOCKET_NAME: &str = "proxy.sock";
 /// so the agent process can reach the host proxy over a Unix socket.
 pub fn proxy_socket_path(temp_dir: &Path) -> PathBuf {
     temp_dir.join(PROXY_SOCKET_NAME)
+}
+
+/// Locate the `strait-gateway` binary.
+///
+/// The gateway binary is a separate Cargo binary (`strait-gateway`) that
+/// is bind-mounted into the container to bridge TCP connections to the
+/// proxy Unix socket.
+///
+/// Search order:
+/// 1. Same directory as the current executable (production install)
+/// 2. Parent directory of the executable (handles `target/debug/deps/`
+///    when run from `cargo test`)
+pub fn find_gateway_binary() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe().context("failed to get current executable path")?;
+    let dir = exe
+        .parent()
+        .context("current executable has no parent directory")?;
+
+    // Check same directory (production: both binaries in /usr/local/bin)
+    let gateway = dir.join("strait-gateway");
+    if gateway.exists() {
+        return Ok(gateway);
+    }
+
+    // Check parent directory (cargo test: exe is in target/debug/deps/,
+    // gateway is in target/debug/)
+    if let Some(parent) = dir.parent() {
+        let parent_gateway = parent.join("strait-gateway");
+        if parent_gateway.exists() {
+            return Ok(parent_gateway);
+        }
+    }
+
+    let searched = if let Some(parent) = dir.parent() {
+        format!(
+            "{} and {}",
+            gateway.display(),
+            parent.join("strait-gateway").display()
+        )
+    } else {
+        gateway.display().to_string()
+    };
+    anyhow::bail!(
+        "strait-gateway binary not found (searched {searched}) -- build it with: cargo build -p strait-gateway"
+    )
 }
 
 /// Run the `launch --observe` workflow.
@@ -124,11 +168,15 @@ pub async fn run_launch_observe(
     container_mgr.verify_connection().await?;
     info!("Docker daemon connected");
 
-    // 2. Create temp directory for ephemeral files (CA pem, entrypoint script)
+    // 2. Locate the gateway binary (fail fast if not found)
+    let gateway_binary = find_gateway_binary()?;
+    info!(path = %gateway_binary.display(), "gateway binary found");
+
+    // 3. Create temp directory for ephemeral files (CA pem, entrypoint script)
     let temp_dir = tempfile::TempDir::new().context("failed to create temp directory")?;
     let ca_pem_path = temp_dir.path().join("ca.pem");
 
-    // 3. Set up observation stream (JSONL file + Unix socket)
+    // 4. Set up observation stream (JSONL file + Unix socket)
     let mut obs_stream = ObservationStream::new();
     obs_stream.persist_to_file(&obs_log_path)?;
     info!(path = %obs_log_path.display(), "observation log created");
@@ -143,12 +191,12 @@ pub async fn run_launch_observe(
         eprintln!("Observation socket: {}", socket_path.display());
     }
 
-    // 4. Generate session CA and write to temp file
+    // 5. Generate session CA and write to temp file
     let session_ca = SessionCa::generate()?;
     std::fs::write(&ca_pem_path, &session_ca.ca_cert_pem)?;
     info!(path = %ca_pem_path.display(), "session CA written");
 
-    // 5. Start full MITM proxy on random port (reuses shared proxy implementation)
+    // 6. Start full MITM proxy on random port (reuses shared proxy implementation)
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_port = proxy_listener.local_addr()?.port();
     info!(port = proxy_port, "proxy listening");
@@ -163,8 +211,8 @@ pub async fn run_launch_observe(
     )?);
     let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx.clone()));
 
-    // 5b. Start Unix socket proxy listener so containers can reach the proxy
-    //     without a host TCP port (bind-mount the socket into the container).
+    // 6b. Start Unix socket proxy listener so containers can reach the proxy
+    //     via a bind-mounted socket (required for --network=none).
     #[cfg(unix)]
     let proxy_socket_path = proxy_socket_path(temp_dir.path());
     #[cfg(unix)]
@@ -176,7 +224,7 @@ pub async fn run_launch_observe(
         tokio::spawn(run_mitm_unix_proxy_loop(listener, proxy_ctx))
     };
 
-    // 6. Build observe-mode container config
+    // 7. Build observe-mode container config
     //    In observe mode, mount the working directory read-write (no restrictions)
     let policy = ContainerPolicy {
         permissions: vec![ContainerPermission::FsWrite(
@@ -184,7 +232,7 @@ pub async fn run_launch_observe(
         )],
     };
 
-    // Warn about observe mode's permissive cwd mount and cooperative enforcement
+    // Warn about observe mode's permissive cwd mount
     warn!(
         path = %cwd.display(),
         "observe mode: working directory mounted read-write with no policy restrictions"
@@ -198,7 +246,8 @@ pub async fn run_launch_observe(
         &policy,
         image,
         &command,
-        proxy_port,
+        &proxy_socket_path,
+        &gateway_binary,
         Some(&ca_pem_path),
         &cwd,
     )?;
@@ -319,11 +368,15 @@ pub async fn run_launch_with_policy(
     container_mgr.verify_connection().await?;
     info!("Docker daemon connected");
 
-    // 3. Create temp directory for ephemeral files (CA pem, entrypoint script)
+    // 3. Locate the gateway binary (fail fast if not found)
+    let gateway_binary = find_gateway_binary()?;
+    info!(path = %gateway_binary.display(), "gateway binary found");
+
+    // 4. Create temp directory for ephemeral files (CA pem, entrypoint script)
     let temp_dir = tempfile::TempDir::new().context("failed to create temp directory")?;
     let ca_pem_path = temp_dir.path().join("ca.pem");
 
-    // 4. Set up observation stream (JSONL file + Unix socket)
+    // 5. Set up observation stream (JSONL file + Unix socket)
     let mut obs_stream = ObservationStream::new();
     obs_stream.persist_to_file(&obs_log_path)?;
     info!(path = %obs_log_path.display(), "observation log created");
@@ -336,12 +389,12 @@ pub async fn run_launch_with_policy(
         eprintln!("Observation socket: {}", socket_path.display());
     }
 
-    // 5. Generate session CA and write to temp file
+    // 6. Generate session CA and write to temp file
     let session_ca = SessionCa::generate()?;
     std::fs::write(&ca_pem_path, &session_ca.ca_cert_pem)?;
     info!(path = %ca_pem_path.display(), "session CA written");
 
-    // 6. Start full MITM proxy on random port (reuses shared proxy implementation)
+    // 7. Start full MITM proxy on random port (reuses shared proxy implementation)
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_port = proxy_listener.local_addr()?.port();
     info!(port = proxy_port, "proxy listening");
@@ -356,7 +409,8 @@ pub async fn run_launch_with_policy(
     )?);
     let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx.clone()));
 
-    // 6b. Start Unix socket proxy listener for container traffic
+    // 7b. Start Unix socket proxy listener for container traffic
+    //     (required for --network=none)
     #[cfg(unix)]
     let proxy_socket_path = proxy_socket_path(temp_dir.path());
     #[cfg(unix)]
@@ -368,7 +422,7 @@ pub async fn run_launch_with_policy(
         tokio::spawn(run_mitm_unix_proxy_loop(listener, proxy_ctx))
     };
 
-    // 7. Extract filesystem permissions from Cedar policy
+    // 8. Extract filesystem permissions from Cedar policy
     let candidate_paths = vec![cwd.to_string_lossy().to_string()];
     let permissions = extract_fs_permissions(&engine, &candidate_paths, "agent");
 
@@ -402,12 +456,13 @@ pub async fn run_launch_with_policy(
         permissions: permissions.clone(),
     };
 
-    // 8. Build container config with policy-restricted mounts
+    // 9. Build container config with policy-restricted mounts
     let mut config = ContainerManager::build_config(
         &container_policy,
         image,
         &command,
-        proxy_port,
+        &proxy_socket_path,
+        &gateway_binary,
         Some(&ca_pem_path),
         &cwd,
     )?;
@@ -501,15 +556,15 @@ pub async fn run_launch_with_policy(
 /// Build the stderr warning message for observe mode's read-write cwd mount.
 ///
 /// Observe mode mounts the working directory read-write with no Cedar policy
-/// restricting filesystem access. Additionally, network enforcement relies on
-/// the container process honoring `HTTPS_PROXY` — a cooperative assumption.
+/// restricting filesystem access. Network traffic is still routed through
+/// the proxy via `--network=none` and the gateway.
 ///
 /// This function is extracted to enable testing the warning content.
 pub(crate) fn observe_cwd_warning(cwd: &Path) -> String {
     format!(
-        "Warning: observe mode mounts {} read-write — the container has full write \
-         access to your working directory. Network enforcement is cooperative \
-         (HTTPS_PROXY is advisory, not enforced at the network level).",
+        "Warning: observe mode mounts {} read-write. The container has full write \
+         access to your working directory. Network traffic is routed through the \
+         proxy (--network=none).",
         cwd.display()
     )
 }
@@ -843,9 +898,9 @@ mod tests {
 
     // -- Observe-mode warning tests ------------------------------------------
 
-    /// Verify observe mode warning mentions read-write access and cooperative enforcement.
+    /// Verify observe mode warning mentions read-write access and network isolation.
     #[test]
-    fn observe_cwd_warning_mentions_rw_and_cooperative() {
+    fn observe_cwd_warning_mentions_rw_and_network_isolation() {
         let cwd = PathBuf::from("/project");
         let msg = observe_cwd_warning(&cwd);
 
@@ -858,12 +913,8 @@ mod tests {
             "warning should mention write access: {msg}"
         );
         assert!(
-            msg.contains("cooperative"),
-            "warning should mention cooperative enforcement: {msg}"
-        );
-        assert!(
-            msg.contains("advisory"),
-            "warning should mention HTTPS_PROXY is advisory: {msg}"
+            msg.contains("--network=none"),
+            "warning should mention --network=none: {msg}"
         );
         assert!(
             msg.contains("/project"),
@@ -895,9 +946,10 @@ mod tests {
 
         let config = ContainerManager::build_config(
             &policy,
-            "alpine:latest",
+            "ubuntu:24.04",
             &["sh".to_string()],
-            8080,
+            Path::new("/tmp/proxy.sock"),
+            Path::new("/usr/local/bin/strait-gateway"),
             None,
             Path::new("/project"),
         )
@@ -905,13 +957,11 @@ mod tests {
 
         // Verify cwd is mounted read-write (not read-only)
         assert!(
-            config.binds.iter().any(|b| b.contains(":rw")),
+            config
+                .binds
+                .iter()
+                .any(|b| b.contains("/project") && b.contains(":rw")),
             "observe mode should mount cwd as read-write: {:?}",
-            config.binds
-        );
-        assert!(
-            !config.binds.iter().any(|b| b.contains(":ro")),
-            "observe mode should NOT have read-only mounts: {:?}",
             config.binds
         );
     }

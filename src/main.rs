@@ -181,7 +181,10 @@ TLS TRUST:
         config: Option<PathBuf>,
 
         /// Docker image to use for the container.
-        #[arg(long, default_value = "alpine:latest")]
+        ///
+        /// Must be glibc-based (e.g. ubuntu, debian) because the gateway
+        /// binary is dynamically linked and bind-mounted into the container.
+        #[arg(long, default_value = "ubuntu:24.04")]
         image: String,
 
         /// Output path for the observation JSONL file.

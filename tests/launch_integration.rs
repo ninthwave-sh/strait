@@ -467,3 +467,360 @@ permit(
     let starts = events_of_type(&events, "container_start");
     assert!(!starts.is_empty(), "should have container_start event");
 }
+
+// ---------------------------------------------------------------------------
+// Network isolation integration tests (--network=none + gateway)
+// ---------------------------------------------------------------------------
+
+/// Helper: write a Cedar policy that permits all network and filesystem access.
+fn write_permissive_policy(path: &std::path::Path) {
+    std::fs::write(
+        path,
+        r#"
+@id("allow-all-network")
+permit(
+    principal == Agent::"agent",
+    action in [Action::"http:GET", Action::"http:POST", Action::"http:CONNECT"],
+    resource
+);
+@id("allow-all-fs")
+permit(
+    principal == Agent::"agent",
+    action in [Action::"fs:read", Action::"fs:write"],
+    resource
+);
+"#,
+    )
+    .unwrap();
+}
+
+/// Helper: write a Cedar policy that permits filesystem access only (no network).
+fn write_fs_only_policy(path: &std::path::Path) {
+    std::fs::write(
+        path,
+        r#"
+@id("allow-all-fs")
+permit(
+    principal == Agent::"agent",
+    action in [Action::"fs:read", Action::"fs:write"],
+    resource
+);
+"#,
+    )
+    .unwrap();
+}
+
+/// Enforce mode: the proxy path works end to end through the gateway.
+///
+/// Sends a CONNECT request from inside the container to the gateway at
+/// 127.0.0.1:3128. The request traverses: container loopback -> gateway ->
+/// Unix socket -> host proxy, which responds with "200 Connection Established".
+/// This proves the full proxy path is functional under --network=none.
+#[tokio::test]
+async fn enforce_proxy_path_end_to_end() {
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let policy_path = temp_dir.path().join("policy.cedar");
+    let obs_path = temp_dir.path().join("observations.jsonl");
+    write_permissive_policy(&policy_path);
+
+    // Send a CONNECT request to the gateway from inside the container.
+    // The host proxy responds with "200 Connection Established" which
+    // proves the full proxy flow is working.
+    let exit_code = strait::launch::run_launch_with_policy(
+        strait::launch::EnforcementMode::Enforce,
+        &policy_path,
+        vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            concat!(
+                "exec 3<>/dev/tcp/127.0.0.1/3128; ",
+                "printf 'CONNECT example.com:443 HTTP/1.1\\r\\n",
+                "Host: example.com:443\\r\\n\\r\\n' >&3; ",
+                "read -t 5 response <&3; ",
+                "exec 3>&-; ",
+                "case \"$response\" in *200*) exit 0 ;; *) exit 1 ;; esac",
+            )
+            .to_string(),
+        ],
+        Some(TEST_IMAGE),
+        Some(obs_path.clone()),
+        None,
+        Vec::new(),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        exit_code, 0,
+        "CONNECT through gateway should get 200 from the host proxy"
+    );
+
+    // Verify lifecycle events in observation log
+    let events = observation_events(&obs_path);
+    let starts = events_of_type(&events, "container_start");
+    let stops = events_of_type(&events, "container_stop");
+    assert!(!starts.is_empty(), "should have container_start event");
+    assert!(!stops.is_empty(), "should have container_stop event");
+    assert_eq!(stops[0]["exit_code"].as_i64(), Some(0));
+}
+
+/// Enforce mode: direct outbound TCP is blocked by --network=none.
+///
+/// Attempts a TCP connection to an external IP (1.1.1.1:80) from inside
+/// the container. With --network=none, no non-loopback interfaces exist,
+/// so the connection fails immediately.
+#[tokio::test]
+async fn enforce_direct_outbound_tcp_blocked() {
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let policy_path = temp_dir.path().join("policy.cedar");
+    let obs_path = temp_dir.path().join("observations.jsonl");
+    write_permissive_policy(&policy_path);
+
+    // Try direct TCP to 1.1.1.1:80. With --network=none this fails because
+    // there are no non-loopback network interfaces.
+    let exit_code = strait::launch::run_launch_with_policy(
+        strait::launch::EnforcementMode::Enforce,
+        &policy_path,
+        vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "(echo > /dev/tcp/1.1.1.1/80) 2>/dev/null && exit 0 || exit 111".to_string(),
+        ],
+        Some(TEST_IMAGE),
+        Some(obs_path.clone()),
+        None,
+        Vec::new(),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        exit_code, 111,
+        "direct TCP to external IP should be blocked by --network=none"
+    );
+}
+
+/// Observe mode also uses --network=none: direct outbound TCP is blocked.
+///
+/// Even without a Cedar policy, observe mode runs containers with
+/// --network=none so all traffic goes through the gateway and proxy.
+#[tokio::test]
+async fn observe_direct_outbound_tcp_blocked() {
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+
+    let exit_code = strait::launch::run_launch_observe(
+        vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "(echo > /dev/tcp/1.1.1.1/80) 2>/dev/null && exit 0 || exit 111".to_string(),
+        ],
+        Some(TEST_IMAGE),
+        Some(obs_path.clone()),
+        None,
+        Vec::new(),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        exit_code, 111,
+        "direct TCP should be blocked even in observe mode (--network=none)"
+    );
+}
+
+/// Observe mode: the proxy path is functional through the gateway.
+///
+/// Same CONNECT-based verification as `enforce_proxy_path_end_to_end`,
+/// but in observe mode. Proves observe mode also uses the gateway for
+/// proxy access.
+#[tokio::test]
+async fn observe_proxy_path_end_to_end() {
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+
+    let exit_code = strait::launch::run_launch_observe(
+        vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            concat!(
+                "exec 3<>/dev/tcp/127.0.0.1/3128; ",
+                "printf 'CONNECT example.com:443 HTTP/1.1\\r\\n",
+                "Host: example.com:443\\r\\n\\r\\n' >&3; ",
+                "read -t 5 response <&3; ",
+                "exec 3>&-; ",
+                "case \"$response\" in *200*) exit 0 ;; *) exit 1 ;; esac",
+            )
+            .to_string(),
+        ],
+        Some(TEST_IMAGE),
+        Some(obs_path.clone()),
+        None,
+        Vec::new(),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        exit_code, 0,
+        "CONNECT through gateway should succeed in observe mode"
+    );
+}
+
+/// Enforce mode: gateway propagates exit code from the container command.
+///
+/// The exit code path is: user command -> gateway child -> Docker wait ->
+/// caller. Verifying a specific non-zero code (42) ensures the gateway
+/// does not swallow or replace the child's exit status.
+#[tokio::test]
+async fn enforce_exit_code_propagation() {
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let policy_path = temp_dir.path().join("policy.cedar");
+    let obs_path = temp_dir.path().join("observations.jsonl");
+    write_fs_only_policy(&policy_path);
+
+    let exit_code = strait::launch::run_launch_with_policy(
+        strait::launch::EnforcementMode::Enforce,
+        &policy_path,
+        vec!["sh".to_string(), "-c".to_string(), "exit 42".to_string()],
+        Some(TEST_IMAGE),
+        Some(obs_path.clone()),
+        None,
+        Vec::new(),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        exit_code, 42,
+        "gateway should propagate exit code 42 from container command"
+    );
+
+    // Observation log should record the exit code
+    let events = observation_events(&obs_path);
+    let stops = events_of_type(&events, "container_stop");
+    assert!(!stops.is_empty(), "should have container_stop event");
+    assert_eq!(
+        stops[0]["exit_code"].as_i64(),
+        Some(42),
+        "container_stop should record exit code 42"
+    );
+}
+
+/// Enforce mode: gateway exits cleanly with exit code 0.
+///
+/// Basic happy path for enforce mode: `echo hello` succeeds, container
+/// lifecycle events are recorded, and the observation log shows clean exit.
+#[tokio::test]
+async fn enforce_clean_exit_zero() {
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let policy_path = temp_dir.path().join("policy.cedar");
+    let obs_path = temp_dir.path().join("observations.jsonl");
+    write_fs_only_policy(&policy_path);
+
+    let exit_code = strait::launch::run_launch_with_policy(
+        strait::launch::EnforcementMode::Enforce,
+        &policy_path,
+        vec!["echo".to_string(), "hello".to_string()],
+        Some(TEST_IMAGE),
+        Some(obs_path.clone()),
+        None,
+        Vec::new(),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(exit_code, 0, "enforce mode echo should exit with code 0");
+
+    let events = observation_events(&obs_path);
+    let starts = events_of_type(&events, "container_start");
+    let stops = events_of_type(&events, "container_stop");
+    assert!(!starts.is_empty(), "should have container_start event");
+    assert!(!stops.is_empty(), "should have container_stop event");
+    assert_eq!(
+        starts[0]["image"].as_str(),
+        Some(TEST_IMAGE),
+        "container_start should record the image"
+    );
+    assert_eq!(
+        stops[0]["exit_code"].as_i64(),
+        Some(0),
+        "container_stop should record exit code 0"
+    );
+}
+
+/// Warn mode: proxy path is functional through the gateway.
+///
+/// Warn mode uses the same --network=none and gateway setup as enforce
+/// mode. Verifies the proxy responds to CONNECT requests from the container.
+#[tokio::test]
+async fn warn_proxy_path_end_to_end() {
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let policy_path = temp_dir.path().join("policy.cedar");
+    let obs_path = temp_dir.path().join("observations.jsonl");
+    write_permissive_policy(&policy_path);
+
+    let exit_code = strait::launch::run_launch_with_policy(
+        strait::launch::EnforcementMode::Warn,
+        &policy_path,
+        vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            concat!(
+                "exec 3<>/dev/tcp/127.0.0.1/3128; ",
+                "printf 'CONNECT example.com:443 HTTP/1.1\\r\\n",
+                "Host: example.com:443\\r\\n\\r\\n' >&3; ",
+                "read -t 5 response <&3; ",
+                "exec 3>&-; ",
+                "case \"$response\" in *200*) exit 0 ;; *) exit 1 ;; esac",
+            )
+            .to_string(),
+        ],
+        Some(TEST_IMAGE),
+        Some(obs_path.clone()),
+        None,
+        Vec::new(),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        exit_code, 0,
+        "CONNECT through gateway should succeed in warn mode"
+    );
+}

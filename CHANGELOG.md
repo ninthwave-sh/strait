@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.2.0
+
+### Network isolation
+
+- Containers run with `--network=none` for enforced network isolation
+- New gateway binary (`strait-gateway`) routes container traffic through a bind-mounted Unix socket to the host proxy
+- Gateway is a statically-linked musl binary with architecture detection for x86_64 and aarch64
+- CI cross-compiles the gateway for linux/amd64 and linux/arm64
+
+### HTTPS proxy
+
+- Upstream connect timeout and response timeout, configurable via `strait.toml`
+
+### CLI
+
+- `--env` flag for `strait launch` to pass environment variables into containers
+- `--config` flag for `strait launch` to enable credential injection in container mode
+- `--no-tty` flag for `strait launch` to disable TTY allocation
+- `proc:exec` policies now mount host binaries into the container
+
 ## v0.1.0
 
 Initial release.

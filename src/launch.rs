@@ -78,7 +78,11 @@ impl EnforcementMode {
 }
 
 /// Default Docker image for the container sandbox.
-const DEFAULT_IMAGE: &str = "alpine:latest";
+///
+/// Must be glibc-based (not Alpine/musl) because the `strait-gateway`
+/// binary is dynamically linked against glibc on the host and bind-mounted
+/// into the container. Alpine uses musl, which cannot load glibc binaries.
+const DEFAULT_IMAGE: &str = "ubuntu:24.04";
 
 /// Filename for the proxy Unix socket inside the session temp directory.
 ///
@@ -119,15 +123,23 @@ pub fn find_gateway_binary() -> anyhow::Result<PathBuf> {
     // Check parent directory (cargo test: exe is in target/debug/deps/,
     // gateway is in target/debug/)
     if let Some(parent) = dir.parent() {
-        let gateway = parent.join("strait-gateway");
-        if gateway.exists() {
-            return Ok(gateway);
+        let parent_gateway = parent.join("strait-gateway");
+        if parent_gateway.exists() {
+            return Ok(parent_gateway);
         }
     }
 
+    let searched = if let Some(parent) = dir.parent() {
+        format!(
+            "{} and {}",
+            gateway.display(),
+            parent.join("strait-gateway").display()
+        )
+    } else {
+        gateway.display().to_string()
+    };
     anyhow::bail!(
-        "strait-gateway binary not found at {} -- build it with: cargo build -p strait-gateway",
-        gateway.display()
+        "strait-gateway binary not found (searched {searched}) -- build it with: cargo build -p strait-gateway"
     )
 }
 
@@ -934,7 +946,7 @@ mod tests {
 
         let config = ContainerManager::build_config(
             &policy,
-            "alpine:latest",
+            "ubuntu:24.04",
             &["sh".to_string()],
             Path::new("/tmp/proxy.sock"),
             Path::new("/usr/local/bin/strait-gateway"),

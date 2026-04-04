@@ -53,7 +53,7 @@ use crate::container::{ContainerManager, ContainerPermission, ContainerPolicy};
 use crate::credentials::CredentialStore;
 use crate::mitm::handle_connection;
 use crate::observe::{EventKind, ObservationStream};
-use crate::policy::{extract_fs_permissions, PolicyEngine};
+use crate::policy::{extract_fs_permissions, extract_proc_permissions, PolicyEngine};
 
 /// Enforcement mode for the launch orchestrator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,7 +527,11 @@ pub async fn run_launch_with_policy(
 
     // 8. Extract filesystem permissions from Cedar policy
     let candidate_paths = vec![cwd.to_string_lossy().to_string()];
-    let permissions = extract_fs_permissions(&engine, &candidate_paths, "agent");
+    let mut permissions = extract_fs_permissions(&engine, &candidate_paths, "agent");
+
+    // 8b. Extract proc:exec permissions and add to the permission set
+    let proc_permissions = extract_proc_permissions(&engine, "agent");
+    permissions.extend(proc_permissions);
 
     // Log which paths were permitted and which were denied
     let cwd_str = cwd.to_string_lossy().to_string();

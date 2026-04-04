@@ -51,7 +51,7 @@ The `test` job is a required status check on `main` — PRs cannot merge until i
 - **Proxy on host, not in container** — stronger isolation. Agent can't tamper with the proxy.
 - **Session-local CA** — new CA cert generated on each startup. Injected into container system CA bundle.
 - **Credential injection on allow only** — agent never sees real secrets. Prevents exfiltration via prompt injection.
-- **Cooperative network enforcement** — container routes via `HTTPS_PROXY`. Defense in depth, not hard boundary.
+- **Enforced network isolation** — containers run with `--network=none`. A gateway binary inside the container routes traffic through a bind-mounted Unix socket to the host proxy. No direct network access.
 - **Observe-then-enforce workflow** — `--observe` → `generate` → `--warn` → `--policy`. Solves policy paralysis.
 - **General-purpose tool** — not ninthwave-specific. Standalone binary, separate repo.
 

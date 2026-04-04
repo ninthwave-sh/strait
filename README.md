@@ -188,7 +188,7 @@ strait watch                                       # live colored event stream
 
 ## Known limitations
 
-- **Network enforcement is currently cooperative** — the container routes traffic through the proxy via `HTTPS_PROXY`. A process that opens direct TCP connections can bypass the proxy. v0.4 will enforce network isolation via `--network=none` with proxy access through a bind-mounted Unix socket, making bypass impossible.
+- **Network enforcement requires a container runtime** — containers run with `--network=none` (no network interfaces). Traffic reaches the proxy through a gateway binary that communicates over a bind-mounted Unix socket. Direct TCP bypass is not possible inside the container, but the enforcement only applies when running under `strait launch`.
 - **Filesystem and process enforcement rely on container isolation** — standard container security model.
 
 ## Install

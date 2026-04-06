@@ -54,6 +54,12 @@ pub struct StraitConfig {
 
     /// Health check configuration (reserved for future use).
     pub health: Option<HealthConfig>,
+
+    /// Container image specification for auto-building.
+    ///
+    /// When present, strait generates a Dockerfile from this spec, builds the
+    /// image, and caches it by content hash. Overridden by `--image` on the CLI.
+    pub container: Option<ContainerSpec>,
 }
 
 /// `[listen]` section — address and port for the proxy listener.
@@ -295,6 +301,30 @@ fn default_identity_default() -> String {
 pub struct HealthConfig {
     /// Port for the health check endpoint (required when `[health]` is present).
     pub port: u16,
+}
+
+/// `[container]` section — declarative container image specification.
+///
+/// When present, strait generates a Dockerfile from the spec, builds the image
+/// via the Docker API, and caches it by content hash (`strait-cache:<hash>`).
+/// Overridden by `--image` on the CLI.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerSpec {
+    /// Base image (e.g. `"ubuntu:24.04"`). Required.
+    pub base_image: String,
+
+    /// APT packages to install (optional, default empty).
+    #[serde(default)]
+    pub apt: Vec<String>,
+
+    /// npm packages to install globally (optional, default empty).
+    #[serde(default)]
+    pub npm: Vec<String>,
+
+    /// pip packages to install (optional, default empty).
+    #[serde(default)]
+    pub pip: Vec<String>,
 }
 
 impl StraitConfig {
@@ -928,6 +958,7 @@ ca_cert_path = "/tmp/ca.pem"
         assert!(config.audit.is_none());
         assert!(config.identity.is_none());
         assert!(config.health.is_none());
+        assert!(config.container.is_none());
     }
 
     #[test]
@@ -1981,5 +2012,98 @@ upstream_response_timeout_secs = 90
         let ctx = ProxyContext::from_config(&config).unwrap();
         assert_eq!(ctx.upstream_connect_timeout, Duration::from_secs(15));
         assert_eq!(ctx.upstream_response_timeout, Duration::from_secs(90));
+    }
+
+    // -- Container spec tests --------------------------------------------------
+
+    #[test]
+    fn container_spec_full_parses() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+
+[container]
+base_image = "ubuntu:24.04"
+apt = ["git", "curl", "ca-certificates"]
+npm = ["@anthropic-ai/claude-code"]
+pip = ["ruff"]
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        let spec = config.container.as_ref().unwrap();
+        assert_eq!(spec.base_image, "ubuntu:24.04");
+        assert_eq!(spec.apt, vec!["git", "curl", "ca-certificates"]);
+        assert_eq!(spec.npm, vec!["@anthropic-ai/claude-code"]);
+        assert_eq!(spec.pip, vec!["ruff"]);
+    }
+
+    #[test]
+    fn container_spec_base_image_only() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+
+[container]
+base_image = "alpine:3.20"
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        let spec = config.container.as_ref().unwrap();
+        assert_eq!(spec.base_image, "alpine:3.20");
+        assert!(spec.apt.is_empty());
+        assert!(spec.npm.is_empty());
+        assert!(spec.pip.is_empty());
+    }
+
+    #[test]
+    fn container_spec_optional_fields_default_empty() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+
+[container]
+base_image = "node:20"
+apt = ["curl"]
+"#,
+        );
+        let config = StraitConfig::load(f.path()).unwrap();
+        let spec = config.container.as_ref().unwrap();
+        assert_eq!(spec.apt, vec!["curl"]);
+        assert!(spec.npm.is_empty());
+        assert!(spec.pip.is_empty());
+    }
+
+    #[test]
+    fn container_spec_missing_base_image_errors() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+
+[container]
+apt = ["git"]
+"#,
+        );
+        let result = StraitConfig::load(f.path());
+        assert!(result.is_err());
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(
+            err.contains("base_image"),
+            "error should mention base_image, got: {err}"
+        );
+    }
+
+    #[test]
+    fn container_spec_unknown_field_errors() {
+        let f = write_config(
+            r#"
+ca_cert_path = "/tmp/ca.pem"
+
+[container]
+base_image = "alpine"
+unknown_field = "value"
+"#,
+        );
+        let result = StraitConfig::load(f.path());
+        assert!(result.is_err(), "unknown fields should be rejected");
     }
 }

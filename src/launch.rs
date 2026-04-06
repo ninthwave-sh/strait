@@ -246,6 +246,79 @@ pub async fn find_gateway_binary(container_mgr: &ContainerManager) -> anyhow::Re
     resolve_gateway_binary(&target)
 }
 
+// ---------------------------------------------------------------------------
+// Operator bind-mount parsing
+// ---------------------------------------------------------------------------
+
+/// A validated operator bind-mount specification.
+///
+/// These mounts are operator-specified via `--mount` and bypass Cedar policy
+/// validation. They allow mounting trusted paths outside the project directory
+/// (e.g., `~/.claude/` for OAuth config).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraMount {
+    /// Absolute path on the host.
+    pub host_path: String,
+    /// Absolute path in the container.
+    pub container_path: String,
+    /// Mount mode: `"ro"` or `"rw"`.
+    pub mode: String,
+}
+
+impl ExtraMount {
+    /// Format as a Docker bind-mount string: `host:container:mode`.
+    pub fn to_bind_string(&self) -> String {
+        format!("{}:{}:{}", self.host_path, self.container_path, self.mode)
+    }
+}
+
+/// Parse and validate `--mount` flag values.
+///
+/// Accepts `HOST:CONTAINER` or `HOST:CONTAINER:MODE` where MODE is `ro` or
+/// `rw`. Defaults to `rw` when no mode is specified. Both paths must be
+/// absolute. These mounts are not validated against `base_dir` because they
+/// are operator-specified, not agent-requested.
+pub fn parse_extra_mounts(specs: &[String]) -> anyhow::Result<Vec<ExtraMount>> {
+    let mut mounts = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let parts: Vec<&str> = spec.splitn(3, ':').collect();
+        let (host_path, container_path, mode) = match parts.len() {
+            2 => (parts[0], parts[1], "rw"),
+            3 => (parts[0], parts[1], parts[2]),
+            _ => anyhow::bail!(
+                "invalid --mount format: {spec:?} (expected HOST:CONTAINER or HOST:CONTAINER:MODE)"
+            ),
+        };
+
+        if host_path.is_empty() || container_path.is_empty() {
+            anyhow::bail!(
+                "invalid --mount format: {spec:?} (host and container paths must not be empty)"
+            );
+        }
+
+        if !host_path.starts_with('/') {
+            anyhow::bail!("invalid --mount host path: {host_path:?} (must be an absolute path)");
+        }
+
+        if !container_path.starts_with('/') {
+            anyhow::bail!(
+                "invalid --mount container path: {container_path:?} (must be an absolute path)"
+            );
+        }
+
+        if mode != "ro" && mode != "rw" {
+            anyhow::bail!("invalid --mount mode: {mode:?} (must be \"ro\" or \"rw\")");
+        }
+
+        mounts.push(ExtraMount {
+            host_path: host_path.to_string(),
+            container_path: container_path.to_string(),
+            mode: mode.to_string(),
+        });
+    }
+    Ok(mounts)
+}
+
 /// Run the `launch --observe` workflow.
 ///
 /// Orchestrates proxy, container, and observation into a unified workflow:
@@ -254,6 +327,7 @@ pub async fn find_gateway_binary(container_mgr: &ContainerManager) -> anyhow::Re
 /// - Activity is recorded to a JSONL observation file and Unix socket
 ///
 /// Returns the container's exit code.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_launch_observe(
     command: Vec<String>,
     image: Option<&str>,
@@ -261,6 +335,7 @@ pub async fn run_launch_observe(
     credential_store: Option<Arc<CredentialStore>>,
     mitm_hosts: Vec<String>,
     extra_env: Vec<String>,
+    extra_mounts: Vec<ExtraMount>,
     tty: bool,
 ) -> anyhow::Result<i32> {
     let image = image.unwrap_or(DEFAULT_IMAGE);
@@ -358,6 +433,9 @@ pub async fn run_launch_observe(
     )?;
     config.auto_remove = false;
     config.env.extend(extra_env);
+    for m in &extra_mounts {
+        config.binds.push(m.to_bind_string());
+    }
 
     let container_id = container_mgr.create_container_from_config(&config).await?;
 
@@ -370,6 +448,16 @@ pub async fn run_launch_observe(
         path: cwd.to_string_lossy().to_string(),
         mode: "read-write".to_string(),
     });
+    for m in &extra_mounts {
+        obs_stream.emit(EventKind::Mount {
+            path: m.host_path.clone(),
+            mode: if m.mode == "ro" {
+                "read-only".to_string()
+            } else {
+                "read-write".to_string()
+            },
+        });
+    }
 
     // 7. Set terminal raw mode for TTY passthrough (restored on drop)
     #[cfg(unix)]
@@ -449,6 +537,7 @@ pub async fn run_launch_with_policy(
     credential_store: Option<Arc<CredentialStore>>,
     mitm_hosts: Vec<String>,
     extra_env: Vec<String>,
+    extra_mounts: Vec<ExtraMount>,
     tty: bool,
 ) -> anyhow::Result<i32> {
     let image = image.unwrap_or(DEFAULT_IMAGE);
@@ -579,6 +668,9 @@ pub async fn run_launch_with_policy(
     )?;
     config.auto_remove = false;
     config.env.extend(extra_env);
+    for m in &extra_mounts {
+        config.binds.push(m.to_bind_string());
+    }
 
     let container_id = container_mgr.create_container_from_config(&config).await?;
 
@@ -605,6 +697,16 @@ pub async fn run_launch_with_policy(
             }
             ContainerPermission::ProcExec(_) => {}
         }
+    }
+    for m in &extra_mounts {
+        obs_stream.emit(EventKind::Mount {
+            path: m.host_path.clone(),
+            mode: if m.mode == "ro" {
+                "read-only".to_string()
+            } else {
+                "read-write".to_string()
+            },
+        });
     }
 
     // 9. Set terminal raw mode for TTY passthrough (restored on drop)
@@ -1812,5 +1914,80 @@ permit(
             msg.contains(&format!("strait-gateway-{target}")),
             "error should mention arch-qualified name: {msg}"
         );
+    }
+
+    // -- parse_extra_mounts tests ---------------------------------------------
+
+    #[test]
+    fn parse_mount_host_container_ro() {
+        let mounts = parse_extra_mounts(&["/foo:/bar:ro".to_string()]).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].host_path, "/foo");
+        assert_eq!(mounts[0].container_path, "/bar");
+        assert_eq!(mounts[0].mode, "ro");
+        assert_eq!(mounts[0].to_bind_string(), "/foo:/bar:ro");
+    }
+
+    #[test]
+    fn parse_mount_defaults_to_rw() {
+        let mounts = parse_extra_mounts(&["/foo:/bar".to_string()]).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].mode, "rw");
+        assert_eq!(mounts[0].to_bind_string(), "/foo:/bar:rw");
+    }
+
+    #[test]
+    fn parse_mount_invalid_no_colon() {
+        let err = parse_extra_mounts(&["/foo".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid --mount format"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_mount_invalid_mode() {
+        let err = parse_extra_mounts(&["/foo:/bar:wx".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid --mount mode"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_mount_relative_host_path() {
+        let err = parse_extra_mounts(&["foo:/bar".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must be an absolute path"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_mount_relative_container_path() {
+        let err = parse_extra_mounts(&["/foo:bar".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must be an absolute path"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_mount_empty_paths() {
+        let err = parse_extra_mounts(&[":/bar".to_string()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must not be empty"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_mount_multiple() {
+        let mounts = parse_extra_mounts(&[
+            "/a:/b:ro".to_string(),
+            "/c:/d:rw".to_string(),
+            "/e:/f".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(mounts.len(), 3);
+        assert_eq!(mounts[0].to_bind_string(), "/a:/b:ro");
+        assert_eq!(mounts[1].to_bind_string(), "/c:/d:rw");
+        assert_eq!(mounts[2].to_bind_string(), "/e:/f:rw");
+    }
+
+    #[test]
+    fn parse_mount_empty_vec() {
+        let mounts = parse_extra_mounts(&[]).unwrap();
+        assert!(mounts.is_empty());
     }
 }

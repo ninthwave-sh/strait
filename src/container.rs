@@ -29,11 +29,14 @@ use bollard::container::{
     Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
     StopContainerOptions,
 };
-use bollard::image::CreateImageOptions;
+use bollard::image::{BuildImageOptions, CreateImageOptions};
 use bollard::models::HostConfig;
 use bollard::Docker;
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
+
+use crate::config::ContainerSpec;
 
 // ---------------------------------------------------------------------------
 // Policy types used as input
@@ -260,6 +263,184 @@ pub(crate) fn resolve_host_binary_with_path(
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Container image building from ContainerSpec
+// ---------------------------------------------------------------------------
+
+/// Generate a Dockerfile from a `ContainerSpec`.
+///
+/// Each package manager step is a separate `RUN` layer for Docker layer caching.
+/// apt packages are installed with `--no-install-recommends` and the apt cache
+/// is cleaned up in the same layer to minimize image size.
+pub fn generate_dockerfile(spec: &ContainerSpec) -> String {
+    let mut lines = vec![format!("FROM {}", spec.base_image)];
+
+    if !spec.apt.is_empty() {
+        let pkgs = spec.apt.join(" ");
+        lines.push(format!(
+            "RUN apt-get update && apt-get install -y --no-install-recommends {pkgs} \
+             && rm -rf /var/lib/apt/lists/*"
+        ));
+    }
+
+    if !spec.npm.is_empty() {
+        let pkgs = spec.npm.join(" ");
+        lines.push(format!("RUN npm install -g {pkgs}"));
+    }
+
+    if !spec.pip.is_empty() {
+        let pkgs = spec.pip.join(" ");
+        lines.push(format!("RUN pip install --no-cache-dir {pkgs}"));
+    }
+
+    lines.join("\n") + "\n"
+}
+
+/// Compute a deterministic content hash for a `ContainerSpec`.
+///
+/// The hash covers the base image, and each sorted package list. Two specs
+/// with the same packages in a different order produce the same hash to avoid
+/// unnecessary rebuilds.
+pub fn spec_content_hash(spec: &ContainerSpec) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(spec.base_image.as_bytes());
+    hasher.update(b"\0");
+
+    let mut apt = spec.apt.clone();
+    apt.sort();
+    for p in &apt {
+        hasher.update(p.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.update(b"\0");
+
+    let mut npm = spec.npm.clone();
+    npm.sort();
+    for p in &npm {
+        hasher.update(p.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.update(b"\0");
+
+    let mut pip = spec.pip.clone();
+    pip.sort();
+    for p in &pip {
+        hasher.update(p.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    let hash = hasher.finalize();
+    hex::encode(&hash[..16]) // 128-bit truncation for tag readability
+}
+
+/// Build a container image from a `ContainerSpec`, or reuse the cached image
+/// if one with the same content hash already exists.
+///
+/// Returns the image tag (`strait-cache:<hash>`).
+pub async fn build_or_reuse_image(docker: &Docker, spec: &ContainerSpec) -> anyhow::Result<String> {
+    let hash = spec_content_hash(spec);
+    let tag = format!("strait-cache:{hash}");
+
+    // Check if the image already exists locally
+    if docker.inspect_image(&tag).await.is_ok() {
+        info!(tag = %tag, "container image cache hit, reusing");
+        eprintln!("Image '{tag}' found in cache, skipping build");
+        return Ok(tag);
+    }
+
+    info!(tag = %tag, "container image not cached, building");
+    eprintln!("Building container image '{tag}'...");
+
+    let dockerfile = generate_dockerfile(spec);
+    debug!(dockerfile = %dockerfile, "generated Dockerfile");
+
+    // Create a tar archive containing the Dockerfile.
+    // bollard's build_image expects a tar stream as the body.
+    let tar_bytes = create_dockerfile_tar(&dockerfile)?;
+
+    let options = BuildImageOptions {
+        t: tag.clone(),
+        rm: true,
+        ..Default::default()
+    };
+
+    let mut stream = docker.build_image(options, None, Some(tar_bytes.into()));
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(output) => {
+                if let Some(ref s) = output.stream {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        debug!(output = %trimmed, "build output");
+                    }
+                }
+                if let Some(ref e) = output.error {
+                    return Err(anyhow::anyhow!("image build failed: {e}"));
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("image build stream error: {e}"));
+            }
+        }
+    }
+
+    info!(tag = %tag, "container image built successfully");
+    eprintln!("Image '{tag}' built successfully");
+    Ok(tag)
+}
+
+/// Create a minimal tar archive containing a single `Dockerfile`.
+fn create_dockerfile_tar(dockerfile: &str) -> anyhow::Result<Vec<u8>> {
+    let dockerfile_bytes = dockerfile.as_bytes();
+    let mut tar_buf = Vec::new();
+
+    // tar header: 512 bytes
+    let mut header = [0u8; 512];
+
+    // File name (first 100 bytes)
+    let name = b"Dockerfile";
+    header[..name.len()].copy_from_slice(name);
+
+    // File mode: 0644 in octal
+    header[100..107].copy_from_slice(b"0000644");
+
+    // Owner/group UID/GID: 0
+    header[108..115].copy_from_slice(b"0000000");
+    header[116..123].copy_from_slice(b"0000000");
+
+    // File size in octal (11 digits + null)
+    let size_str = format!("{:011o}", dockerfile_bytes.len());
+    header[124..135].copy_from_slice(size_str.as_bytes());
+
+    // Modification time: 0
+    header[136..147].copy_from_slice(b"00000000000");
+
+    // Type flag: '0' = regular file
+    header[156] = b'0';
+
+    // Compute checksum: sum of all bytes in the header, treating the
+    // checksum field (bytes 148-155) as spaces.
+    header[148..156].copy_from_slice(b"        ");
+    let checksum: u32 = header.iter().map(|&b| b as u32).sum();
+    let cksum_str = format!("{:06o}\0 ", checksum);
+    header[148..156].copy_from_slice(cksum_str.as_bytes());
+
+    tar_buf.extend_from_slice(&header);
+    tar_buf.extend_from_slice(dockerfile_bytes);
+
+    // Pad to 512-byte boundary
+    let padding = 512 - (dockerfile_bytes.len() % 512);
+    if padding < 512 {
+        tar_buf.extend(std::iter::repeat_n(0u8, padding));
+    }
+
+    // End-of-archive marker: two 512-byte blocks of zeros
+    tar_buf.extend(std::iter::repeat_n(0u8, 1024));
+
+    Ok(tar_buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -1733,6 +1914,142 @@ mod tests {
         assert!(
             path_value.contains("/usr/local/bin"),
             "PATH should include mount location (/usr/local/bin): {path_value}"
+        );
+    }
+
+    // -- Unit tests: generate_dockerfile & spec_content_hash ------------------
+
+    #[test]
+    fn generate_dockerfile_apt_only() {
+        let spec = ContainerSpec {
+            base_image: "ubuntu:24.04".to_string(),
+            apt: vec!["git".to_string(), "curl".to_string()],
+            npm: vec![],
+            pip: vec![],
+        };
+        let df = generate_dockerfile(&spec);
+        assert!(df.starts_with("FROM ubuntu:24.04\n"));
+        assert!(df.contains("apt-get install -y --no-install-recommends git curl"));
+        assert!(df.contains("rm -rf /var/lib/apt/lists/*"));
+        assert!(!df.contains("npm install"));
+        assert!(!df.contains("pip install"));
+    }
+
+    #[test]
+    fn generate_dockerfile_npm_only() {
+        let spec = ContainerSpec {
+            base_image: "node:20".to_string(),
+            apt: vec![],
+            npm: vec!["@anthropic-ai/claude-code".to_string()],
+            pip: vec![],
+        };
+        let df = generate_dockerfile(&spec);
+        assert!(df.starts_with("FROM node:20\n"));
+        assert!(df.contains("npm install -g @anthropic-ai/claude-code"));
+        assert!(!df.contains("apt-get"));
+        assert!(!df.contains("pip install"));
+    }
+
+    #[test]
+    fn generate_dockerfile_combined() {
+        let spec = ContainerSpec {
+            base_image: "ubuntu:24.04".to_string(),
+            apt: vec![
+                "git".to_string(),
+                "curl".to_string(),
+                "ca-certificates".to_string(),
+            ],
+            npm: vec!["@anthropic-ai/claude-code".to_string()],
+            pip: vec!["ruff".to_string()],
+        };
+        let df = generate_dockerfile(&spec);
+        assert!(df.starts_with("FROM ubuntu:24.04\n"));
+        assert!(df.contains("apt-get install -y --no-install-recommends git curl ca-certificates"));
+        assert!(df.contains("npm install -g @anthropic-ai/claude-code"));
+        assert!(df.contains("pip install --no-cache-dir ruff"));
+    }
+
+    #[test]
+    fn generate_dockerfile_base_image_only() {
+        let spec = ContainerSpec {
+            base_image: "alpine:3.20".to_string(),
+            apt: vec![],
+            npm: vec![],
+            pip: vec![],
+        };
+        let df = generate_dockerfile(&spec);
+        assert_eq!(df, "FROM alpine:3.20\n");
+    }
+
+    #[test]
+    fn content_hash_same_spec_same_hash() {
+        let spec = ContainerSpec {
+            base_image: "ubuntu:24.04".to_string(),
+            apt: vec!["git".to_string(), "curl".to_string()],
+            npm: vec!["typescript".to_string()],
+            pip: vec![],
+        };
+        let h1 = spec_content_hash(&spec);
+        let h2 = spec_content_hash(&spec);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn content_hash_different_spec_different_hash() {
+        let spec1 = ContainerSpec {
+            base_image: "ubuntu:24.04".to_string(),
+            apt: vec!["git".to_string()],
+            npm: vec![],
+            pip: vec![],
+        };
+        let spec2 = ContainerSpec {
+            base_image: "ubuntu:24.04".to_string(),
+            apt: vec!["curl".to_string()],
+            npm: vec![],
+            pip: vec![],
+        };
+        assert_ne!(spec_content_hash(&spec1), spec_content_hash(&spec2));
+    }
+
+    #[test]
+    fn content_hash_order_independent() {
+        let spec1 = ContainerSpec {
+            base_image: "ubuntu:24.04".to_string(),
+            apt: vec!["git".to_string(), "curl".to_string()],
+            npm: vec![],
+            pip: vec![],
+        };
+        let spec2 = ContainerSpec {
+            base_image: "ubuntu:24.04".to_string(),
+            apt: vec!["curl".to_string(), "git".to_string()],
+            npm: vec![],
+            pip: vec![],
+        };
+        assert_eq!(
+            spec_content_hash(&spec1),
+            spec_content_hash(&spec2),
+            "package order should not affect hash"
+        );
+    }
+
+    #[test]
+    fn content_hash_different_base_image() {
+        let spec1 = ContainerSpec {
+            base_image: "ubuntu:24.04".to_string(),
+            apt: vec!["git".to_string()],
+            npm: vec![],
+            pip: vec![],
+        };
+        let spec2 = ContainerSpec {
+            base_image: "ubuntu:22.04".to_string(),
+            apt: vec!["git".to_string()],
+            npm: vec![],
+            pip: vec![],
+        };
+        assert_ne!(
+            spec_content_hash(&spec1),
+            spec_content_hash(&spec2),
+            "different base images should produce different hashes"
         );
     }
 }

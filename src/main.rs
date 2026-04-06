@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use clap::{ArgGroup, Parser, Subcommand};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -181,8 +182,11 @@ TLS TRUST:
         config: Option<PathBuf>,
 
         /// Docker image to use for the container.
-        #[arg(long, default_value = "ubuntu:24.04")]
-        image: String,
+        ///
+        /// When set, overrides any `[container]` auto-build spec in strait.toml.
+        /// Defaults to ubuntu:24.04 if neither --image nor [container] is set.
+        #[arg(long)]
+        image: Option<String>,
 
         /// Output path for the observation JSONL file.
         #[arg(long, default_value = "observations.jsonl")]
@@ -325,25 +329,41 @@ async fn main() -> anyhow::Result<()> {
         } => {
             init_tracing();
 
-            // Load credential store and MITM hosts from config if provided.
-            let (credential_store, mitm_hosts) = if let Some(ref config_path) = config {
-                let cfg = StraitConfig::load(config_path)?;
-                info!(path = %config_path.display(), "launch config loaded");
+            // Load credential store, MITM hosts, and container spec from config if provided.
+            let (credential_store, mitm_hosts, container_spec) =
+                if let Some(ref config_path) = config {
+                    let cfg = StraitConfig::load(config_path)?;
+                    info!(path = %config_path.display(), "launch config loaded");
 
-                let cred_store = if cfg.credential.is_empty() {
-                    None
+                    let cred_store = if cfg.credential.is_empty() {
+                        None
+                    } else {
+                        let store = CredentialStore::from_entries(&cfg.credential)?;
+                        info!(
+                            count = cfg.credential.len(),
+                            "credentials loaded from config"
+                        );
+                        Some(Arc::new(store))
+                    };
+
+                    (cred_store, cfg.mitm.hosts.clone(), cfg.container.clone())
                 } else {
-                    let store = CredentialStore::from_entries(&cfg.credential)?;
-                    info!(
-                        count = cfg.credential.len(),
-                        "credentials loaded from config"
-                    );
-                    Some(Arc::new(store))
+                    (None, Vec::new(), None)
                 };
 
-                (cred_store, cfg.mitm.hosts.clone())
+            // Resolve image: --image wins, then [container] spec auto-build,
+            // then DEFAULT_IMAGE fallback.
+            let resolved_image = if let Some(ref img) = image {
+                img.clone()
+            } else if let Some(ref spec) = container_spec {
+                // Auto-build from [container] spec. We need a Docker connection
+                // for the build, but the launch functions also create one. To
+                // avoid connecting twice, we build here and pass the tag.
+                let docker = bollard::Docker::connect_with_local_defaults()
+                    .context("failed to connect to Docker for image build")?;
+                strait::container::build_or_reuse_image(&docker, spec).await?
             } else {
-                (None, Vec::new())
+                "ubuntu:24.04".to_string()
             };
 
             // clap's ArgGroup "mode" guarantees exactly one of these is set.
@@ -355,7 +375,7 @@ async fn main() -> anyhow::Result<()> {
                     strait::launch::EnforcementMode::Enforce,
                     &policy_path,
                     command,
-                    Some(&image),
+                    Some(&resolved_image),
                     Some(output),
                     credential_store,
                     mitm_hosts,
@@ -370,7 +390,7 @@ async fn main() -> anyhow::Result<()> {
                     strait::launch::EnforcementMode::Warn,
                     &warn_path,
                     command,
-                    Some(&image),
+                    Some(&resolved_image),
                     Some(output),
                     credential_store,
                     mitm_hosts,
@@ -384,7 +404,7 @@ async fn main() -> anyhow::Result<()> {
                 debug_assert!(observe);
                 strait::launch::run_launch_observe(
                     command,
-                    Some(&image),
+                    Some(&resolved_image),
                     Some(output),
                     credential_store,
                     mitm_hosts,
@@ -679,7 +699,7 @@ mod tests {
                 assert!(observe);
                 assert!(warn.is_none());
                 assert!(policy.is_none());
-                assert_eq!(image, "ubuntu:24.04");
+                assert_eq!(image.as_deref(), Some("ubuntu:24.04"));
                 assert_eq!(output.to_str().unwrap(), "/tmp/obs.jsonl");
                 assert!(env.is_empty());
                 assert_eq!(command, vec!["npm", "test"]);

@@ -1,12 +1,16 @@
-// VALIDATED: 2026-04-04 strait template for Claude Code
+// VALIDATED: 2026-04-06 strait template for Claude Code
 // claude-code — Full-stack policy for Claude Code agent sessions.
 //
-// Covers Claude Code's API surface: Anthropic API, GitHub API, filesystem,
-// and process execution. Designed for use with `strait launch --policy`.
+// Designed for Claude Code with OAuth auth (Claude Max / Team / Enterprise).
+// With OAuth, Anthropic API traffic is passthrough (not proxied through strait),
+// so no Anthropic permit rules are needed here.
+//
+// If you use an API key instead of OAuth, uncomment the Anthropic API section
+// below so strait can proxy and inject credentials for api.anthropic.com.
 //
 // Network:
-//   Allows: GET, POST to api.anthropic.com (Claude API)
 //   Allows: GET, POST, DELETE to api.github.com scoped to your org
+//   Allows: GET to registry.npmjs.org (npm package metadata/tarballs)
 //   Denies: Push to main/release branches via Git Data API
 //   Denies: Repository deletion
 //
@@ -23,16 +27,18 @@
 // and adjust filesystem paths for your workspace layout.
 
 // ---------------------------------------------------------------------------
-// NETWORK — Anthropic API (Claude)
+// NETWORK — Anthropic API (API key users only)
 // ---------------------------------------------------------------------------
-
-// Claude API requests: completions, messages, model queries.
-@id("anthropic-api")
-permit(
-    principal,
-    action in [Action::"http:GET", Action::"http:POST"],
-    resource in Resource::"api.anthropic.com"
-);
+// Uncomment this section if you use an API key for Anthropic instead of OAuth.
+// OAuth users (Max/Team/Enterprise) do not need these rules because Anthropic
+// traffic bypasses the proxy entirely.
+//
+// @id("anthropic-api")
+// permit(
+//     principal,
+//     action in [Action::"http:GET", Action::"http:POST"],
+//     resource in Resource::"api.anthropic.com"
+// );
 
 // ---------------------------------------------------------------------------
 // NETWORK — GitHub API (scoped to org)
@@ -68,6 +74,18 @@ permit(
     principal,
     action == Action::"http:GET",
     resource in Resource::"api.github.com"
+);
+
+// ---------------------------------------------------------------------------
+// NETWORK — npm registry (package installs)
+// ---------------------------------------------------------------------------
+
+// Read access to npm registry: package metadata and tarballs.
+@id("npm-registry-read")
+permit(
+    principal,
+    action == Action::"http:GET",
+    resource in Resource::"registry.npmjs.org"
 );
 
 // ---------------------------------------------------------------------------

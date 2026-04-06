@@ -200,6 +200,15 @@ TLS TRUST:
         #[arg(long, value_name = "KEY=VALUE")]
         env: Vec<String>,
 
+        /// Additional bind mounts in Docker format (repeatable).
+        ///
+        /// Accepts `HOST:CONTAINER` or `HOST:CONTAINER:MODE` where MODE is
+        /// `ro` or `rw` (defaults to `rw`). These mounts are operator-specified
+        /// and bypass Cedar policy validation -- use them for trusted paths
+        /// outside the project directory (e.g., `~/.claude/:/root/.claude/:ro`).
+        #[arg(long, value_name = "HOST:CONTAINER[:MODE]")]
+        mount: Vec<String>,
+
         /// The command and arguments to run inside the container.
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -311,6 +320,7 @@ async fn main() -> anyhow::Result<()> {
             output,
             no_tty,
             env,
+            mount,
             command,
         } => {
             init_tracing();
@@ -338,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
 
             // clap's ArgGroup "mode" guarantees exactly one of these is set.
             let tty = !no_tty;
+            let extra_mounts = strait::launch::parse_extra_mounts(&mount)?;
             let exit_code = if let Some(policy_path) = policy {
                 // Enforce mode: deny disallowed access
                 strait::launch::run_launch_with_policy(
@@ -349,6 +360,7 @@ async fn main() -> anyhow::Result<()> {
                     credential_store,
                     mitm_hosts,
                     env,
+                    extra_mounts,
                     tty,
                 )
                 .await?
@@ -363,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
                     credential_store,
                     mitm_hosts,
                     env,
+                    extra_mounts,
                     tty,
                 )
                 .await?
@@ -376,6 +389,7 @@ async fn main() -> anyhow::Result<()> {
                     credential_store,
                     mitm_hosts,
                     env,
+                    extra_mounts,
                     tty,
                 )
                 .await?

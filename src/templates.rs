@@ -41,7 +41,7 @@ pub const TEMPLATES: &[Template] = &[
     },
     Template {
         name: "claude-code",
-        description: "Claude Code agent: Anthropic + GitHub API, filesystem, dev tools",
+        description: "Claude Code agent (OAuth): GitHub API, npm, filesystem, dev tools",
         policy: include_str!("../templates/claude-code.cedar"),
         schema: include_str!("../templates/strait.cedarschema"),
     },
@@ -647,7 +647,9 @@ permit(
     // --- claude-code behavioral tests ---
 
     #[test]
-    fn claude_code_permits_anthropic_api() {
+    fn claude_code_anthropic_api_not_proxied() {
+        // OAuth users: Anthropic traffic is passthrough, not proxied.
+        // The template should NOT permit Anthropic API requests (rules are commented out).
         let t = find("claude-code").unwrap();
         let policy = t.policy.replace("your-org", "test-org");
         let engine = engine_from_policy(&policy);
@@ -662,17 +664,28 @@ permit(
             )
             .unwrap();
         assert!(
-            result.allowed,
-            "POST /v1/messages to Anthropic should be allowed"
+            !result.allowed,
+            "POST to Anthropic should not be allowed (OAuth passthrough)"
         );
 
         let result = engine
             .evaluate("api.anthropic.com", "http:GET", "/v1/models", &[], "worker")
             .unwrap();
         assert!(
-            result.allowed,
-            "GET /v1/models to Anthropic should be allowed"
+            !result.allowed,
+            "GET to Anthropic should not be allowed (OAuth passthrough)"
         );
+    }
+
+    #[test]
+    fn claude_code_permits_npm_registry() {
+        let t = find("claude-code").unwrap();
+        let engine = engine_from_policy(t.policy);
+
+        let result = engine
+            .evaluate("registry.npmjs.org", "http:GET", "/express", &[], "worker")
+            .unwrap();
+        assert!(result.allowed, "GET to npm registry should be allowed");
     }
 
     #[test]

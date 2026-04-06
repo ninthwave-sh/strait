@@ -1,27 +1,22 @@
-// policy.cedar — Complete Cedar policy for Claude Code inside strait.
+// policy.cedar — Cedar policy for Claude Code inside strait.
 //
 // Covers three domains:
-//   http:  — API access (Anthropic, GitHub, telemetry, npm)
+//   http:  — API access (GitHub, npm)
 //   fs:    — filesystem access (project directory)
 //   proc:  — host binary execution (claude, git, node)
 //
+// Anthropic traffic (api.anthropic.com, statsig, sentry) is NOT listed
+// here because it passes through as a plain CONNECT tunnel. Only MITM'd
+// hosts need permit rules.
+//
 // proc:exec rules serve double duty: they authorize execution at runtime
 // AND tell strait which host binaries to bind-mount into the container.
-// No custom Dockerfile or manual installation needed.
 //
 // Default disposition: DENY. Only the access patterns below are allowed.
 
 // ---------------------------------------------------------------------------
-// HTTP — API endpoints Claude Code needs
+// HTTP — MITM'd endpoints (GitHub, npm)
 // ---------------------------------------------------------------------------
-
-// Anthropic API (chat completions, tool use).
-@id("allow-anthropic-api")
-permit(
-    principal == Agent::"claude-code",
-    action in [Action::"http:GET", Action::"http:POST"],
-    resource in Resource::"api.anthropic.com"
-);
 
 // GitHub API (repo operations, PR creation, issue management).
 @id("allow-github-api")
@@ -31,23 +26,7 @@ permit(
     resource in Resource::"api.github.com"
 );
 
-// Anthropic telemetry (feature flags, usage stats).
-@id("allow-anthropic-statsig")
-permit(
-    principal == Agent::"claude-code",
-    action in [Action::"http:GET", Action::"http:POST"],
-    resource in Resource::"statsig.anthropic.com"
-);
-
-// Sentry error reporting.
-@id("allow-sentry")
-permit(
-    principal == Agent::"claude-code",
-    action == Action::"http:POST",
-    resource in Resource::"sentry.io"
-);
-
-// npm registry (package metadata lookups).
+// npm registry (package metadata and tarball downloads).
 @id("allow-npm-registry")
 permit(
     principal == Agent::"claude-code",

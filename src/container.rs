@@ -342,17 +342,24 @@ impl ContainerManager {
                     binds.push(format!("{validated}:{validated}:rw"));
                 }
                 ContainerPermission::ProcExec(binary) => {
-                    // Resolve the binary on the host and bind-mount it into
-                    // /usr/local/bin/<name>:ro inside the container.
                     let binary_name = std::path::Path::new(binary)
                         .file_name()
                         .unwrap_or_else(|| std::ffi::OsStr::new(binary))
                         .to_string_lossy()
                         .to_string();
 
-                    if let Some(host_path) = resolve_host_binary(&binary_name) {
+                    // On macOS the host binaries are Mach-O format and cannot
+                    // execute inside Linux containers. Skip the resolve +
+                    // bind-mount step and log a warning instead.
+                    if cfg!(target_os = "macos") {
+                        warn!(
+                            binary = %binary_name,
+                            "host binary mounting skipped on macOS \
+                             (Mach-O binaries cannot run in Linux containers)"
+                        );
+                    } else if let Some(host_path) = resolve_host_binary(&binary_name) {
                         let container_path = format!("{CONTAINER_BIN_DIR}/{binary_name}");
-                        binds.push(format!("{}:{}:ro", host_path.display(), container_path,));
+                        binds.push(format!("{}:{}:ro", host_path.display(), container_path));
                         info!(
                             binary = %binary_name,
                             host_path = %host_path.display(),
@@ -367,7 +374,8 @@ impl ContainerManager {
                     }
 
                     // Always add /usr/local/bin to PATH (where we mount binaries)
-                    // plus standard dirs as fallback.
+                    // plus standard dirs as fallback so container-installed
+                    // binaries work regardless of host OS.
                     for std_dir in [CONTAINER_BIN_DIR, "/usr/bin", "/bin"] {
                         if !extra_path_dirs.contains(&std_dir.to_string()) {
                             extra_path_dirs.push(std_dir.to_string());
@@ -1095,7 +1103,9 @@ mod tests {
             .binds
             .contains(&"/project/out:/project/out:rw".to_string()));
 
-        // If git is available on the host, it should be bind-mounted
+        // If git is available on the host and we're on Linux, it should be bind-mounted.
+        // On macOS, host binary mounting is skipped (Mach-O binaries).
+        #[cfg(not(target_os = "macos"))]
         if resolve_host_binary("git").is_some() {
             assert!(
                 config
@@ -1621,6 +1631,7 @@ mod tests {
     // -- Unit tests: ProcExec bind-mount in build_config ----------------------
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn proc_exec_mounts_host_binary_into_container() {
         // Create a temp dir with a fake binary to simulate host PATH
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1643,6 +1654,45 @@ mod tests {
             config.binds.contains(&git_bind),
             "should bind-mount git from host: {:?}",
             config.binds
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn proc_exec_skips_host_binary_mount_on_macos() {
+        // Create a temp dir with a fake binary to simulate host PATH
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fake_git = tmp.path().join("git");
+        std::fs::write(&fake_git, b"fake").unwrap();
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{original_path}", tmp.path().display()));
+
+        let policy = policy_with(vec![ContainerPermission::ProcExec("git".to_string())]);
+        let config = build_test_config(&policy, "node:20", &[], None, test_base_dir()).unwrap();
+
+        std::env::set_var("PATH", &original_path);
+
+        // On macOS, no host binary bind-mounts should be created
+        assert!(
+            !config
+                .binds
+                .iter()
+                .any(|b| b.contains("/usr/local/bin/git:ro")),
+            "macOS should not bind-mount host binaries: {:?}",
+            config.binds
+        );
+
+        // PATH should still be set for container-installed binaries
+        let path_env = config.env.iter().find(|e| e.starts_with("PATH="));
+        assert!(
+            path_env.is_some(),
+            "should have PATH even without bind-mounts"
+        );
+        let path_value = path_env.unwrap().strip_prefix("PATH=").unwrap();
+        assert!(
+            path_value.contains("/usr/local/bin"),
+            "PATH should include /usr/local/bin: {path_value}"
         );
     }
 

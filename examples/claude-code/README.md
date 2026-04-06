@@ -1,31 +1,50 @@
 # Claude Code in a strait container
 
 Run Claude Code inside a sandboxed container with policy enforcement,
-credential injection, and audit logging. No custom Docker build needed.
+credential injection, and audit logging.
 
-strait reads `proc:exec` rules from your Cedar policy and automatically
-mounts host binaries (`claude`, `git`, `node`) into the container. You
-write a policy, point strait at a base image, and go.
+Two auth models are supported:
+
+1. **Max subscription (OAuth)** -- primary path. Anthropic traffic passes
+   through as a tunnel. OAuth tokens from `~/.claude/` are mounted into
+   the container.
+2. **API key** -- secondary path. Anthropic traffic is MITM'd and the
+   `x-api-key` header is injected by the proxy.
+
+In both cases, GitHub and npm credentials are injected by the proxy and
+never exposed to the agent.
 
 ## Prerequisites
 
 - Docker (or OrbStack / Podman)
-- `ANTHROPIC_API_KEY` and `GITHUB_TOKEN` environment variables
+- `GITHUB_TOKEN` environment variable
 - `strait` binary on your PATH (`cargo install --path .` from the repo root)
-- `claude` CLI installed on the host (`npm install -g @anthropic-ai/claude-code`)
-- `git` and `node` on the host PATH
+- Claude Code Max subscription (or `ANTHROPIC_API_KEY` for API key auth)
 
 ## How it works
 
-The example has three files:
+The example has two files:
 
 | File | Purpose |
 |------|---------|
-| `strait.toml` | Config: MITM hosts, credential sources, audit settings |
+| `strait.toml` | Config: MITM hosts, credential sources, container spec, audit |
 | `policy.cedar` | Cedar policy: HTTP access, filesystem mounts, binary execution |
-| `Dockerfile` | Minimal base image (`ubuntu:24.04` + `ca-certificates`) |
 
-The key insight is `proc:exec` rules in `policy.cedar`:
+The `[container]` section in `strait.toml` tells strait to auto-build a
+Docker image with the right packages installed:
+
+```toml
+[container]
+base_image = "ubuntu:24.04"
+apt = ["git", "curl", "ca-certificates"]
+npm = ["@anthropic-ai/claude-code"]
+```
+
+strait generates a Dockerfile, builds the image, and caches it by content
+hash. No manual `docker build` step needed.
+
+The `proc:exec` rules in `policy.cedar` tell strait which host binaries
+to bind-mount into the container:
 
 ```cedar
 @id("allow-exec-claude")
@@ -38,30 +57,69 @@ permit(
 
 When strait sees this rule, it finds `claude` on your host PATH, resolves
 its absolute path, and bind-mounts it read-only into the container at
-`/usr/local/bin/claude`. Same for `git` and `node`. No Dockerfile changes
-needed when you add a new tool. Just add a `proc:exec` rule.
+`/usr/local/bin/claude`. Same for `git` and `node`.
 
-## Quick start
+## Quick start (Max subscription)
 
-Build the minimal base image (one-time):
-
-```bash
-docker build -t claude-code-sandbox examples/claude-code/
-```
-
-Then run Claude Code through strait:
+Mount your Claude credentials into the container. Anthropic traffic passes
+through without MITM -- the proxy only intercepts GitHub and npm traffic
+for credential injection.
 
 ```bash
 strait launch --policy examples/claude-code/policy.cedar \
   --config examples/claude-code/strait.toml \
-  --image claude-code-sandbox \
-  --env "ANTHROPIC_API_KEY=" \
+  --mount ~/.claude/:/root/.claude/:rw \
   --env "GITHUB_TOKEN=" \
   -- claude --print "list my GitHub repos"
 ```
 
-The `--env` flags create empty placeholders inside the container. The real
-keys stay on the host and are injected by the proxy after policy evaluation.
+The `--mount` flag makes your OAuth tokens available inside the container.
+The `--env` flag creates an empty placeholder -- the real token is injected
+by the proxy after policy evaluation.
+
+## Quick start (API key)
+
+If you have an Anthropic API key instead of a Max subscription, add
+Anthropic to the MITM hosts and credential injection config.
+
+Add to `strait.toml`:
+
+```toml
+[mitm]
+hosts = [
+    "api.anthropic.com",
+    "api.github.com",
+    "registry.npmjs.org",
+]
+
+# Add this credential block:
+[[credential]]
+host = "api.anthropic.com"
+header = "x-api-key"
+source = "env"
+env_var = "ANTHROPIC_API_KEY"
+```
+
+Add to `policy.cedar`:
+
+```cedar
+@id("allow-anthropic-api")
+permit(
+    principal == Agent::"claude-code",
+    action in [Action::"http:GET", Action::"http:POST"],
+    resource in Resource::"api.anthropic.com"
+);
+```
+
+Then launch without the `--mount` flag:
+
+```bash
+strait launch --policy examples/claude-code/policy.cedar \
+  --config examples/claude-code/strait.toml \
+  --env "ANTHROPIC_API_KEY=" \
+  --env "GITHUB_TOKEN=" \
+  -- claude --print "list my GitHub repos"
+```
 
 ## Observe-then-enforce workflow
 
@@ -74,9 +132,8 @@ Run with no policy. All traffic is allowed and recorded.
 
 ```bash
 strait launch --observe \
-  --image claude-code-sandbox \
   --output observations.jsonl \
-  --env "ANTHROPIC_API_KEY=" \
+  --mount ~/.claude/:/root/.claude/:rw \
   --env "GITHUB_TOKEN=" \
   -- claude --print "list my GitHub repos"
 ```
@@ -118,9 +175,8 @@ Evaluate the policy but allow all traffic. Violations are logged as warnings.
 ```bash
 strait launch --warn policy.cedar \
   --config examples/claude-code/strait.toml \
-  --image claude-code-sandbox \
   --output observations.jsonl \
-  --env "ANTHROPIC_API_KEY=" \
+  --mount ~/.claude/:/root/.claude/:rw \
   --env "GITHUB_TOKEN=" \
   -- claude --print "list my GitHub repos"
 ```
@@ -139,9 +195,8 @@ allowed requests.
 ```bash
 strait launch --policy policy.cedar \
   --config examples/claude-code/strait.toml \
-  --image claude-code-sandbox \
   --output observations.jsonl \
-  --env "ANTHROPIC_API_KEY=" \
+  --mount ~/.claude/:/root/.claude/:rw \
   --env "GITHUB_TOKEN=" \
   -- claude --print "list my GitHub repos"
 ```
@@ -155,15 +210,23 @@ The `strait.toml` config intercepts these endpoints:
 
 | Host | Purpose |
 |------|---------|
-| `api.anthropic.com` | Chat completions, tool use |
 | `api.github.com` | Repo operations, PRs, issues |
-| `statsig.anthropic.com` | Feature flags, usage telemetry |
-| `sentry.io` | Error reporting |
 | `registry.npmjs.org` | npm package metadata |
 
-Traffic to hosts not in this list passes through as a plain CONNECT tunnel
-(no TLS termination, no policy evaluation, no credential injection).
+Traffic to hosts not in this list -- including `api.anthropic.com`,
+`statsig.anthropic.com`, and `sentry.io` -- passes through as a plain
+CONNECT tunnel (no TLS termination, no policy evaluation). This is the
+right default for Max/OAuth users: Anthropic traffic carries its own
+OAuth token and does not need credential injection.
 
-If Claude Code hits additional endpoints during your usage, add them to
-`[mitm] hosts` in `strait.toml` and add corresponding `permit` rules in
-your Cedar policy. Run in observe mode first to discover what is needed.
+## What is isolated
+
+- **GitHub token**: injected by the proxy on allowed requests only.
+  The agent inside the container has an empty `GITHUB_TOKEN` placeholder.
+- **npm token**: same injection model for private package access.
+- **Anthropic credentials**: for Max users, OAuth tokens live in the
+  mounted `~/.claude/` directory. The proxy does not touch Anthropic
+  traffic. For API key users, the proxy injects `x-api-key` and the
+  agent never sees the real key.
+- **Filesystem**: only the project directory is mounted (per Cedar policy).
+- **Network**: all traffic routes through the proxy for audit logging.

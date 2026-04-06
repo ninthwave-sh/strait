@@ -1,30 +1,22 @@
 # strait.toml — Claude Code sandbox configuration.
 #
-# MITM-intercepts Anthropic and GitHub API traffic for policy evaluation
-# and credential injection. The agent inside the container never sees
-# the real API keys.
+# Designed for Claude Code Max (OAuth). Anthropic traffic passes through
+# as a plain CONNECT tunnel -- no MITM, no credential injection. OAuth
+# tokens live in ~/.claude/ mounted into the container.
 #
-# No custom Dockerfile needed. strait mounts host binaries (claude, git,
-# node) into the container when your Cedar policy includes proc:exec
-# rules. See policy.cedar for the full example.
+# GitHub and npm traffic is MITM'd for policy evaluation and credential
+# injection. The agent never sees the real tokens.
+#
+# The [container] section auto-builds an image with Claude Code and
+# dependencies installed. No Dockerfile needed.
 
 ca_cert_path = "/tmp/strait-ca.pem"
 
 [mitm]
 hosts = [
-    "api.anthropic.com",
     "api.github.com",
-    "statsig.anthropic.com",
-    "sentry.io",
     "registry.npmjs.org",
 ]
-
-# Anthropic API — inject x-api-key header
-[[credential]]
-host = "api.anthropic.com"
-header = "x-api-key"
-source = "env"
-env_var = "ANTHROPIC_API_KEY"
 
 # GitHub API — inject Authorization header
 [[credential]]
@@ -33,6 +25,19 @@ header = "Authorization"
 value_prefix = "token "
 source = "env"
 env_var = "GITHUB_TOKEN"
+
+# npm registry — inject Authorization header (for private packages)
+[[credential]]
+host = "registry.npmjs.org"
+header = "Authorization"
+value_prefix = "Bearer "
+source = "env"
+env_var = "NPM_TOKEN"
+
+[container]
+base_image = "ubuntu:24.04"
+apt = ["git", "curl", "ca-certificates"]
+npm = ["@anthropic-ai/claude-code"]
 
 [identity]
 header = "X-Strait-Agent"

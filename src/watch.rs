@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::launch::{latest_launch_session, list_launch_sessions, request_launch_watch_attach};
+use crate::launch::{list_launch_sessions, request_launch_watch_attach, LaunchSessionMetadata};
 use crate::observe::{EventKind, ObservationEvent};
 
 // ---------------------------------------------------------------------------

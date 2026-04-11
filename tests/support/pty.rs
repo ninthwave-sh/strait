@@ -97,6 +97,11 @@ impl PtySession {
             return Err(io::Error::last_os_error());
         }
 
+        let signal_rc = unsafe { libc::kill(self.child.id() as i32, libc::SIGWINCH) };
+        if signal_rc == -1 {
+            return Err(io::Error::last_os_error());
+        }
+
         Ok(())
     }
 
@@ -220,7 +225,14 @@ impl PtySession {
                 match err.kind() {
                     ErrorKind::WouldBlock => return Ok(()),
                     ErrorKind::Interrupted => continue,
-                    _ => return Err(err),
+                    _ => {
+                        if err.raw_os_error() == Some(libc::EIO) {
+                            self.reached_eof = true;
+                            self.flush_pending_line();
+                            return Ok(());
+                        }
+                        return Err(err);
+                    }
                 }
             }
 

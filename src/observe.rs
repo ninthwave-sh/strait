@@ -402,13 +402,18 @@ fn resolve_socket_dir() -> PathBuf {
 }
 
 #[cfg(unix)]
+pub fn runtime_dir() -> PathBuf {
+    resolve_socket_dir()
+}
+
+#[cfg(unix)]
 impl ObservationStream {
     /// Return the default socket path for the current process.
     ///
     /// The path is `/tmp/strait-<pid>.sock` (or a fallback directory if
     /// `/tmp` is not writable).
     pub fn socket_path() -> PathBuf {
-        resolve_socket_dir().join(format!("strait-{}.sock", std::process::id()))
+        runtime_dir().join(format!("strait-{}.sock", std::process::id()))
     }
 
     /// Start a Unix socket server that streams JSONL events to connected

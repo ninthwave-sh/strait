@@ -40,10 +40,12 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
 use futures_util::StreamExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
+use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
 
 use crate::audit::AuditLogger;
@@ -86,12 +88,564 @@ const DEFAULT_IMAGE: &str = "ubuntu:24.04";
 /// traffic reaches the host proxy without a host TCP port.
 pub const PROXY_SOCKET_NAME: &str = "proxy.sock";
 
+/// Current version of the launch session control protocol.
+pub const SESSION_CONTROL_PROTOCOL_VERSION: u32 = 1;
+
+/// Directory name under the runtime directory that stores active launch sessions.
+#[cfg(unix)]
+const SESSION_REGISTRY_DIR_NAME: &str = "strait-sessions";
+
+/// JSON metadata filename for a launch session.
+#[cfg(unix)]
+const SESSION_METADATA_FILE_NAME: &str = "session.json";
+
+/// Unix socket name for the launch control protocol.
+#[cfg(unix)]
+const SESSION_CONTROL_SOCKET_NAME: &str = "control.sock";
+
+/// Unix socket name for observation attach handles returned by `watch.attach`.
+#[cfg(unix)]
+const SESSION_OBSERVATION_SOCKET_NAME: &str = "observe.sock";
+
+/// Exit code returned when a launch session is stopped via the control socket.
+#[cfg(unix)]
+const SESSION_STOP_EXIT_CODE: i32 = 130;
+
 /// Return the proxy Unix socket path for a given session temp directory.
 ///
 /// This is the path that container setup should bind-mount into the container
 /// so the agent process can reach the host proxy over a Unix socket.
 pub fn proxy_socket_path(temp_dir: &Path) -> PathBuf {
     temp_dir.join(PROXY_SOCKET_NAME)
+}
+
+/// Handle used by watchers and future frontends to observe a running launch session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservationHandle {
+    /// Transport type for the observation stream.
+    pub transport: String,
+    /// Filesystem path to the observation transport endpoint.
+    pub path: PathBuf,
+}
+
+/// On-disk metadata for an active launch session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchSessionMetadata {
+    /// Metadata schema / control protocol version.
+    pub version: u32,
+    /// Stable launch session identifier.
+    pub session_id: String,
+    /// Active enforcement mode for the launch session.
+    pub mode: String,
+    /// Path to the session control socket.
+    pub control_socket_path: PathBuf,
+    /// Observation attachment handle for watch clients.
+    pub observation: ObservationHandle,
+    /// Docker container ID, once created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+    /// Docker container name, once created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+}
+
+/// JSON request envelope for the local launch control protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchControlRequest {
+    /// Protocol version requested by the client.
+    pub version: u32,
+    /// Control method name.
+    pub method: String,
+}
+
+impl LaunchControlRequest {
+    fn new(method: ControlMethod) -> Self {
+        Self {
+            version: SESSION_CONTROL_PROTOCOL_VERSION,
+            method: method.as_str().to_string(),
+        }
+    }
+}
+
+/// Structured control protocol error.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchControlError {
+    /// Stable machine-readable error code.
+    pub code: String,
+    /// Human-readable error message.
+    pub message: String,
+}
+
+/// Successful result payloads for the local launch control protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LaunchControlResult {
+    /// Result for `session.info`.
+    SessionInfo { session: LaunchSessionMetadata },
+    /// Result for `watch.attach`.
+    WatchAttach { observation: ObservationHandle },
+    /// Result for `session.stop`.
+    SessionStop { accepted: bool },
+}
+
+/// Response envelope for the local launch control protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchControlResponse {
+    /// Control protocol version used by the server.
+    pub version: u32,
+    /// Whether the request succeeded.
+    pub ok: bool,
+    /// Successful result payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<LaunchControlResult>,
+    /// Structured error when `ok` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<LaunchControlError>,
+}
+
+impl LaunchControlResponse {
+    fn success(result: LaunchControlResult) -> Self {
+        Self {
+            version: SESSION_CONTROL_PROTOCOL_VERSION,
+            ok: true,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    fn invalid_request(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            version: SESSION_CONTROL_PROTOCOL_VERSION,
+            ok: false,
+            result: None,
+            error: Some(LaunchControlError {
+                code: code.to_string(),
+                message: message.into(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlMethod {
+    SessionInfo,
+    WatchAttach,
+    SessionStop,
+}
+
+impl ControlMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionInfo => "session.info",
+            Self::WatchAttach => "watch.attach",
+            Self::SessionStop => "session.stop",
+        }
+    }
+}
+
+fn parse_control_method(request: &LaunchControlRequest) -> anyhow::Result<ControlMethod> {
+    if request.version != SESSION_CONTROL_PROTOCOL_VERSION {
+        anyhow::bail!(
+            "unsupported control protocol version {} (expected {})",
+            request.version,
+            SESSION_CONTROL_PROTOCOL_VERSION
+        );
+    }
+
+    match request.method.as_str() {
+        "session.info" => Ok(ControlMethod::SessionInfo),
+        "watch.attach" => Ok(ControlMethod::WatchAttach),
+        "session.stop" => Ok(ControlMethod::SessionStop),
+        other => anyhow::bail!("unsupported control method '{other}'"),
+    }
+}
+
+#[cfg(unix)]
+fn launch_session_registry_dir() -> PathBuf {
+    crate::observe::runtime_dir().join(SESSION_REGISTRY_DIR_NAME)
+}
+
+#[cfg(unix)]
+fn write_launch_session_metadata(
+    path: &Path,
+    metadata: &LaunchSessionMetadata,
+) -> anyhow::Result<()> {
+    let json = serde_json::to_vec_pretty(metadata)
+        .context("failed to serialize launch session metadata")?;
+    std::fs::write(path, json).with_context(|| {
+        format!(
+            "failed to write launch session metadata '{}'",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn list_launch_sessions_in(root: &Path) -> anyhow::Result<Vec<LaunchSessionMetadata>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut sessions = Vec::new();
+    for entry in std::fs::read_dir(root).with_context(|| {
+        format!(
+            "failed to read launch session registry '{}'",
+            root.display()
+        )
+    })? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let metadata_path = entry.path().join(SESSION_METADATA_FILE_NAME);
+        if !metadata_path.exists() {
+            continue;
+        }
+        let json = std::fs::read_to_string(&metadata_path).with_context(|| {
+            format!(
+                "failed to read launch session metadata '{}'",
+                metadata_path.display()
+            )
+        })?;
+        let metadata: LaunchSessionMetadata = serde_json::from_str(&json).with_context(|| {
+            format!(
+                "failed to parse launch session metadata '{}'",
+                metadata_path.display()
+            )
+        })?;
+        sessions.push(metadata);
+    }
+    sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    Ok(sessions)
+}
+
+/// List active launch sessions from the local registry.
+#[cfg(unix)]
+pub fn list_launch_sessions() -> anyhow::Result<Vec<LaunchSessionMetadata>> {
+    list_launch_sessions_in(&launch_session_registry_dir())
+}
+
+/// Send a raw request to a running launch session control socket.
+#[cfg(unix)]
+pub async fn send_launch_control_request(
+    control_socket_path: &Path,
+    request: &LaunchControlRequest,
+) -> anyhow::Result<LaunchControlResponse> {
+    let mut stream = tokio::net::UnixStream::connect(control_socket_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to connect to launch control socket '{}'",
+                control_socket_path.display()
+            )
+        })?;
+
+    let request_line =
+        serde_json::to_string(request).context("failed to serialize control request")?;
+    stream
+        .write_all(request_line.as_bytes())
+        .await
+        .context("failed to write control request")?;
+    stream
+        .write_all(b"\n")
+        .await
+        .context("failed to terminate control request")?;
+    stream
+        .flush()
+        .await
+        .context("failed to flush control request")?;
+
+    let mut response_line = String::new();
+    let mut reader = BufReader::new(stream);
+    let bytes_read = reader
+        .read_line(&mut response_line)
+        .await
+        .context("failed to read control response")?;
+    if bytes_read == 0 {
+        anyhow::bail!("launch control server closed the connection without a response");
+    }
+
+    let response = serde_json::from_str::<LaunchControlResponse>(response_line.trim_end())
+        .context("failed to parse control response")?;
+    if !response.ok {
+        let error = response
+            .error
+            .as_ref()
+            .map(|err| format!("{}: {}", err.code, err.message))
+            .unwrap_or_else(|| "unknown control error".to_string());
+        anyhow::bail!("{error}");
+    }
+
+    Ok(response)
+}
+
+/// Query `session.info` from a running launch session.
+#[cfg(unix)]
+pub async fn request_launch_session_info(
+    control_socket_path: &Path,
+) -> anyhow::Result<LaunchSessionMetadata> {
+    let response = send_launch_control_request(
+        control_socket_path,
+        &LaunchControlRequest::new(ControlMethod::SessionInfo),
+    )
+    .await?;
+    match response.result {
+        Some(LaunchControlResult::SessionInfo { session }) => Ok(session),
+        other => anyhow::bail!("unexpected session.info response: {other:?}"),
+    }
+}
+
+/// Query `watch.attach` from a running launch session.
+#[cfg(unix)]
+pub async fn request_launch_watch_attach(
+    control_socket_path: &Path,
+) -> anyhow::Result<ObservationHandle> {
+    let response = send_launch_control_request(
+        control_socket_path,
+        &LaunchControlRequest::new(ControlMethod::WatchAttach),
+    )
+    .await?;
+    match response.result {
+        Some(LaunchControlResult::WatchAttach { observation }) => Ok(observation),
+        other => anyhow::bail!("unexpected watch.attach response: {other:?}"),
+    }
+}
+
+/// Request graceful shutdown of a running launch session.
+#[cfg(unix)]
+pub async fn request_launch_session_stop(control_socket_path: &Path) -> anyhow::Result<()> {
+    let response = send_launch_control_request(
+        control_socket_path,
+        &LaunchControlRequest::new(ControlMethod::SessionStop),
+    )
+    .await?;
+    match response.result {
+        Some(LaunchControlResult::SessionStop { accepted: true }) => Ok(()),
+        other => anyhow::bail!("unexpected session.stop response: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+async fn handle_launch_control_client(
+    stream: tokio::net::UnixStream,
+    metadata: Arc<RwLock<LaunchSessionMetadata>>,
+    stop_tx: watch::Sender<bool>,
+) -> anyhow::Result<()> {
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    let bytes_read = reader
+        .read_line(&mut line)
+        .await
+        .context("failed to read control request")?;
+    if bytes_read == 0 {
+        return Ok(());
+    }
+
+    let response = match serde_json::from_str::<LaunchControlRequest>(line.trim_end()) {
+        Ok(request) => match parse_control_method(&request) {
+            Ok(ControlMethod::SessionInfo) => {
+                let session = metadata.read().await.clone();
+                LaunchControlResponse::success(LaunchControlResult::SessionInfo { session })
+            }
+            Ok(ControlMethod::WatchAttach) => {
+                let observation = metadata.read().await.observation.clone();
+                LaunchControlResponse::success(LaunchControlResult::WatchAttach { observation })
+            }
+            Ok(ControlMethod::SessionStop) => {
+                let _ = stop_tx.send(true);
+                LaunchControlResponse::success(LaunchControlResult::SessionStop { accepted: true })
+            }
+            Err(error) => {
+                LaunchControlResponse::invalid_request("invalid_method", error.to_string())
+            }
+        },
+        Err(error) => LaunchControlResponse::invalid_request(
+            "invalid_request",
+            format!("failed to parse control request: {error}"),
+        ),
+    };
+
+    let response_line =
+        serde_json::to_string(&response).context("failed to serialize control response")?;
+    write_half
+        .write_all(response_line.as_bytes())
+        .await
+        .context("failed to write control response")?;
+    write_half
+        .write_all(b"\n")
+        .await
+        .context("failed to terminate control response")?;
+    write_half
+        .flush()
+        .await
+        .context("failed to flush control response")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn start_launch_control_server(
+    control_socket_path: PathBuf,
+    metadata: Arc<RwLock<LaunchSessionMetadata>>,
+    stop_tx: watch::Sender<bool>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    if control_socket_path.exists() {
+        std::fs::remove_file(&control_socket_path).with_context(|| {
+            format!(
+                "failed to remove stale launch control socket '{}'",
+                control_socket_path.display()
+            )
+        })?;
+    }
+
+    let listener = UnixListener::bind(&control_socket_path).with_context(|| {
+        format!(
+            "failed to bind launch control socket '{}'",
+            control_socket_path.display()
+        )
+    })?;
+
+    Ok(tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let metadata = metadata.clone();
+                    let stop_tx = stop_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            handle_launch_control_client(stream, metadata, stop_tx).await
+                        {
+                            tracing::debug!(error = %error, "launch control client error");
+                        }
+                    });
+                }
+                Err(error) => {
+                    warn!(error = %error, "launch control accept error");
+                    break;
+                }
+            }
+        }
+    }))
+}
+
+#[cfg(unix)]
+fn launch_session_output_lines(metadata: &LaunchSessionMetadata) -> Vec<String> {
+    vec![
+        format!("Session ID: {}", metadata.session_id),
+        format!("Control socket: {}", metadata.control_socket_path.display()),
+        format!(
+            "Observation socket: {}",
+            metadata.observation.path.display()
+        ),
+    ]
+}
+
+#[cfg(unix)]
+struct LaunchSession {
+    metadata: Arc<RwLock<LaunchSessionMetadata>>,
+    session_dir: PathBuf,
+    metadata_path: PathBuf,
+    control_task: tokio::task::JoinHandle<()>,
+    stop_tx: watch::Sender<bool>,
+}
+
+#[cfg(unix)]
+impl LaunchSession {
+    async fn create(session_id: &str, mode: EnforcementMode) -> anyhow::Result<Self> {
+        let registry_dir = launch_session_registry_dir();
+        Self::create_in(&registry_dir, session_id, mode).await
+    }
+
+    async fn create_in(
+        root: &Path,
+        session_id: &str,
+        mode: EnforcementMode,
+    ) -> anyhow::Result<Self> {
+        let registry_dir = root.to_path_buf();
+        std::fs::create_dir_all(&registry_dir).with_context(|| {
+            format!(
+                "failed to create launch session registry '{}'",
+                registry_dir.display()
+            )
+        })?;
+
+        let session_dir = registry_dir.join(session_id);
+        std::fs::create_dir_all(&session_dir).with_context(|| {
+            format!(
+                "failed to create launch session directory '{}'",
+                session_dir.display()
+            )
+        })?;
+
+        let metadata_path = session_dir.join(SESSION_METADATA_FILE_NAME);
+        let metadata = LaunchSessionMetadata {
+            version: SESSION_CONTROL_PROTOCOL_VERSION,
+            session_id: session_id.to_string(),
+            mode: mode.as_str().to_string(),
+            control_socket_path: session_dir.join(SESSION_CONTROL_SOCKET_NAME),
+            observation: ObservationHandle {
+                transport: "unix_socket".to_string(),
+                path: session_dir.join(SESSION_OBSERVATION_SOCKET_NAME),
+            },
+            container_id: None,
+            container_name: None,
+        };
+        write_launch_session_metadata(&metadata_path, &metadata)?;
+
+        let metadata = Arc::new(RwLock::new(metadata));
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        let control_task = start_launch_control_server(
+            metadata.read().await.control_socket_path.clone(),
+            metadata.clone(),
+            stop_tx.clone(),
+        )
+        .await?;
+
+        Ok(Self {
+            metadata,
+            session_dir,
+            metadata_path,
+            control_task,
+            stop_tx,
+        })
+    }
+
+    async fn set_container(
+        &self,
+        container_id: impl Into<String>,
+        container_name: impl Into<String>,
+    ) -> anyhow::Result<()> {
+        let mut metadata = self.metadata.write().await;
+        metadata.container_id = Some(container_id.into());
+        metadata.container_name = Some(container_name.into());
+        write_launch_session_metadata(&self.metadata_path, &metadata)
+    }
+
+    async fn metadata(&self) -> LaunchSessionMetadata {
+        self.metadata.read().await.clone()
+    }
+
+    #[cfg(test)]
+    async fn control_socket_path(&self) -> PathBuf {
+        self.metadata.read().await.control_socket_path.clone()
+    }
+
+    async fn observation_socket_path(&self) -> PathBuf {
+        self.metadata.read().await.observation.path.clone()
+    }
+
+    fn stop_receiver(&self) -> watch::Receiver<bool> {
+        self.stop_tx.subscribe()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LaunchSession {
+    fn drop(&mut self) {
+        self.control_task.abort();
+        let _ = std::fs::remove_dir_all(&self.session_dir);
+    }
 }
 
 /// The size of an interactive terminal in character cells.
@@ -459,15 +1013,6 @@ async fn run_launch_observe_with_terminal_mode(
     info!(path = %obs_log_path.display(), "observation log created");
     eprintln!("Observation log: {}", obs_log_path.display());
 
-    #[cfg(unix)]
-    {
-        // Use a unique socket path in the temp directory to avoid conflicts
-        // when multiple launch sessions run concurrently (e.g., parallel tests).
-        let socket_path = temp_dir.path().join("strait.sock");
-        obs_stream.start_socket_server_at(&socket_path).await?;
-        eprintln!("Observation socket: {}", socket_path.display());
-    }
-
     // 5. Generate session CA and write to temp file
     let session_ca = SessionCa::generate()?;
     std::fs::write(&ca_pem_path, &session_ca.ca_cert_pem)?;
@@ -486,6 +1031,27 @@ async fn run_launch_observe_with_terminal_mode(
         credential_store,
         mitm_hosts,
     )?);
+
+    #[cfg(unix)]
+    let launch_session = LaunchSession::create(
+        proxy_ctx.audit_logger.session_id(),
+        EnforcementMode::Observe,
+    )
+    .await?;
+    #[cfg(unix)]
+    {
+        let observation_socket_path = launch_session.observation_socket_path().await;
+        obs_stream
+            .start_socket_server_at(&observation_socket_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to start observation socket '{}'",
+                    observation_socket_path.display()
+                )
+            })?;
+    }
+
     let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx.clone()));
 
     // 6b. Start Unix socket proxy listener so containers can reach the proxy
@@ -562,6 +1128,14 @@ async fn run_launch_observe_with_terminal_mode(
 
     // 8. Attach to container, start it, pipe I/O, and wait for exit
     let container_name = container_mgr.container_name().unwrap().to_string();
+    #[cfg(unix)]
+    launch_session
+        .set_container(container_id.clone(), container_name.clone())
+        .await?;
+    #[cfg(unix)]
+    for line in launch_session_output_lines(&launch_session.metadata().await) {
+        eprintln!("{line}");
+    }
 
     let (run_future, abort_handle) = futures_util::future::abortable(attach_and_wait(
         container_mgr.docker().clone(),
@@ -569,6 +1143,20 @@ async fn run_launch_observe_with_terminal_mode(
         terminal.initial_size,
         terminal.resize_source.clone(),
     ));
+    let session_stop = async {
+        #[cfg(unix)]
+        {
+            let mut rx = launch_session.stop_receiver();
+            rx.changed()
+                .await
+                .context("launch control stop channel closed unexpectedly")?;
+            Ok::<(), anyhow::Error>(())
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<Result<(), anyhow::Error>>().await
+        }
+    };
     let exit_code = wait_for_launch_completion(
         run_future,
         abort_handle,
@@ -576,6 +1164,9 @@ async fn run_launch_observe_with_terminal_mode(
             let _ = tokio::signal::ctrl_c().await;
         },
         sigterm_signal(),
+        session_stop,
+        "Stopped via control socket — cleaning up...",
+        SESSION_STOP_EXIT_CODE,
         Some(&mut container_mgr),
     )
     .await?;
@@ -726,13 +1317,6 @@ async fn run_launch_with_policy_with_terminal_mode(
     info!(path = %obs_log_path.display(), "observation log created");
     eprintln!("Observation log: {}", obs_log_path.display());
 
-    #[cfg(unix)]
-    {
-        let socket_path = temp_dir.path().join("strait.sock");
-        obs_stream.start_socket_server_at(&socket_path).await?;
-        eprintln!("Observation socket: {}", socket_path.display());
-    }
-
     // 6. Generate session CA and write to temp file
     let session_ca = SessionCa::generate()?;
     std::fs::write(&ca_pem_path, &session_ca.ca_cert_pem)?;
@@ -751,6 +1335,23 @@ async fn run_launch_with_policy_with_terminal_mode(
         credential_store,
         mitm_hosts,
     )?);
+
+    #[cfg(unix)]
+    let launch_session = LaunchSession::create(proxy_ctx.audit_logger.session_id(), mode).await?;
+    #[cfg(unix)]
+    {
+        let observation_socket_path = launch_session.observation_socket_path().await;
+        obs_stream
+            .start_socket_server_at(&observation_socket_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to start observation socket '{}'",
+                    observation_socket_path.display()
+                )
+            })?;
+    }
+
     let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx.clone()));
 
     // 7b. Start Unix socket proxy listener for container traffic
@@ -863,6 +1464,14 @@ async fn run_launch_with_policy_with_terminal_mode(
 
     // 10. Attach to container, start it, pipe I/O, and wait for exit
     let container_name = container_mgr.container_name().unwrap().to_string();
+    #[cfg(unix)]
+    launch_session
+        .set_container(container_id.clone(), container_name.clone())
+        .await?;
+    #[cfg(unix)]
+    for line in launch_session_output_lines(&launch_session.metadata().await) {
+        eprintln!("{line}");
+    }
 
     let (run_future, abort_handle) = futures_util::future::abortable(attach_and_wait(
         container_mgr.docker().clone(),
@@ -870,6 +1479,20 @@ async fn run_launch_with_policy_with_terminal_mode(
         terminal.initial_size,
         terminal.resize_source.clone(),
     ));
+    let session_stop = async {
+        #[cfg(unix)]
+        {
+            let mut rx = launch_session.stop_receiver();
+            rx.changed()
+                .await
+                .context("launch control stop channel closed unexpectedly")?;
+            Ok::<(), anyhow::Error>(())
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<Result<(), anyhow::Error>>().await
+        }
+    };
     let exit_code = wait_for_launch_completion(
         run_future,
         abort_handle,
@@ -877,6 +1500,9 @@ async fn run_launch_with_policy_with_terminal_mode(
             let _ = tokio::signal::ctrl_c().await;
         },
         sigterm_signal(),
+        session_stop,
+        "Stopped via control socket — cleaning up...",
+        SESSION_STOP_EXIT_CODE,
         Some(&mut container_mgr),
     )
     .await?;
@@ -1063,21 +1689,26 @@ async fn sigterm_signal() {
     std::future::pending::<()>().await;
 }
 
-async fn wait_for_launch_completion<Run, CtrlC, Sigterm>(
+async fn wait_for_launch_completion<Run, CtrlC, Sigterm, Stop>(
     run_future: Run,
     abort_handle: futures_util::future::AbortHandle,
     ctrl_c: CtrlC,
     sigterm: Sigterm,
+    stop: Stop,
+    stop_message: &'static str,
+    stop_exit_code: i32,
     container_mgr: Option<&mut ContainerManager>,
 ) -> anyhow::Result<i32>
 where
     Run: std::future::Future<Output = Result<anyhow::Result<i32>, futures_util::future::Aborted>>,
     CtrlC: std::future::Future<Output = ()>,
     Sigterm: std::future::Future<Output = ()>,
+    Stop: std::future::Future<Output = anyhow::Result<()>>,
 {
     tokio::pin!(run_future);
     tokio::pin!(ctrl_c);
     tokio::pin!(sigterm);
+    tokio::pin!(stop);
     let mut container_mgr = container_mgr;
 
     tokio::select! {
@@ -1104,6 +1735,16 @@ where
                 (*container_mgr).stop_container().await.ok();
             }
             Ok(143)
+        }
+        result = &mut stop => {
+            result?;
+            eprintln!("\n{stop_message}");
+            abort_handle.abort();
+            let _ = (&mut run_future).await;
+            if let Some(container_mgr) = container_mgr.as_mut() {
+                (*container_mgr).stop_container().await.ok();
+            }
+            Ok(stop_exit_code)
         }
     }
 }
@@ -1669,6 +2310,9 @@ mod tests {
                 let _ = started_rx.await;
             },
             std::future::pending::<()>(),
+            std::future::pending::<anyhow::Result<()>>(),
+            "unused",
+            0,
             None,
         )
         .await
@@ -1717,6 +2361,9 @@ mod tests {
             async move {
                 let _ = started_rx.await;
             },
+            std::future::pending::<anyhow::Result<()>>(),
+            "unused",
+            0,
             None,
         )
         .await
@@ -2259,6 +2906,135 @@ permit(
             !path_clone.exists(),
             "socket file should be cleaned up with temp dir"
         );
+    }
+
+    // -- Launch session control tests ----------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn control_request_parser_rejects_bad_version_and_method() {
+        let wrong_version = LaunchControlRequest {
+            version: 99,
+            method: "session.info".to_string(),
+        };
+        let err = parse_control_method(&wrong_version).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported control protocol version"),
+            "wrong version should be rejected: {err}"
+        );
+
+        let wrong_method = LaunchControlRequest {
+            version: SESSION_CONTROL_PROTOCOL_VERSION,
+            method: "session.nope".to_string(),
+        };
+        let err = parse_control_method(&wrong_method).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported control method"),
+            "unknown method should be rejected: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_session_output_lines_include_targeting_fields() {
+        let metadata = LaunchSessionMetadata {
+            version: SESSION_CONTROL_PROTOCOL_VERSION,
+            session_id: "test-session".to_string(),
+            mode: "observe".to_string(),
+            control_socket_path: PathBuf::from("/tmp/control.sock"),
+            observation: ObservationHandle {
+                transport: "unix_socket".to_string(),
+                path: PathBuf::from("/tmp/observe.sock"),
+            },
+            container_id: Some("abc123".to_string()),
+            container_name: Some("strait-test".to_string()),
+        };
+
+        let lines = launch_session_output_lines(&metadata);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Session ID: test-session")),
+            "session id line should be present: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("/tmp/control.sock")),
+            "control socket line should be present: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("/tmp/observe.sock")),
+            "observation socket line should be present: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_session_registry_writes_metadata_and_cleans_up() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let session =
+            LaunchSession::create_in(registry_root.path(), "test-session", EnforcementMode::Warn)
+                .await
+                .unwrap();
+        let control_socket = session.control_socket_path().await;
+        let session_dir = registry_root.path().join("test-session");
+        let metadata_path = session_dir.join(SESSION_METADATA_FILE_NAME);
+
+        assert!(control_socket.exists(), "control socket should exist");
+        assert!(metadata_path.exists(), "metadata file should exist");
+
+        let sessions = list_launch_sessions_in(registry_root.path()).unwrap();
+        assert_eq!(sessions.len(), 1, "registry should contain one session");
+        assert_eq!(sessions[0].session_id, "test-session");
+        assert_eq!(sessions[0].mode, "warn");
+        assert_eq!(sessions[0].control_socket_path, control_socket);
+
+        drop(session);
+
+        assert!(
+            !session_dir.exists(),
+            "session directory should be removed on cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_control_server_handles_info_attach_and_stop() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let session = LaunchSession::create_in(
+            registry_root.path(),
+            "test-session",
+            EnforcementMode::Observe,
+        )
+        .await
+        .unwrap();
+        session
+            .set_container("container-123", "strait-test-container")
+            .await
+            .unwrap();
+
+        let control_socket = session.control_socket_path().await;
+        let info = request_launch_session_info(&control_socket).await.unwrap();
+        assert_eq!(info.session_id, "test-session");
+        assert_eq!(info.mode, "observe");
+        assert_eq!(info.container_id.as_deref(), Some("container-123"));
+        assert_eq!(
+            info.container_name.as_deref(),
+            Some("strait-test-container")
+        );
+
+        let observation = request_launch_watch_attach(&control_socket).await.unwrap();
+        assert_eq!(observation.transport, "unix_socket");
+        assert_eq!(observation.path, info.observation.path);
+
+        let mut stop_rx = session.stop_receiver();
+        request_launch_session_stop(&control_socket).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), stop_rx.changed())
+            .await
+            .expect("session.stop should notify the launch loop")
+            .expect("session.stop channel should stay open");
+
+        drop(session);
     }
 
     // -- docker_arch_to_target tests ------------------------------------------

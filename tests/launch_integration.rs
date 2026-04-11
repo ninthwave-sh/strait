@@ -8,6 +8,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -163,6 +164,20 @@ fn launch_test_guard() -> MutexGuard<'static, ()> {
     }
 }
 
+#[cfg(unix)]
+fn run_strait_cli(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(strait_binary())
+        .args(args)
+        .current_dir(repo_root())
+        .output()
+        .expect("strait CLI should run")
+}
+
+#[cfg(unix)]
+fn output_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 async fn wait_for_new_launch_session(
     existing_session_ids: &[String],
     require_container_identity: bool,
@@ -215,6 +230,46 @@ async fn start_managed_observe_launch() -> (
 
     let session = wait_for_new_launch_session(&existing_session_ids, true).await;
     (temp_dir, launch_task, session)
+}
+
+async fn start_managed_policy_launch(
+    policy_text: &str,
+) -> (
+    tempfile::TempDir,
+    tokio::task::JoinHandle<anyhow::Result<i32>>,
+    strait::launch::LaunchSessionMetadata,
+    std::path::PathBuf,
+) {
+    let existing_session_ids: Vec<String> = strait::launch::list_launch_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+    let policy_path = temp_dir.path().join("policy.cedar");
+    std::fs::write(&policy_path, policy_text).unwrap();
+
+    let launch_policy_path = policy_path.clone();
+    let launch_task = tokio::spawn(async move {
+        strait::launch::run_launch_with_policy(
+            strait::launch::EnforcementMode::Enforce,
+            &launch_policy_path,
+            vec!["sh".to_string(), "-lc".to_string(), "sleep 60".to_string()],
+            Some(TEST_IMAGE),
+            Some(obs_path),
+            None,
+            Vec::new(),
+            vec![],
+            vec![],
+            false,
+        )
+        .await
+    });
+
+    let session = wait_for_new_launch_session(&existing_session_ids, true).await;
+    (temp_dir, launch_task, session, policy_path)
 }
 
 async fn stop_launch_session(
@@ -310,6 +365,17 @@ async fn start_upstream_close_server() -> std::net::SocketAddr {
     addr
 }
 
+#[cfg(unix)]
+async fn wait_for_launch_task_exit(
+    launch_task: tokio::task::JoinHandle<anyhow::Result<i32>>,
+) -> i32 {
+    tokio::time::timeout(Duration::from_secs(20), launch_task)
+        .await
+        .expect("launch task should finish")
+        .expect("launch task should not panic")
+        .expect("launch task should return an exit code")
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests (require Docker)
 // ---------------------------------------------------------------------------
@@ -374,6 +440,234 @@ async fn launch_observe_echo_hello() {
         Some(0),
         "container_stop should record exit code 0"
     );
+}
+
+#[tokio::test]
+async fn session_cli_list_and_info_report_active_session() {
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let (_temp_dir, launch_task, session) = start_managed_observe_launch().await;
+
+    let list = run_strait_cli(&["session", "list"]);
+    let list_stdout = output_text(&list.stdout);
+    assert!(
+        list.status.success(),
+        "session list should succeed: {list_stdout}"
+    );
+    assert!(
+        list_stdout.contains(&session.session_id),
+        "session list should include the active session id: {list_stdout}"
+    );
+    assert!(
+        list_stdout.contains("observe"),
+        "session list should show the enforcement mode: {list_stdout}"
+    );
+
+    let info = run_strait_cli(&["session", "info", "--session", &session.session_id]);
+    let info_stdout = output_text(&info.stdout);
+    assert!(
+        info.status.success(),
+        "session info should succeed: {info_stdout}"
+    );
+    assert!(
+        info_stdout.contains(&format!("Session ID: {}", session.session_id)),
+        "session info should print the targeted session id: {info_stdout}"
+    );
+    assert!(
+        info_stdout.contains("Policy updates: Live updates apply to network policy only; filesystem or process policy changes require relaunch."),
+        "session info should explain the live update boundary: {info_stdout}"
+    );
+
+    let exit_code = stop_launch_session(&session, launch_task).await;
+    assert_eq!(exit_code, 130);
+}
+
+#[tokio::test]
+async fn session_cli_watch_streams_session_events() {
+    use tokio::io::AsyncBufReadExt;
+
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let (_temp_dir, launch_task, session) = start_managed_observe_launch().await;
+
+    let mut child = tokio::process::Command::new(strait_binary())
+        .args(["session", "watch", "--session", session.session_id.as_str()])
+        .current_dir(repo_root())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("session watch should start");
+
+    let stdout = child.stdout.take().expect("watch stdout should be piped");
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let line = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match lines.next_line().await.unwrap() {
+                Some(line) if line.contains("container:start") => return line,
+                Some(_) => continue,
+                None => panic!("session watch exited before streaming container events"),
+            }
+        }
+    })
+    .await
+    .expect("session watch should stream events promptly");
+
+    assert!(
+        line.contains(TEST_IMAGE),
+        "session watch should render the container start event: {line}"
+    );
+
+    child
+        .start_kill()
+        .expect("watch process should accept kill");
+    let _ = child.wait().await;
+
+    let exit_code = stop_launch_session(&session, launch_task).await;
+    assert_eq!(exit_code, 130);
+}
+
+#[tokio::test]
+async fn session_cli_reload_replace_and_stop_use_control_api() {
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let initial_policy = r#"
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource
+);
+"#;
+    let (temp_dir, launch_task, session, policy_path) =
+        start_managed_policy_launch(initial_policy).await;
+
+    std::fs::write(&policy_path, "forbid(principal, action, resource);\n").unwrap();
+    let reload = run_strait_cli(&["session", "reload-policy", "--session", &session.session_id]);
+    let reload_stdout = output_text(&reload.stdout);
+    assert!(
+        reload.status.success(),
+        "network-only reload should succeed: {reload_stdout}"
+    );
+    assert!(
+        reload_stdout.contains("Policy reload applied live"),
+        "reload output should confirm a live apply: {reload_stdout}"
+    );
+
+    let replace_policy_path = temp_dir.path().join("replace-policy.cedar");
+    std::fs::write(
+        &replace_policy_path,
+        r#"
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource
+);
+"#,
+    )
+    .unwrap();
+    let replace = run_strait_cli(&[
+        "session",
+        "replace-policy",
+        "--session",
+        &session.session_id,
+        replace_policy_path.to_str().unwrap(),
+    ]);
+    let replace_stdout = output_text(&replace.stdout);
+    assert!(
+        replace.status.success(),
+        "network-only replace should succeed: {replace_stdout}"
+    );
+    assert!(
+        replace_stdout.contains("Policy replace applied live"),
+        "replace output should confirm a live apply: {replace_stdout}"
+    );
+
+    std::fs::write(
+        &policy_path,
+        r#"
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource
+);
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:read",
+    resource in Resource::"fs::/workspace"
+);
+"#,
+    )
+    .unwrap();
+    let reload_restart =
+        run_strait_cli(&["session", "reload-policy", "--session", &session.session_id]);
+    let reload_restart_stderr = output_text(&reload_restart.stderr);
+    assert!(
+        !reload_restart.status.success(),
+        "fs-changing reload should require relaunch"
+    );
+    assert!(
+        reload_restart_stderr.contains("requires relaunch for fs policy changes"),
+        "reload failure should explain the live update boundary: {reload_restart_stderr}"
+    );
+
+    let replace_restart_path = temp_dir.path().join("replace-restart.cedar");
+    std::fs::write(
+        &replace_restart_path,
+        r#"
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource
+);
+permit(
+    principal == Agent::"agent",
+    action == Action::"proc:exec",
+    resource == Resource::"proc::git"
+);
+"#,
+    )
+    .unwrap();
+    let replace_restart = run_strait_cli(&[
+        "session",
+        "replace-policy",
+        "--session",
+        &session.session_id,
+        replace_restart_path.to_str().unwrap(),
+    ]);
+    let replace_restart_stderr = output_text(&replace_restart.stderr);
+    assert!(
+        !replace_restart.status.success(),
+        "proc-changing replace should require relaunch"
+    );
+    assert!(
+        replace_restart_stderr.contains("requires relaunch for proc policy changes"),
+        "replace failure should explain the live update boundary: {replace_restart_stderr}"
+    );
+
+    let stop = run_strait_cli(&["session", "stop", "--session", &session.session_id]);
+    let stop_stdout = output_text(&stop.stdout);
+    assert!(
+        stop.status.success(),
+        "session stop should succeed: {stop_stdout}"
+    );
+    assert!(
+        stop_stdout.contains(&format!(
+            "Stop requested for session {}.",
+            session.session_id
+        )),
+        "stop output should confirm the targeted session: {stop_stdout}"
+    );
+
+    let exit_code = wait_for_launch_task_exit(launch_task).await;
+    assert_eq!(exit_code, 130, "session stop should terminate the session");
 }
 
 /// Observation JSONL contains both network events from proxy AND container

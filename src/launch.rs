@@ -94,6 +94,10 @@ pub const PROXY_SOCKET_NAME: &str = "proxy.sock";
 /// Current version of the launch session control protocol.
 pub const SESSION_CONTROL_PROTOCOL_VERSION: u32 = 1;
 
+/// Operator-facing reminder for live policy updates.
+pub const LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE: &str =
+    "Live updates apply to network policy only; filesystem or process policy changes require relaunch.";
+
 /// Directory name under the runtime directory that stores active launch sessions.
 #[cfg(unix)]
 const SESSION_REGISTRY_DIR_NAME: &str = "strait-sessions";
@@ -458,6 +462,23 @@ pub fn list_launch_sessions() -> anyhow::Result<Vec<LaunchSessionMetadata>> {
     list_launch_sessions_in(&launch_session_registry_dir())
 }
 
+#[cfg(unix)]
+fn session_modified_time(session: &LaunchSessionMetadata) -> Option<std::time::SystemTime> {
+    std::fs::metadata(&session.control_socket_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+}
+
+/// Return the newest active launch session from the local registry.
+#[cfg(unix)]
+pub fn latest_launch_session() -> anyhow::Result<Option<LaunchSessionMetadata>> {
+    Ok(list_launch_sessions()?.into_iter().max_by(|left, right| {
+        session_modified_time(left)
+            .cmp(&session_modified_time(right))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    }))
+}
+
 /// Send a raw request to a running launch session control socket.
 #[cfg(unix)]
 pub async fn send_launch_control_request(
@@ -788,6 +809,11 @@ fn launch_session_output_lines(metadata: &LaunchSessionMetadata) -> Vec<String> 
             "Observation socket: {}",
             metadata.observation.path.display()
         ),
+        format!(
+            "Manage session: strait session info --session {}",
+            metadata.session_id
+        ),
+        format!("Policy updates: {LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE}"),
     ]
 }
 
@@ -3361,6 +3387,20 @@ permit(
         assert!(
             lines.iter().any(|line| line.contains("/tmp/observe.sock")),
             "observation socket line should be present: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("strait session info --session test-session")),
+            "launch output should point operators at session commands: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| {
+                line.contains(
+                    "Policy updates: Live updates apply to network policy only; filesystem or process policy changes require relaunch."
+                )
+            }),
+            "launch output should explain the live update boundary: {lines:?}"
         );
     }
 

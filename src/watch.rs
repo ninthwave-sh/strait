@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::launch::{list_launch_sessions, request_launch_watch_attach, LaunchSessionMetadata};
+use crate::launch::{latest_launch_session, list_launch_sessions, request_launch_watch_attach};
 use crate::observe::{EventKind, ObservationEvent};
 
 // ---------------------------------------------------------------------------
@@ -316,7 +316,6 @@ async fn discover_named_session_socket(session_id: &str) -> Option<PathBuf> {
         .filter(|session| session.session_id == session_id)
         .collect::<Vec<_>>();
     discover_session_socket_from_sessions(matching).await
-}
 }
 
 /// Discover the newest observation socket across multiple directories.

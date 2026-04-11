@@ -135,6 +135,7 @@ fn events_of_type<'a>(
         .collect()
 }
 
+<<<<<<< HEAD
 #[cfg(unix)]
 fn repo_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))

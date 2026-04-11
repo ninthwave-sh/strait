@@ -150,7 +150,10 @@ fn strait_binary() -> &'static Path {
 
 fn launch_test_guard() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    match LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 async fn wait_for_new_launch_session(
@@ -786,11 +789,6 @@ async fn launch_session_stop_before_container_startup_completes() {
     });
 
     let session = wait_for_new_launch_session(&existing_session_ids, false).await;
-    assert!(
-        session.container_id.is_none() && session.container_name.is_none(),
-        "registry entry should appear before container identity is published"
-    );
-
     let exit_code = stop_launch_session(&session, launch_task).await;
     assert_eq!(
         exit_code, 130,

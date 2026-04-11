@@ -277,26 +277,36 @@ fn session_modified_time(session: &LaunchSessionMetadata) -> Option<std::time::S
         .and_then(|metadata| metadata.modified().ok())
 }
 
-fn newest_launch_session(
+fn launch_sessions_newest_first(
     sessions: impl IntoIterator<Item = LaunchSessionMetadata>,
-) -> Option<LaunchSessionMetadata> {
-    sessions.into_iter().max_by(|left, right| {
-        session_modified_time(left)
-            .cmp(&session_modified_time(right))
-            .then_with(|| left.session_id.cmp(&right.session_id))
-    })
+) -> Vec<LaunchSessionMetadata> {
+    let mut sessions: Vec<_> = sessions.into_iter().collect();
+    sessions.sort_by(|left, right| {
+        session_modified_time(right)
+            .cmp(&session_modified_time(left))
+            .then_with(|| right.session_id.cmp(&left.session_id))
+    });
+    sessions
+}
+
+async fn discover_session_socket_from_sessions(
+    sessions: impl IntoIterator<Item = LaunchSessionMetadata>,
+) -> Option<PathBuf> {
+    for session in launch_sessions_newest_first(sessions) {
+        let Ok(observation) = request_launch_watch_attach(&session.control_socket_path).await
+        else {
+            continue;
+        };
+        if observation.transport == "unix_socket" {
+            return Some(observation.path);
+        }
+    }
+    None
 }
 
 async fn discover_session_socket() -> Option<PathBuf> {
-    let session = newest_launch_session(list_launch_sessions().ok()?)?;
-    let observation = request_launch_watch_attach(&session.control_socket_path)
-        .await
-        .ok()?;
-    if observation.transport == "unix_socket" {
-        Some(observation.path)
-    } else {
-        None
-    }
+    let sessions = list_launch_sessions().ok()?;
+    discover_session_socket_from_sessions(sessions).await
 }
 
 /// Discover the newest observation socket across multiple directories.
@@ -933,6 +943,84 @@ mod tests {
 
         let dirs = vec![dir1.path().to_path_buf(), dir2.path().to_path_buf()];
         assert!(discover_socket_in_dirs(&dirs).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discover_session_socket_skips_dead_newer_session() {
+        use crate::launch::{
+            LaunchControlResponse, LaunchControlResult, LaunchSessionMetadata, ObservationHandle,
+            SESSION_CONTROL_PROTOCOL_VERSION,
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let older_control = dir.path().join("older-control.sock");
+        let older_observe = dir.path().join("older-observe.sock");
+        let stale_control = dir.path().join("stale-control.sock");
+
+        let live_listener = UnixListener::bind(&older_control).unwrap();
+        let older_observe_for_server = older_observe.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = live_listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+
+            let response = LaunchControlResponse {
+                version: SESSION_CONTROL_PROTOCOL_VERSION,
+                ok: true,
+                result: Some(LaunchControlResult::WatchAttach {
+                    observation: ObservationHandle {
+                        transport: "unix_socket".to_string(),
+                        path: older_observe_for_server,
+                    },
+                }),
+                error: None,
+            };
+            let line = serde_json::to_string(&response).unwrap();
+            write_half.write_all(line.as_bytes()).await.unwrap();
+            write_half.write_all(b"\n").await.unwrap();
+            write_half.flush().await.unwrap();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let stale_listener = UnixListener::bind(&stale_control).unwrap();
+        drop(stale_listener);
+
+        let sessions = vec![
+            LaunchSessionMetadata {
+                version: SESSION_CONTROL_PROTOCOL_VERSION,
+                session_id: "older-live".to_string(),
+                mode: "observe".to_string(),
+                control_socket_path: older_control,
+                observation: ObservationHandle {
+                    transport: "unix_socket".to_string(),
+                    path: older_observe.clone(),
+                },
+                container_id: None,
+                container_name: None,
+            },
+            LaunchSessionMetadata {
+                version: SESSION_CONTROL_PROTOCOL_VERSION,
+                session_id: "newer-dead".to_string(),
+                mode: "observe".to_string(),
+                control_socket_path: stale_control,
+                observation: ObservationHandle {
+                    transport: "unix_socket".to_string(),
+                    path: dir.path().join("stale-observe.sock"),
+                },
+                container_id: None,
+                container_name: None,
+            },
+        ];
+
+        let discovered = discover_session_socket_from_sessions(sessions).await;
+        assert_eq!(discovered, Some(older_observe));
+
+        server.await.unwrap();
     }
 
     // -- Socket connection integration tests ----------------------------------

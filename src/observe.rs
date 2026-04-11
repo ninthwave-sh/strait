@@ -452,11 +452,6 @@ pub fn runtime_dir() -> PathBuf {
 }
 
 #[cfg(unix)]
-pub fn runtime_dir() -> PathBuf {
-    resolve_socket_dir()
-}
-
-#[cfg(unix)]
 impl ObservationStream {
     /// Return the default socket path for the current process.
     ///

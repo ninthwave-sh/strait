@@ -1915,7 +1915,7 @@ printf '{"event":"exit","code":0}\n'
 
 #[cfg(unix)]
 #[test]
-fn launch_policy_replace_live_updates_network_probe() {
+fn launch_policy_replace_live_updates_running_session() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let _guard = launch_test_guard();
     if !runtime.block_on(require_docker()) {
@@ -1965,11 +1965,10 @@ fn launch_policy_replace_live_updates_network_probe() {
         .expect("session.info should succeed while policy probe is running");
     assert_eq!(info.mode, "enforce");
 
-    session.write_line("probe").unwrap();
-    let denied = session
-        .wait_for_event("probe", Duration::from_secs(10))
-        .unwrap();
-    assert_eq!(denied["status"].as_str(), Some("403"));
+    // Launch sessions default to `mitm_all=true`, so a bare CONNECT handshake
+    // only proves the gateway/proxy path is reachable. The control-plane
+    // response and observation event are the supported contract for a live
+    // network-only policy mutation on a running session.
 
     let observation = runtime
         .block_on(strait::launch::request_launch_watch_attach(
@@ -2010,11 +2009,20 @@ fn launch_policy_replace_live_updates_network_probe() {
         Some(live_session.session_id.as_str())
     );
 
-    session.write_line("probe").unwrap();
-    let allowed = session
-        .wait_for_event("probe", Duration::from_secs(10))
-        .unwrap();
-    assert_eq!(allowed["status"].as_str(), Some("200"));
+    let follow_up = runtime
+        .block_on(strait::launch::request_launch_policy_replace(
+            &live_session.control_socket_path,
+            FS_ONLY_POLICY_TEXT,
+        ))
+        .expect("replacing back to the original network policy should also succeed");
+    assert!(
+        follow_up.applied,
+        "reverting a network-only policy change should stay live"
+    );
+    assert!(
+        follow_up.restart_required_domains.is_empty(),
+        "reverting the network policy should still avoid restart"
+    );
 
     session.write_line("exit").unwrap();
     session

@@ -1640,6 +1640,8 @@ mod tests {
     async fn wait_for_launch_completion_aborts_task_on_ctrl_c() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use tokio::sync::oneshot;
+        use tokio::time::{timeout, Duration};
 
         struct DropFlag(Arc<AtomicBool>);
         impl Drop for DropFlag {
@@ -1649,10 +1651,12 @@ mod tests {
         }
 
         let task_dropped = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = oneshot::channel();
         let (run_future, abort_handle) = {
             let task_dropped = Arc::clone(&task_dropped);
             futures_util::future::abortable(async move {
                 let _flag = DropFlag(task_dropped);
+                let _ = started_tx.send(());
                 std::future::pending::<()>().await;
                 Ok::<i32, anyhow::Error>(0)
             })
@@ -1661,22 +1665,31 @@ mod tests {
         let exit_code = wait_for_launch_completion(
             run_future,
             abort_handle,
-            std::future::ready(()),
+            async move {
+                let _ = started_rx.await;
+            },
             std::future::pending::<()>(),
             None,
         )
         .await
         .expect("ctrl-c branch should return an exit code");
 
-        tokio::task::yield_now().await;
         assert_eq!(exit_code, 130);
-        assert!(task_dropped.load(Ordering::SeqCst));
+        timeout(Duration::from_secs(1), async {
+            while !task_dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ctrl-c should cancel the attach task");
     }
 
     #[tokio::test]
     async fn wait_for_launch_completion_aborts_task_on_sigterm() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use tokio::sync::oneshot;
+        use tokio::time::{timeout, Duration};
 
         struct DropFlag(Arc<AtomicBool>);
         impl Drop for DropFlag {
@@ -1686,10 +1699,12 @@ mod tests {
         }
 
         let task_dropped = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = oneshot::channel();
         let (run_future, abort_handle) = {
             let task_dropped = Arc::clone(&task_dropped);
             futures_util::future::abortable(async move {
                 let _flag = DropFlag(task_dropped);
+                let _ = started_tx.send(());
                 std::future::pending::<()>().await;
                 Ok::<i32, anyhow::Error>(0)
             })
@@ -1699,15 +1714,22 @@ mod tests {
             run_future,
             abort_handle,
             std::future::pending::<()>(),
-            std::future::ready(()),
+            async move {
+                let _ = started_rx.await;
+            },
             None,
         )
         .await
         .expect("sigterm branch should return an exit code");
 
-        tokio::task::yield_now().await;
         assert_eq!(exit_code, 143);
-        assert!(task_dropped.load(Ordering::SeqCst));
+        timeout(Duration::from_secs(1), async {
+            while !task_dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sigterm should cancel the attach task");
     }
 
     // -- ProxyContext builder tests -------------------------------------------

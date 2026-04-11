@@ -1306,9 +1306,11 @@ async fn run_launch_observe_with_terminal_mode(
             let _ = tokio::signal::ctrl_c().await;
         },
         sigterm_signal(),
-        session_stop,
-        "Stopped via control socket — cleaning up...",
-        SESSION_STOP_EXIT_CODE,
+        LaunchStop {
+            future: session_stop,
+            message: "Stopped via control socket — cleaning up...",
+            exit_code: SESSION_STOP_EXIT_CODE,
+        },
         Some(&mut container_mgr),
     )
     .await?;
@@ -1635,9 +1637,11 @@ async fn run_launch_with_policy_with_terminal_mode(
             let _ = tokio::signal::ctrl_c().await;
         },
         sigterm_signal(),
-        session_stop,
-        "Stopped via control socket — cleaning up...",
-        SESSION_STOP_EXIT_CODE,
+        LaunchStop {
+            future: session_stop,
+            message: "Stopped via control socket — cleaning up...",
+            exit_code: SESSION_STOP_EXIT_CODE,
+        },
         Some(&mut container_mgr),
     )
     .await?;
@@ -1824,14 +1828,18 @@ async fn sigterm_signal() {
     std::future::pending::<()>().await;
 }
 
+struct LaunchStop<Stop> {
+    future: Stop,
+    message: &'static str,
+    exit_code: i32,
+}
+
 async fn wait_for_launch_completion<Run, CtrlC, Sigterm, Stop>(
     run_future: Run,
     abort_handle: futures_util::future::AbortHandle,
     ctrl_c: CtrlC,
     sigterm: Sigterm,
-    stop: Stop,
-    stop_message: &'static str,
-    stop_exit_code: i32,
+    stop: LaunchStop<Stop>,
     container_mgr: Option<&mut ContainerManager>,
 ) -> anyhow::Result<i32>
 where
@@ -1840,6 +1848,11 @@ where
     Sigterm: std::future::Future<Output = ()>,
     Stop: std::future::Future<Output = anyhow::Result<()>>,
 {
+    let LaunchStop {
+        future: stop,
+        message: stop_message,
+        exit_code: stop_exit_code,
+    } = stop;
     tokio::pin!(run_future);
     tokio::pin!(ctrl_c);
     tokio::pin!(sigterm);
@@ -2445,9 +2458,11 @@ mod tests {
                 let _ = started_rx.await;
             },
             std::future::pending::<()>(),
-            std::future::pending::<anyhow::Result<()>>(),
-            "unused",
-            0,
+            LaunchStop {
+                future: std::future::pending::<anyhow::Result<()>>(),
+                message: "unused",
+                exit_code: 0,
+            },
             None,
         )
         .await
@@ -2496,9 +2511,11 @@ mod tests {
             async move {
                 let _ = started_rx.await;
             },
-            std::future::pending::<anyhow::Result<()>>(),
-            "unused",
-            0,
+            LaunchStop {
+                future: std::future::pending::<anyhow::Result<()>>(),
+                message: "unused",
+                exit_code: 0,
+            },
             None,
         )
         .await

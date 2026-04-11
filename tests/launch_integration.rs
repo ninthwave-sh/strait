@@ -8,6 +8,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::time::Duration;
 
 /// Container image used for integration tests.
 const TEST_IMAGE: &str = "ubuntu:24.04";
@@ -229,6 +230,166 @@ async fn launch_observe_contains_lifecycle_events() {
     // Should have container_stop event
     let stops = events_of_type(&events, "container_stop");
     assert!(!stops.is_empty(), "should have container_stop event");
+}
+
+/// TTY observe launches apply the initial terminal size to the container.
+#[tokio::test]
+async fn launch_observe_sets_initial_terminal_size() {
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+    let tty_capture_dir = temp_dir.path().join("tty-capture");
+    std::fs::create_dir_all(&tty_capture_dir).unwrap();
+
+    let exit_code = strait::launch::run_launch_observe_with_test_terminal(
+        vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "sleep 0.5; stty size > /test-out/start.txt".to_string(),
+        ],
+        Some(TEST_IMAGE),
+        Some(obs_path),
+        None,
+        Vec::new(),
+        vec![],
+        vec![strait::launch::ExtraMount {
+            host_path: tty_capture_dir.display().to_string(),
+            container_path: "/test-out".to_string(),
+            mode: "rw".to_string(),
+        }],
+        true,
+        strait::launch::TestTerminalOptions {
+            stdin_is_terminal: true,
+            initial_size: Some(strait::launch::TerminalSize { rows: 12, cols: 34 }),
+            resize_events: Vec::new(),
+        },
+    )
+    .await
+    .expect("launch should succeed");
+
+    assert_eq!(exit_code, 0, "TTY launch should exit cleanly");
+
+    let start_size = std::fs::read_to_string(tty_capture_dir.join("start.txt"))
+        .expect("container should record initial terminal size");
+    assert_eq!(start_size.trim(), "12 34");
+}
+
+/// TTY observe launches forward live resize events to the running container.
+#[tokio::test]
+async fn launch_observe_forwards_terminal_resizes() {
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+    let tty_capture_dir = temp_dir.path().join("tty-capture");
+    std::fs::create_dir_all(&tty_capture_dir).unwrap();
+
+    let exit_code = strait::launch::run_launch_observe_with_test_terminal(
+        vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            concat!(
+                "SECONDS=0; ",
+                "trap 'stty size > /test-out/resized.txt; exit 0' WINCH; ",
+                "stty size > /test-out/start.txt; ",
+                "while [ \"$SECONDS\" -lt 5 ]; do sleep 0.1; done; ",
+                "exit 99"
+            )
+            .to_string(),
+        ],
+        Some(TEST_IMAGE),
+        Some(obs_path),
+        None,
+        Vec::new(),
+        vec![],
+        vec![strait::launch::ExtraMount {
+            host_path: tty_capture_dir.display().to_string(),
+            container_path: "/test-out".to_string(),
+            mode: "rw".to_string(),
+        }],
+        true,
+        strait::launch::TestTerminalOptions {
+            stdin_is_terminal: true,
+            initial_size: Some(strait::launch::TerminalSize { rows: 12, cols: 34 }),
+            resize_events: vec![strait::launch::ScriptedTerminalResize {
+                after: Duration::from_millis(500),
+                size: strait::launch::TerminalSize {
+                    rows: 40,
+                    cols: 100,
+                },
+            }],
+        },
+    )
+    .await
+    .expect("launch should succeed");
+
+    assert_eq!(
+        exit_code, 0,
+        "resize trap should exit the container cleanly"
+    );
+
+    let start_size = std::fs::read_to_string(tty_capture_dir.join("start.txt"))
+        .expect("container should record initial terminal size");
+    let resized_size = std::fs::read_to_string(tty_capture_dir.join("resized.txt"))
+        .expect("container should record the forwarded terminal resize");
+    assert_eq!(start_size.trim(), "12 34");
+    assert_eq!(resized_size.trim(), "40 100");
+}
+
+/// Non-TTY launches skip terminal management even if scripted resize events exist.
+#[tokio::test]
+async fn launch_observe_without_tty_skips_resize_forwarding() {
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+    let tty_capture_dir = temp_dir.path().join("tty-capture");
+    std::fs::create_dir_all(&tty_capture_dir).unwrap();
+
+    let exit_code = strait::launch::run_launch_observe_with_test_terminal(
+        vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            concat!("trap 'touch /test-out/unexpected.txt' WINCH; ", "sleep 1").to_string(),
+        ],
+        Some(TEST_IMAGE),
+        Some(obs_path),
+        None,
+        Vec::new(),
+        vec![],
+        vec![strait::launch::ExtraMount {
+            host_path: tty_capture_dir.display().to_string(),
+            container_path: "/test-out".to_string(),
+            mode: "rw".to_string(),
+        }],
+        false,
+        strait::launch::TestTerminalOptions {
+            stdin_is_terminal: true,
+            initial_size: Some(strait::launch::TerminalSize { rows: 12, cols: 34 }),
+            resize_events: vec![strait::launch::ScriptedTerminalResize {
+                after: Duration::from_millis(200),
+                size: strait::launch::TerminalSize {
+                    rows: 40,
+                    cols: 100,
+                },
+            }],
+        },
+    )
+    .await
+    .expect("non-TTY launch should succeed");
+
+    assert_eq!(exit_code, 0);
+    assert!(
+        !tty_capture_dir.join("unexpected.txt").exists(),
+        "non-TTY launch should not forward resize events"
+    );
 }
 
 /// Agent exits immediately with bad command — clean error with exit code.

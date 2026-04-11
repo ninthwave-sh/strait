@@ -35,7 +35,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
@@ -92,6 +92,50 @@ pub const PROXY_SOCKET_NAME: &str = "proxy.sock";
 /// so the agent process can reach the host proxy over a Unix socket.
 pub fn proxy_socket_path(temp_dir: &Path) -> PathBuf {
     temp_dir.join(PROXY_SOCKET_NAME)
+}
+
+/// The size of an interactive terminal in character cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSize {
+    /// Number of terminal rows.
+    pub rows: u16,
+    /// Number of terminal columns.
+    pub cols: u16,
+}
+
+/// A scripted terminal resize event used by automated tests.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptedTerminalResize {
+    /// Delay before the resize is applied.
+    pub after: Duration,
+    /// Terminal size to apply.
+    pub size: TerminalSize,
+}
+
+/// Test-only terminal options for launch integration coverage.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TestTerminalOptions {
+    /// Whether the launch path should behave as if stdin is a TTY.
+    pub stdin_is_terminal: bool,
+    /// Initial terminal size to apply after container start.
+    pub initial_size: Option<TerminalSize>,
+    /// Scripted resize events to deliver while the session is running.
+    pub resize_events: Vec<ScriptedTerminalResize>,
+}
+
+#[derive(Debug, Clone)]
+enum LaunchTerminalMode {
+    Host,
+    Test(TestTerminalOptions),
+}
+
+#[derive(Debug, Clone)]
+enum TerminalResizeSource {
+    Disabled,
+    HostSignals,
+    Scripted(Vec<ScriptedTerminalResize>),
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +382,60 @@ pub async fn run_launch_observe(
     extra_mounts: Vec<ExtraMount>,
     tty: bool,
 ) -> anyhow::Result<i32> {
+    run_launch_observe_with_terminal_mode(
+        command,
+        image,
+        output,
+        credential_store,
+        mitm_hosts,
+        extra_env,
+        extra_mounts,
+        tty,
+        LaunchTerminalMode::Host,
+    )
+    .await
+}
+
+/// Test-only observe-mode entry point with scripted terminal events.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_launch_observe_with_test_terminal(
+    command: Vec<String>,
+    image: Option<&str>,
+    output: Option<PathBuf>,
+    credential_store: Option<Arc<CredentialStore>>,
+    mitm_hosts: Vec<String>,
+    extra_env: Vec<String>,
+    extra_mounts: Vec<ExtraMount>,
+    tty: bool,
+    terminal: TestTerminalOptions,
+) -> anyhow::Result<i32> {
+    run_launch_observe_with_terminal_mode(
+        command,
+        image,
+        output,
+        credential_store,
+        mitm_hosts,
+        extra_env,
+        extra_mounts,
+        tty,
+        LaunchTerminalMode::Test(terminal),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_launch_observe_with_terminal_mode(
+    command: Vec<String>,
+    image: Option<&str>,
+    output: Option<PathBuf>,
+    credential_store: Option<Arc<CredentialStore>>,
+    mitm_hosts: Vec<String>,
+    extra_env: Vec<String>,
+    extra_mounts: Vec<ExtraMount>,
+    tty: bool,
+    terminal_mode: LaunchTerminalMode,
+) -> anyhow::Result<i32> {
     let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
     let obs_log_path = output.unwrap_or_else(|| cwd.join("observations.jsonl"));
@@ -460,14 +558,18 @@ pub async fn run_launch_observe(
     }
 
     // 7. Set terminal raw mode for TTY passthrough (restored on drop)
-    #[cfg(unix)]
-    let _term_guard = setup_raw_terminal();
+    let terminal = prepare_terminal_session(tty, terminal_mode);
 
     // 8. Attach to container, start it, pipe I/O, and wait for exit
     let container_name = container_mgr.container_name().unwrap().to_string();
 
     let exit_code = {
-        let run_future = attach_and_wait(container_mgr.docker(), &container_name);
+        let run_future = attach_and_wait(
+            container_mgr.docker(),
+            &container_name,
+            terminal.initial_size,
+            terminal.resize_source.clone(),
+        );
         let ctrl_c = tokio::signal::ctrl_c();
         let sigterm = sigterm_signal();
 
@@ -504,10 +606,7 @@ pub async fn run_launch_observe(
 
     // Flush observation log before returning so callers can read the file.
     obs_stream.flush();
-
-    // Drop the terminal guard before printing final messages
-    #[cfg(unix)]
-    drop(_term_guard);
+    drop(terminal);
 
     eprintln!("Container exited with code {exit_code}");
     eprintln!("Observation log: {}", obs_log_path.display());
@@ -710,14 +809,18 @@ pub async fn run_launch_with_policy(
     }
 
     // 9. Set terminal raw mode for TTY passthrough (restored on drop)
-    #[cfg(unix)]
-    let _term_guard = setup_raw_terminal();
+    let terminal = prepare_terminal_session(tty, LaunchTerminalMode::Host);
 
     // 10. Attach to container, start it, pipe I/O, and wait for exit
     let container_name = container_mgr.container_name().unwrap().to_string();
 
     let exit_code = {
-        let run_future = attach_and_wait(container_mgr.docker(), &container_name);
+        let run_future = attach_and_wait(
+            container_mgr.docker(),
+            &container_name,
+            terminal.initial_size,
+            terminal.resize_source.clone(),
+        );
         let ctrl_c = tokio::signal::ctrl_c();
         let sigterm = sigterm_signal();
 
@@ -753,8 +856,7 @@ pub async fn run_launch_with_policy(
     // Flush observation log before returning so callers can read the file.
     obs_stream.flush();
 
-    #[cfg(unix)]
-    drop(_term_guard);
+    drop(terminal);
 
     eprintln!("Container exited with code {exit_code}");
     eprintln!("Observation log: {}", obs_log_path.display());
@@ -929,8 +1031,14 @@ async fn sigterm_signal() {
 ///
 /// The attach is created before starting the container to avoid missing
 /// early output. Returns the container's exit code.
-async fn attach_and_wait(docker: &bollard::Docker, container_name: &str) -> anyhow::Result<i32> {
+async fn attach_and_wait(
+    docker: &bollard::Docker,
+    container_name: &str,
+    initial_tty_size: Option<TerminalSize>,
+    resize_source: TerminalResizeSource,
+) -> anyhow::Result<i32> {
     use bollard::container::{AttachContainerOptions, StartContainerOptions};
+    use tokio::task::JoinHandle;
 
     // Attach before starting to not miss any output
     let attach_options = AttachContainerOptions::<String> {
@@ -953,6 +1061,12 @@ async fn attach_and_wait(docker: &bollard::Docker, container_name: &str) -> anyh
         .context("failed to start container")?;
 
     info!(container_name = container_name, "container started");
+
+    if let Some(size) = initial_tty_size {
+        resize_container_tty(docker, container_name, size)
+            .await
+            .context("failed to apply initial container TTY size")?;
+    }
 
     // Pipe container output to host stdout.
     // When the container exits, the output stream closes.
@@ -989,9 +1103,15 @@ async fn attach_and_wait(docker: &bollard::Docker, container_name: &str) -> anyh
         }
     });
 
+    let resize_task: Option<JoinHandle<()>> =
+        spawn_resize_forwarder(docker.clone(), container_name.to_string(), resize_source);
+
     // Wait for the output stream to close (container has exited)
     let _ = output_task.await;
     input_task.abort();
+    if let Some(task) = resize_task {
+        task.abort();
+    }
 
     // Retrieve the exit code via inspect_container. The container is created
     // with auto_remove=false so it still exists after exit. This avoids a
@@ -1016,18 +1136,199 @@ async fn attach_and_wait(docker: &bollard::Docker, container_name: &str) -> anyh
 // Terminal raw mode (Unix only)
 // ---------------------------------------------------------------------------
 
-/// Guard that restores terminal settings when dropped.
+struct TerminalSession {
+    initial_size: Option<TerminalSize>,
+    resize_source: TerminalResizeSource,
+    #[cfg(unix)]
+    _guard: Option<CleanupGuard>,
+}
+
+impl Default for TerminalSession {
+    fn default() -> Self {
+        Self {
+            initial_size: None,
+            resize_source: TerminalResizeSource::Disabled,
+            #[cfg(unix)]
+            _guard: None,
+        }
+    }
+}
+
+/// Guard that runs cleanup exactly once when dropped.
 #[cfg(unix)]
-struct TerminalGuard {
-    fd: i32,
-    original: libc::termios,
+struct CleanupGuard {
+    cleanup: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
 #[cfg(unix)]
-impl Drop for TerminalGuard {
+impl CleanupGuard {
+    fn new<F>(cleanup: F) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        Self {
+            cleanup: Some(Box::new(cleanup)),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CleanupGuard {
     fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+fn should_manage_terminal(tty: bool, stdin_is_terminal: bool) -> bool {
+    tty && stdin_is_terminal
+}
+
+fn prepare_terminal_session(tty: bool, mode: LaunchTerminalMode) -> TerminalSession {
+    match mode {
+        LaunchTerminalMode::Host => prepare_host_terminal_session(tty),
+        LaunchTerminalMode::Test(options) => prepare_test_terminal_session(tty, options),
+    }
+}
+
+fn prepare_test_terminal_session(tty: bool, options: TestTerminalOptions) -> TerminalSession {
+    if !should_manage_terminal(tty, options.stdin_is_terminal) {
+        return TerminalSession::default();
+    }
+
+    TerminalSession {
+        initial_size: options.initial_size,
+        resize_source: TerminalResizeSource::Scripted(options.resize_events),
+        #[cfg(unix)]
+        _guard: None,
+    }
+}
+
+#[cfg(unix)]
+fn prepare_host_terminal_session(tty: bool) -> TerminalSession {
+    use std::io::IsTerminal;
+
+    let stdin_is_terminal = std::io::stdin().is_terminal();
+    if !should_manage_terminal(tty, stdin_is_terminal) {
+        return TerminalSession::default();
+    }
+
+    TerminalSession {
+        initial_size: current_terminal_size(),
+        resize_source: TerminalResizeSource::HostSignals,
+        _guard: setup_raw_terminal(),
+    }
+}
+
+#[cfg(not(unix))]
+fn prepare_host_terminal_session(_tty: bool) -> TerminalSession {
+    TerminalSession::default()
+}
+
+fn terminal_size_from_rows_and_cols(rows: u16, cols: u16) -> Option<TerminalSize> {
+    if rows == 0 || cols == 0 {
+        None
+    } else {
+        Some(TerminalSize { rows, cols })
+    }
+}
+
+#[cfg(unix)]
+fn terminal_size_from_winsize(winsize: libc::winsize) -> Option<TerminalSize> {
+    terminal_size_from_rows_and_cols(winsize.ws_row, winsize.ws_col)
+}
+
+#[cfg(unix)]
+fn current_terminal_size() -> Option<TerminalSize> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = std::io::stdin().as_raw_fd();
+    unsafe {
+        let mut winsize: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(fd, libc::TIOCGWINSZ, &mut winsize) != 0 {
+            return None;
+        }
+        terminal_size_from_winsize(winsize)
+    }
+}
+
+async fn resize_container_tty(
+    docker: &bollard::Docker,
+    container_name: &str,
+    size: TerminalSize,
+) -> anyhow::Result<()> {
+    use bollard::container::ResizeContainerTtyOptions;
+
+    docker
+        .resize_container_tty(
+            container_name,
+            ResizeContainerTtyOptions {
+                width: size.cols,
+                height: size.rows,
+            },
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to resize container TTY to {}x{}",
+                size.cols, size.rows
+            )
+        })
+}
+
+#[cfg(unix)]
+fn spawn_resize_forwarder(
+    docker: bollard::Docker,
+    container_name: String,
+    resize_source: TerminalResizeSource,
+) -> Option<tokio::task::JoinHandle<()>> {
+    match resize_source {
+        TerminalResizeSource::Disabled => None,
+        TerminalResizeSource::HostSignals => Some(tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+
+            let mut signals = match signal(SignalKind::window_change()) {
+                Ok(signals) => signals,
+                Err(e) => {
+                    warn!(error = %e, "failed to register SIGWINCH handler, resize forwarding disabled");
+                    return;
+                }
+            };
+
+            while signals.recv().await.is_some() {
+                if let Some(size) = current_terminal_size() {
+                    if let Err(e) = resize_container_tty(&docker, &container_name, size).await {
+                        warn!(error = %e, "failed to forward terminal resize");
+                    }
+                }
+            }
+        })),
+        TerminalResizeSource::Scripted(events) => Some(tokio::spawn(async move {
+            forward_scripted_terminal_resizes(docker, container_name, events).await;
+        })),
+    }
+}
+
+#[cfg(not(unix))]
+fn spawn_resize_forwarder(
+    _docker: bollard::Docker,
+    _container_name: String,
+    _resize_source: TerminalResizeSource,
+) -> Option<tokio::task::JoinHandle<()>> {
+    None
+}
+
+async fn forward_scripted_terminal_resizes(
+    docker: bollard::Docker,
+    container_name: String,
+    events: Vec<ScriptedTerminalResize>,
+) {
+    for event in events {
+        tokio::time::sleep(event.after).await;
+        if let Err(e) = resize_container_tty(&docker, &container_name, event.size).await {
+            warn!(error = %e, "failed to forward scripted terminal resize");
+            break;
         }
     }
 }
@@ -1037,13 +1338,8 @@ impl Drop for TerminalGuard {
 /// Returns a guard that restores the original terminal settings on drop.
 /// Returns `None` if stdin is not a terminal (e.g., piped input).
 #[cfg(unix)]
-fn setup_raw_terminal() -> Option<TerminalGuard> {
-    use std::io::IsTerminal;
+fn setup_raw_terminal() -> Option<CleanupGuard> {
     use std::os::unix::io::AsRawFd;
-
-    if !std::io::stdin().is_terminal() {
-        return None;
-    }
 
     let fd = std::io::stdin().as_raw_fd();
     unsafe {
@@ -1056,7 +1352,9 @@ fn setup_raw_terminal() -> Option<TerminalGuard> {
         if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
             return None;
         }
-        Some(TerminalGuard { fd, original })
+        Some(CleanupGuard::new(move || {
+            libc::tcsetattr(fd, libc::TCSANOW, &original);
+        }))
     }
 }
 
@@ -1177,6 +1475,46 @@ mod tests {
                 .any(|b| b.contains("/project") && b.contains(":rw")),
             "observe mode should mount cwd as read-write: {:?}",
             config.binds
+        );
+    }
+
+    // -- Terminal helpers ----------------------------------------------------
+
+    #[test]
+    fn should_manage_terminal_requires_tty_and_terminal_stdin() {
+        assert!(should_manage_terminal(true, true));
+        assert!(!should_manage_terminal(true, false));
+        assert!(!should_manage_terminal(false, true));
+        assert!(!should_manage_terminal(false, false));
+    }
+
+    #[test]
+    fn terminal_size_helper_rejects_zero_dimensions() {
+        assert_eq!(terminal_size_from_rows_and_cols(0, 80), None);
+        assert_eq!(terminal_size_from_rows_and_cols(24, 0), None);
+        assert_eq!(
+            terminal_size_from_rows_and_cols(24, 80),
+            Some(TerminalSize { rows: 24, cols: 80 })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_guard_runs_on_drop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let cleaned = Arc::new(AtomicBool::new(false));
+        {
+            let cleaned = Arc::clone(&cleaned);
+            let _guard = CleanupGuard::new(move || {
+                cleaned.store(true, Ordering::SeqCst);
+            });
+        }
+
+        assert!(
+            cleaned.load(Ordering::SeqCst),
+            "cleanup guard should run its callback on drop"
         );
     }
 

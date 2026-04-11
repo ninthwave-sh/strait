@@ -408,6 +408,7 @@ async fn launch_observe_contains_lifecycle_events() {
 /// TTY observe launches apply the initial terminal size to the container.
 #[tokio::test]
 async fn launch_observe_sets_initial_terminal_size() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -454,6 +455,7 @@ async fn launch_observe_sets_initial_terminal_size() {
 /// even if the initial resize races with container shutdown.
 #[tokio::test]
 async fn launch_observe_tty_fast_exit_still_cleans_up() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -500,6 +502,7 @@ async fn launch_observe_tty_fast_exit_still_cleans_up() {
 /// Policy-mode launches share the same terminal setup and apply initial TTY size.
 #[tokio::test]
 async fn launch_warn_sets_initial_terminal_size() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -549,6 +552,7 @@ async fn launch_warn_sets_initial_terminal_size() {
 /// TTY observe launches forward live resize events to the running container.
 #[tokio::test]
 async fn launch_observe_forwards_terminal_resizes() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -624,6 +628,7 @@ async fn launch_observe_forwards_terminal_resizes() {
 /// Non-TTY launches skip terminal management even if scripted resize events exist.
 #[tokio::test]
 async fn launch_observe_without_tty_skips_resize_forwarding() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }

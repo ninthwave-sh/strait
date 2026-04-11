@@ -639,6 +639,68 @@ pub async fn run_launch_with_policy(
     extra_mounts: Vec<ExtraMount>,
     tty: bool,
 ) -> anyhow::Result<i32> {
+    run_launch_with_policy_with_terminal_mode(
+        mode,
+        policy_path,
+        command,
+        image,
+        output,
+        credential_store,
+        mitm_hosts,
+        extra_env,
+        extra_mounts,
+        tty,
+        LaunchTerminalMode::Host,
+    )
+    .await
+}
+
+/// Test-only policy-mode entry point with scripted terminal events.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_launch_with_policy_with_test_terminal(
+    mode: EnforcementMode,
+    policy_path: &Path,
+    command: Vec<String>,
+    image: Option<&str>,
+    output: Option<PathBuf>,
+    credential_store: Option<Arc<CredentialStore>>,
+    mitm_hosts: Vec<String>,
+    extra_env: Vec<String>,
+    extra_mounts: Vec<ExtraMount>,
+    tty: bool,
+    terminal: TestTerminalOptions,
+) -> anyhow::Result<i32> {
+    run_launch_with_policy_with_terminal_mode(
+        mode,
+        policy_path,
+        command,
+        image,
+        output,
+        credential_store,
+        mitm_hosts,
+        extra_env,
+        extra_mounts,
+        tty,
+        LaunchTerminalMode::Test(terminal),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_launch_with_policy_with_terminal_mode(
+    mode: EnforcementMode,
+    policy_path: &Path,
+    command: Vec<String>,
+    image: Option<&str>,
+    output: Option<PathBuf>,
+    credential_store: Option<Arc<CredentialStore>>,
+    mitm_hosts: Vec<String>,
+    extra_env: Vec<String>,
+    extra_mounts: Vec<ExtraMount>,
+    tty: bool,
+    terminal_mode: LaunchTerminalMode,
+) -> anyhow::Result<i32> {
     let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
     let obs_log_path = output.unwrap_or_else(|| cwd.join("observations.jsonl"));
@@ -809,7 +871,7 @@ pub async fn run_launch_with_policy(
     }
 
     // 9. Set terminal raw mode for TTY passthrough (restored on drop)
-    let terminal = prepare_terminal_session(tty, LaunchTerminalMode::Host);
+    let terminal = prepare_terminal_session(tty, terminal_mode);
 
     // 10. Attach to container, start it, pipe I/O, and wait for exit
     let container_name = container_mgr.container_name().unwrap().to_string();
@@ -1064,15 +1126,11 @@ async fn attach_and_wait(
 
     if let Some(size) = initial_tty_size {
         if let Err(error) = resize_container_tty(docker, container_name, size).await {
-            if initial_resize_error_is_benign(&error) {
-                warn!(
-                    error = %error,
-                    container_name = container_name,
-                    "container exited before initial TTY resize completed"
-                );
-            } else {
-                return Err(error).context("failed to apply initial container TTY size");
-            }
+            warn!(
+                error = %error,
+                container_name = container_name,
+                "failed to apply initial container TTY size after start; continuing"
+            );
         }
     }
 
@@ -1283,13 +1341,6 @@ async fn resize_container_tty(
                 size.cols, size.rows
             )
         })
-}
-
-fn initial_resize_error_is_benign(error: &anyhow::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("is not running")
-        || message.contains("no such container")
-        || message.contains("container not running")
 }
 
 #[cfg(unix)]
@@ -1511,19 +1562,6 @@ mod tests {
             terminal_size_from_rows_and_cols(24, 80),
             Some(TerminalSize { rows: 24, cols: 80 })
         );
-    }
-
-    #[test]
-    fn initial_resize_error_classifier_allows_exited_container_cases() {
-        assert!(initial_resize_error_is_benign(&anyhow::anyhow!(
-            "409 container is not running"
-        )));
-        assert!(initial_resize_error_is_benign(&anyhow::anyhow!(
-            "404 no such container"
-        )));
-        assert!(!initial_resize_error_is_benign(&anyhow::anyhow!(
-            "permission denied"
-        )));
     }
 
     #[cfg(unix)]

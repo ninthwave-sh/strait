@@ -324,6 +324,55 @@ async fn launch_observe_tty_fast_exit_still_cleans_up() {
     );
 }
 
+/// Policy-mode launches share the same terminal setup and apply initial TTY size.
+#[tokio::test]
+async fn launch_warn_sets_initial_terminal_size() {
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let policy_path = temp_dir.path().join("policy.cedar");
+    let obs_path = temp_dir.path().join("observations.jsonl");
+    let tty_capture_dir = temp_dir.path().join("tty-capture");
+    std::fs::create_dir_all(&tty_capture_dir).unwrap();
+    write_permissive_policy(&policy_path);
+
+    let exit_code = strait::launch::run_launch_with_policy_with_test_terminal(
+        strait::launch::EnforcementMode::Warn,
+        &policy_path,
+        vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "sleep 0.5; stty size > /test-out/start.txt".to_string(),
+        ],
+        Some(TEST_IMAGE),
+        Some(obs_path),
+        None,
+        Vec::new(),
+        vec![],
+        vec![strait::launch::ExtraMount {
+            host_path: tty_capture_dir.display().to_string(),
+            container_path: "/test-out".to_string(),
+            mode: "rw".to_string(),
+        }],
+        true,
+        strait::launch::TestTerminalOptions {
+            stdin_is_terminal: true,
+            initial_size: Some(strait::launch::TerminalSize { rows: 22, cols: 66 }),
+            resize_events: Vec::new(),
+        },
+    )
+    .await
+    .expect("warn-mode TTY launch should succeed");
+
+    assert_eq!(exit_code, 0, "warn-mode TTY launch should exit cleanly");
+
+    let start_size = std::fs::read_to_string(tty_capture_dir.join("start.txt"))
+        .expect("warn-mode container should record initial terminal size");
+    assert_eq!(start_size.trim(), "22 66");
+}
+
 /// TTY observe launches forward live resize events to the running container.
 #[tokio::test]
 async fn launch_observe_forwards_terminal_resizes() {

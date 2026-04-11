@@ -8,7 +8,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-#[cfg(unix)]
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -148,6 +148,100 @@ fn strait_binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_strait"))
 }
 
+fn launch_test_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    match LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+async fn wait_for_new_launch_session(
+    existing_session_ids: &[String],
+    require_container_identity: bool,
+) -> strait::launch::LaunchSessionMetadata {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let sessions = strait::launch::list_launch_sessions().unwrap();
+            if let Some(session) = sessions.into_iter().find(|candidate| {
+                !existing_session_ids.contains(&candidate.session_id)
+                    && (!require_container_identity
+                        || candidate.container_id.is_some()
+                        || candidate.container_name.is_some())
+            }) {
+                return session;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("launch session should appear in the registry")
+}
+
+async fn start_managed_observe_launch() -> (
+    tempfile::TempDir,
+    tokio::task::JoinHandle<anyhow::Result<i32>>,
+    strait::launch::LaunchSessionMetadata,
+) {
+    let existing_session_ids: Vec<String> = strait::launch::list_launch_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+
+    let launch_task = tokio::spawn(async move {
+        strait::launch::run_launch_observe(
+            vec!["sh".to_string(), "-lc".to_string(), "sleep 60".to_string()],
+            Some(TEST_IMAGE),
+            Some(obs_path),
+            None,
+            Vec::new(),
+            vec![],
+            vec![],
+            false,
+        )
+        .await
+    });
+
+    let session = wait_for_new_launch_session(&existing_session_ids, true).await;
+    (temp_dir, launch_task, session)
+}
+
+async fn stop_launch_session(
+    session: &strait::launch::LaunchSessionMetadata,
+    launch_task: tokio::task::JoinHandle<anyhow::Result<i32>>,
+) -> i32 {
+    strait::launch::request_launch_session_stop(&session.control_socket_path)
+        .await
+        .expect("session.stop should succeed");
+
+    let exit_code = tokio::time::timeout(Duration::from_secs(20), launch_task)
+        .await
+        .expect("launch task should finish after session.stop")
+        .expect("launch task should not panic")
+        .expect("launch task should return an exit code");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sessions = strait::launch::list_launch_sessions().unwrap();
+            if sessions
+                .iter()
+                .all(|candidate| candidate.session_id != session.session_id)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("session registry entry should be removed after stop");
+
+    exit_code
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests (require Docker)
 // ---------------------------------------------------------------------------
@@ -156,6 +250,7 @@ fn strait_binary() -> &'static Path {
 /// and exits cleanly with exit code 0.
 #[tokio::test]
 async fn launch_observe_echo_hello() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -208,6 +303,7 @@ async fn launch_observe_echo_hello() {
 /// lifecycle events.
 #[tokio::test]
 async fn launch_observe_contains_lifecycle_events() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -513,6 +609,7 @@ async fn launch_observe_without_tty_skips_resize_forwarding() {
 /// Agent exits immediately with bad command — clean error with exit code.
 #[tokio::test]
 async fn launch_observe_bad_command_exit_code() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -549,9 +646,160 @@ async fn launch_observe_bad_command_exit_code() {
     );
 }
 
+/// Running observe launches expose stable metadata via `session.info`.
+#[tokio::test]
+async fn launch_session_info_reports_active_session_metadata() {
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let (_temp_dir, launch_task, session) = start_managed_observe_launch().await;
+
+    let info = strait::launch::request_launch_session_info(&session.control_socket_path)
+        .await
+        .expect("session.info should succeed");
+
+    assert_eq!(
+        info.version,
+        strait::launch::SESSION_CONTROL_PROTOCOL_VERSION
+    );
+    assert_eq!(info.session_id, session.session_id);
+    assert_eq!(info.mode, "observe");
+    assert_eq!(info.control_socket_path, session.control_socket_path);
+    assert_eq!(info.observation, session.observation);
+    assert!(
+        info.container_id.is_some() || info.container_name.is_some(),
+        "session.info should include container identity"
+    );
+
+    let exit_code = stop_launch_session(&session, launch_task).await;
+    assert_eq!(
+        exit_code, 130,
+        "session.stop should use the control-stop exit code"
+    );
+}
+
+/// `watch.attach` returns a socket that streams observation events for the session.
+#[tokio::test]
+async fn launch_watch_attach_returns_observation_socket() {
+    use tokio::io::AsyncBufReadExt;
+
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let (_temp_dir, launch_task, session) = start_managed_observe_launch().await;
+
+    let observation = strait::launch::request_launch_watch_attach(&session.control_socket_path)
+        .await
+        .expect("watch.attach should succeed");
+
+    assert_eq!(observation.transport, "unix_socket");
+    assert_eq!(observation.path, session.observation.path);
+
+    let stream = tokio::net::UnixStream::connect(&observation.path)
+        .await
+        .expect("watch.attach socket should accept connections");
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut line = String::new();
+    let event = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            line.clear();
+            let bytes = reader.read_line(&mut line).await.unwrap();
+            assert!(bytes > 0, "observation socket should stream events");
+            let event: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+            if event.get("type").and_then(|value| value.as_str()) == Some("container_start") {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("watch.attach should return recent session events");
+
+    assert_eq!(event["type"], "container_start");
+    assert_eq!(event["image"].as_str(), Some(TEST_IMAGE));
+
+    let exit_code = stop_launch_session(&session, launch_task).await;
+    assert_eq!(exit_code, 130);
+}
+
+/// `session.stop` terminates the launch and removes registry resources.
+#[tokio::test]
+async fn launch_session_stop_cleans_up_session_resources() {
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let (_temp_dir, launch_task, session) = start_managed_observe_launch().await;
+    let session_dir = session
+        .control_socket_path
+        .parent()
+        .expect("control socket should live in a session directory")
+        .to_path_buf();
+
+    let exit_code = stop_launch_session(&session, launch_task).await;
+
+    assert_eq!(exit_code, 130, "session.stop should terminate the session");
+    assert!(
+        !session.control_socket_path.exists(),
+        "control socket should be removed on cleanup"
+    );
+    assert!(
+        !session.observation.path.exists(),
+        "observation socket should be removed on cleanup"
+    );
+    assert!(
+        !session_dir.exists(),
+        "session registry directory should be removed on cleanup"
+    );
+}
+
+/// `session.stop` is honored even if it arrives as soon as the registry entry appears.
+#[tokio::test]
+async fn launch_session_stop_before_container_startup_completes() {
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let existing_session_ids: Vec<String> = strait::launch::list_launch_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+
+    let launch_task = tokio::spawn(async move {
+        strait::launch::run_launch_observe(
+            vec!["sh".to_string(), "-lc".to_string(), "sleep 60".to_string()],
+            Some(TEST_IMAGE),
+            Some(obs_path),
+            None,
+            Vec::new(),
+            vec![],
+            vec![],
+            false,
+        )
+        .await
+    });
+
+    let session = wait_for_new_launch_session(&existing_session_ids, false).await;
+    let exit_code = stop_launch_session(&session, launch_task).await;
+    assert_eq!(
+        exit_code, 130,
+        "early session.stop should still terminate the launch"
+    );
+}
+
 /// Docker not running gives a clear error before any operations.
 #[tokio::test]
 async fn docker_not_running_gives_clear_error() {
+    let _guard = launch_test_guard();
     // This test verifies the error message when Docker is not available.
     // We can't easily simulate Docker being down, but we verify the
     // ContainerManager constructor and verify_connection path.
@@ -589,6 +837,7 @@ async fn docker_not_running_gives_clear_error() {
 /// Invalid policy file fails fast before starting container.
 #[tokio::test]
 async fn launch_policy_invalid_file_fails_fast() {
+    let _guard = launch_test_guard();
     let temp_dir = tempfile::tempdir().unwrap();
     let policy_path = temp_dir.path().join("bad.cedar");
     std::fs::write(&policy_path, "this is not valid cedar @@@ {{{").unwrap();
@@ -624,6 +873,7 @@ async fn launch_policy_invalid_file_fails_fast() {
 /// Nonexistent policy file fails fast with clear error.
 #[tokio::test]
 async fn launch_policy_missing_file_fails_fast() {
+    let _guard = launch_test_guard();
     let temp_dir = tempfile::tempdir().unwrap();
     let obs_path = temp_dir.path().join("observations.jsonl");
 
@@ -653,6 +903,7 @@ async fn launch_policy_missing_file_fails_fast() {
 /// The agent sees only the permitted mounts.
 #[tokio::test]
 async fn launch_policy_restricts_mounts() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -721,6 +972,7 @@ permit(
 /// `launch --warn` with restrictive policy still allows the agent to succeed.
 #[tokio::test]
 async fn launch_warn_allows_agent_to_succeed() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -817,6 +1069,7 @@ permit(
 /// This proves the full proxy path is functional under --network=none.
 #[tokio::test]
 async fn enforce_proxy_path_end_to_end() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -877,6 +1130,7 @@ async fn enforce_proxy_path_end_to_end() {
 /// so the connection fails immediately.
 #[tokio::test]
 async fn enforce_direct_outbound_tcp_blocked() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -919,6 +1173,7 @@ async fn enforce_direct_outbound_tcp_blocked() {
 /// --network=none so all traffic goes through the gateway and proxy.
 #[tokio::test]
 async fn observe_direct_outbound_tcp_blocked() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -956,6 +1211,7 @@ async fn observe_direct_outbound_tcp_blocked() {
 /// proxy access.
 #[tokio::test]
 async fn observe_proxy_path_end_to_end() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -1001,6 +1257,7 @@ async fn observe_proxy_path_end_to_end() {
 /// does not swallow or replace the child's exit status.
 #[tokio::test]
 async fn enforce_exit_code_propagation() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -1047,6 +1304,7 @@ async fn enforce_exit_code_propagation() {
 /// lifecycle events are recorded, and the observation log shows clean exit.
 #[tokio::test]
 async fn enforce_clean_exit_zero() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -1096,6 +1354,7 @@ async fn enforce_clean_exit_zero() {
 /// mode. Verifies the proxy responds to CONNECT requests from the container.
 #[tokio::test]
 async fn warn_proxy_path_end_to_end() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }

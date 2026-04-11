@@ -8,7 +8,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-#[cfg(unix)]
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -148,6 +148,11 @@ fn strait_binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_strait"))
 }
 
+fn launch_test_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
 async fn wait_for_new_launch_session(
     existing_session_ids: &[String],
 ) -> strait::launch::LaunchSessionMetadata {
@@ -239,6 +244,7 @@ async fn stop_launch_session(
 /// and exits cleanly with exit code 0.
 #[tokio::test]
 async fn launch_observe_echo_hello() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -291,6 +297,7 @@ async fn launch_observe_echo_hello() {
 /// lifecycle events.
 #[tokio::test]
 async fn launch_observe_contains_lifecycle_events() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -596,6 +603,7 @@ async fn launch_observe_without_tty_skips_resize_forwarding() {
 /// Agent exits immediately with bad command — clean error with exit code.
 #[tokio::test]
 async fn launch_observe_bad_command_exit_code() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -635,6 +643,7 @@ async fn launch_observe_bad_command_exit_code() {
 /// Running observe launches expose stable metadata via `session.info`.
 #[tokio::test]
 async fn launch_session_info_reports_active_session_metadata() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -670,6 +679,7 @@ async fn launch_session_info_reports_active_session_metadata() {
 async fn launch_watch_attach_returns_observation_socket() {
     use tokio::io::AsyncBufReadExt;
 
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -712,6 +722,7 @@ async fn launch_watch_attach_returns_observation_socket() {
 /// `session.stop` terminates the launch and removes registry resources.
 #[tokio::test]
 async fn launch_session_stop_cleans_up_session_resources() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -743,6 +754,7 @@ async fn launch_session_stop_cleans_up_session_resources() {
 /// Docker not running gives a clear error before any operations.
 #[tokio::test]
 async fn docker_not_running_gives_clear_error() {
+    let _guard = launch_test_guard();
     // This test verifies the error message when Docker is not available.
     // We can't easily simulate Docker being down, but we verify the
     // ContainerManager constructor and verify_connection path.
@@ -780,6 +792,7 @@ async fn docker_not_running_gives_clear_error() {
 /// Invalid policy file fails fast before starting container.
 #[tokio::test]
 async fn launch_policy_invalid_file_fails_fast() {
+    let _guard = launch_test_guard();
     let temp_dir = tempfile::tempdir().unwrap();
     let policy_path = temp_dir.path().join("bad.cedar");
     std::fs::write(&policy_path, "this is not valid cedar @@@ {{{").unwrap();
@@ -815,6 +828,7 @@ async fn launch_policy_invalid_file_fails_fast() {
 /// Nonexistent policy file fails fast with clear error.
 #[tokio::test]
 async fn launch_policy_missing_file_fails_fast() {
+    let _guard = launch_test_guard();
     let temp_dir = tempfile::tempdir().unwrap();
     let obs_path = temp_dir.path().join("observations.jsonl");
 
@@ -844,6 +858,7 @@ async fn launch_policy_missing_file_fails_fast() {
 /// The agent sees only the permitted mounts.
 #[tokio::test]
 async fn launch_policy_restricts_mounts() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -912,6 +927,7 @@ permit(
 /// `launch --warn` with restrictive policy still allows the agent to succeed.
 #[tokio::test]
 async fn launch_warn_allows_agent_to_succeed() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -1008,6 +1024,7 @@ permit(
 /// This proves the full proxy path is functional under --network=none.
 #[tokio::test]
 async fn enforce_proxy_path_end_to_end() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -1068,6 +1085,7 @@ async fn enforce_proxy_path_end_to_end() {
 /// so the connection fails immediately.
 #[tokio::test]
 async fn enforce_direct_outbound_tcp_blocked() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -1110,6 +1128,7 @@ async fn enforce_direct_outbound_tcp_blocked() {
 /// --network=none so all traffic goes through the gateway and proxy.
 #[tokio::test]
 async fn observe_direct_outbound_tcp_blocked() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -1147,6 +1166,7 @@ async fn observe_direct_outbound_tcp_blocked() {
 /// proxy access.
 #[tokio::test]
 async fn observe_proxy_path_end_to_end() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -1192,6 +1212,7 @@ async fn observe_proxy_path_end_to_end() {
 /// does not swallow or replace the child's exit status.
 #[tokio::test]
 async fn enforce_exit_code_propagation() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -1238,6 +1259,7 @@ async fn enforce_exit_code_propagation() {
 /// lifecycle events are recorded, and the observation log shows clean exit.
 #[tokio::test]
 async fn enforce_clean_exit_zero() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }
@@ -1287,6 +1309,7 @@ async fn enforce_clean_exit_zero() {
 /// mode. Verifies the proxy responds to CONNECT requests from the container.
 #[tokio::test]
 async fn warn_proxy_path_end_to_end() {
+    let _guard = launch_test_guard();
     if !require_docker().await {
         return;
     }

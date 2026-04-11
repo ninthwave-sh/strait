@@ -144,6 +144,10 @@ fn spawn_resize_thread(_tx: mpsc::Sender<Command>) -> anyhow::Result<()> {
 }
 
 fn run() -> anyhow::Result<i32> {
+    let (tx, rx) = mpsc::channel();
+    spawn_stdin_thread(tx.clone());
+    spawn_resize_thread(tx)?;
+
     let stdin_tty = io::stdin().is_terminal();
     let stdout_tty = io::stdout().is_terminal();
     let (cols, rows) = terminal_size();
@@ -152,10 +156,6 @@ fn run() -> anyhow::Result<i32> {
 
     let mut seq = 1;
     emit(&draw_event(seq, "start", cols, rows))?;
-
-    let (tx, rx) = mpsc::channel();
-    spawn_stdin_thread(tx.clone());
-    spawn_resize_thread(tx)?;
 
     while let Ok(command) = rx.recv() {
         match command {

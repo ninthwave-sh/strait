@@ -270,6 +270,8 @@ fn write_launch_session_metadata(
     path: &Path,
     metadata: &LaunchSessionMetadata,
 ) -> anyhow::Result<()> {
+    use std::io::Write as _;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -294,9 +296,24 @@ fn write_launch_session_metadata(
 
     let json = serde_json::to_vec_pretty(metadata)
         .context("failed to serialize launch session metadata")?;
-    std::fs::write(path, json).with_context(|| {
+    let parent = path
+        .parent()
+        .context("launch session metadata path should have a parent directory")?;
+    let mut temp_file = tempfile::NamedTempFile::new_in(parent).with_context(|| {
         format!(
-            "failed to write launch session metadata '{}'",
+            "failed to create temporary launch session metadata '{}'",
+            parent.display()
+        )
+    })?;
+    temp_file.write_all(&json).with_context(|| {
+        format!(
+            "failed to write temporary launch session metadata '{}'",
+            path.display()
+        )
+    })?;
+    temp_file.flush().with_context(|| {
+        format!(
+            "failed to flush temporary launch session metadata '{}'",
             path.display()
         )
     })?;
@@ -304,15 +321,23 @@ fn write_launch_session_metadata(
     {
         use std::os::unix::fs::PermissionsExt;
 
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(
-            || {
+        temp_file
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
                 format!(
-                    "failed to secure launch session metadata '{}'",
+                    "failed to secure temporary launch session metadata '{}'",
                     path.display()
                 )
-            },
-        )?;
+            })?;
     }
+    temp_file.persist(path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to atomically publish launch session metadata '{}': {}",
+            path.display(),
+            error.error
+        )
+    })?;
     Ok(())
 }
 
@@ -329,26 +354,50 @@ fn list_launch_sessions_in(root: &Path) -> anyhow::Result<Vec<LaunchSessionMetad
             root.display()
         )
     })? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("failed to read launch session entry"),
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                warn!(
+                    path = %entry.path().display(),
+                    error = %error,
+                    "skipping launch session entry with unreadable metadata"
+                );
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
             continue;
         }
         let metadata_path = entry.path().join(SESSION_METADATA_FILE_NAME);
-        if !metadata_path.exists() {
-            continue;
-        }
-        let json = std::fs::read_to_string(&metadata_path).with_context(|| {
-            format!(
-                "failed to read launch session metadata '{}'",
-                metadata_path.display()
-            )
-        })?;
-        let metadata: LaunchSessionMetadata = serde_json::from_str(&json).with_context(|| {
-            format!(
-                "failed to parse launch session metadata '{}'",
-                metadata_path.display()
-            )
-        })?;
+        let json = match std::fs::read_to_string(&metadata_path) {
+            Ok(json) => json,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                warn!(
+                    path = %metadata_path.display(),
+                    error = %error,
+                    "skipping launch session with unreadable metadata"
+                );
+                continue;
+            }
+        };
+        let metadata: LaunchSessionMetadata = match serde_json::from_str(&json) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warn!(
+                    path = %metadata_path.display(),
+                    error = %error,
+                    "skipping launch session with invalid metadata"
+                );
+                continue;
+            }
+        };
         sessions.push(metadata);
     }
     sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
@@ -680,7 +729,6 @@ impl LaunchSession {
             container_id: None,
             container_name: None,
         };
-        write_launch_session_metadata(&metadata_path, &metadata)?;
 
         let metadata = Arc::new(RwLock::new(metadata));
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -700,6 +748,21 @@ impl LaunchSession {
             },
             stop_rx,
         ))
+    }
+
+    async fn publish(&self, obs_stream: &ObservationStream) -> anyhow::Result<()> {
+        let observation_socket_path = self.observation_socket_path().await;
+        obs_stream
+            .start_socket_server_at(&observation_socket_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to start observation socket '{}'",
+                    observation_socket_path.display()
+                )
+            })?;
+        let metadata = self.metadata().await;
+        write_launch_session_metadata(&self.metadata_path, &metadata)
     }
 
     async fn set_container(
@@ -1126,18 +1189,7 @@ async fn run_launch_observe_with_terminal_mode(
     )
     .await?;
     #[cfg(unix)]
-    {
-        let observation_socket_path = launch_session.observation_socket_path().await;
-        obs_stream
-            .start_socket_server_at(&observation_socket_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to start observation socket '{}'",
-                    observation_socket_path.display()
-                )
-            })?;
-    }
+    launch_session.publish(&obs_stream).await?;
 
     let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx.clone()));
 
@@ -1430,18 +1482,7 @@ async fn run_launch_with_policy_with_terminal_mode(
     let (launch_session, mut session_stop_rx) =
         LaunchSession::create(proxy_ctx.audit_logger.session_id(), mode).await?;
     #[cfg(unix)]
-    {
-        let observation_socket_path = launch_session.observation_socket_path().await;
-        obs_stream
-            .start_socket_server_at(&observation_socket_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to start observation socket '{}'",
-                    observation_socket_path.display()
-                )
-            })?;
-    }
+    launch_session.publish(&obs_stream).await?;
 
     let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx.clone()));
 
@@ -3070,11 +3111,17 @@ permit(
             LaunchSession::create_in(registry_root.path(), "test-session", EnforcementMode::Warn)
                 .await
                 .unwrap();
+        let obs_stream = ObservationStream::new();
+        session.publish(&obs_stream).await.unwrap();
         let control_socket = session.control_socket_path().await;
         let session_dir = registry_root.path().join("test-session");
         let metadata_path = session_dir.join(SESSION_METADATA_FILE_NAME);
 
         assert!(control_socket.exists(), "control socket should exist");
+        assert!(
+            session.observation_socket_path().await.exists(),
+            "observation socket should exist"
+        );
         assert!(metadata_path.exists(), "metadata file should exist");
 
         let sessions = list_launch_sessions_in(registry_root.path()).unwrap();
@@ -3102,6 +3149,8 @@ permit(
         )
         .await
         .unwrap();
+        let obs_stream = ObservationStream::new();
+        session.publish(&obs_stream).await.unwrap();
         session
             .set_container("container-123", "strait-test-container")
             .await
@@ -3141,6 +3190,8 @@ permit(
         )
         .await
         .unwrap();
+        let obs_stream = ObservationStream::new();
+        session.publish(&obs_stream).await.unwrap();
 
         let control_socket = session.control_socket_path().await;
         request_launch_session_stop(&control_socket).await.unwrap();
@@ -3163,7 +3214,10 @@ permit(
             LaunchSession::create_in(registry_root.path(), "test-session", EnforcementMode::Warn)
                 .await
                 .unwrap();
+        let obs_stream = ObservationStream::new();
+        session.publish(&obs_stream).await.unwrap();
         let control_socket = session.control_socket_path().await;
+        let observation_socket = session.observation_socket_path().await;
         let session_dir = registry_root.path().join("test-session");
         let metadata_path = session_dir.join(SESSION_METADATA_FILE_NAME);
 
@@ -3182,10 +3236,90 @@ permit(
             .permissions()
             .mode()
             & 0o777;
+        let observation_socket_mode = std::fs::metadata(&observation_socket)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
 
         assert_eq!(session_mode, 0o700, "session directory should be private");
         assert_eq!(metadata_mode, 0o600, "metadata file should be private");
         assert_eq!(socket_mode, 0o600, "control socket should be private");
+        assert_eq!(
+            observation_socket_mode, 0o600,
+            "observation socket should be private"
+        );
+
+        drop(session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_session_registry_publishes_only_ready_sessions() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let (session, _stop_rx) = LaunchSession::create_in(
+            registry_root.path(),
+            "test-session",
+            EnforcementMode::Observe,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            list_launch_sessions_in(registry_root.path())
+                .unwrap()
+                .is_empty(),
+            "unpublished sessions should stay out of discovery"
+        );
+        assert!(
+            session.control_socket_path().await.exists(),
+            "control socket should be ready before publish"
+        );
+        assert!(
+            !session.observation_socket_path().await.exists(),
+            "observation socket should not exist before publish"
+        );
+
+        let obs_stream = ObservationStream::new();
+        session.publish(&obs_stream).await.unwrap();
+
+        let sessions = list_launch_sessions_in(registry_root.path()).unwrap();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "ready session should become discoverable"
+        );
+        assert_eq!(sessions[0].session_id, "test-session");
+        assert!(
+            session.observation_socket_path().await.exists(),
+            "observation socket should exist after publish"
+        );
+
+        drop(session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_session_registry_skips_invalid_metadata_entries() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let (session, _stop_rx) =
+            LaunchSession::create_in(registry_root.path(), "healthy", EnforcementMode::Warn)
+                .await
+                .unwrap();
+        let obs_stream = ObservationStream::new();
+        session.publish(&obs_stream).await.unwrap();
+
+        let broken_dir = registry_root.path().join("broken");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        std::fs::write(
+            broken_dir.join(SESSION_METADATA_FILE_NAME),
+            "{ definitely not valid json",
+        )
+        .unwrap();
+
+        let sessions = list_launch_sessions_in(registry_root.path()).unwrap();
+        assert_eq!(sessions.len(), 1, "broken entries should be ignored");
+        assert_eq!(sessions[0].session_id, "healthy");
 
         drop(session);
     }

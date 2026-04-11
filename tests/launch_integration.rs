@@ -242,6 +242,52 @@ async fn stop_launch_session(
     exit_code
 }
 
+async fn wait_for_launch_session_removed(session_id: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let sessions = strait::launch::list_launch_sessions().unwrap();
+            if sessions
+                .iter()
+                .all(|candidate| candidate.session_id != session_id)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("launch session should be removed from the registry");
+}
+
+#[cfg(unix)]
+async fn wait_for_observation_socket_event(
+    path: &Path,
+    event_type: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    use tokio::io::AsyncBufReadExt;
+
+    let stream = tokio::net::UnixStream::connect(path)
+        .await
+        .expect("observation socket should accept connections");
+    let mut reader = tokio::io::BufReader::new(stream);
+
+    tokio::time::timeout(timeout, async {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes = reader.read_line(&mut line).await.unwrap();
+            assert!(bytes > 0, "observation socket should keep streaming");
+            let event: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+            if event.get("type").and_then(|value| value.as_str()) == Some(event_type) {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("expected observation event should arrive before timeout")
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests (require Docker)
 // ---------------------------------------------------------------------------
@@ -1098,9 +1144,15 @@ permit(
 
 /// Helper: write a Cedar policy that permits all network and filesystem access.
 fn write_permissive_policy(path: &std::path::Path) {
-    std::fs::write(
-        path,
-        r#"
+    std::fs::write(path, PERMISSIVE_POLICY_TEXT).unwrap();
+}
+
+/// Helper: write a Cedar policy that permits filesystem access only (no network).
+fn write_fs_only_policy(path: &std::path::Path) {
+    std::fs::write(path, FS_ONLY_POLICY_TEXT).unwrap();
+}
+
+const PERMISSIVE_POLICY_TEXT: &str = r#"
 @id("allow-all-network")
 permit(
     principal == Agent::"agent",
@@ -1113,26 +1165,16 @@ permit(
     action in [Action::"fs:read", Action::"fs:write"],
     resource
 );
-"#,
-    )
-    .unwrap();
-}
+"#;
 
-/// Helper: write a Cedar policy that permits filesystem access only (no network).
-fn write_fs_only_policy(path: &std::path::Path) {
-    std::fs::write(
-        path,
-        r#"
+const FS_ONLY_POLICY_TEXT: &str = r#"
 @id("allow-all-fs")
 permit(
     principal == Agent::"agent",
     action in [Action::"fs:read", Action::"fs:write"],
     resource
 );
-"#,
-    )
-    .unwrap();
-}
+"#;
 
 /// Enforce mode: the proxy path works end to end through the gateway.
 ///
@@ -1636,12 +1678,18 @@ fn pty_helper_is_stable_across_repeated_runs() {
 #[test]
 fn launch_observe_passthrough_supports_mock_tui_interaction() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = launch_test_guard();
     if !runtime.block_on(require_docker()) {
         return;
     }
 
     let temp_dir = tempfile::tempdir().unwrap();
     let obs_path = temp_dir.path().join("interactive-observations.jsonl");
+    let existing_session_ids: Vec<String> = strait::launch::list_launch_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect();
     let args = vec![
         "launch".to_string(),
         "--observe".to_string(),
@@ -1666,6 +1714,19 @@ fn launch_observe_passthrough_supports_mock_tui_interaction() {
     assert_eq!(boot["stdin_tty"].as_bool(), Some(true));
     assert_eq!(boot["stdout_tty"].as_bool(), Some(true));
 
+    let live_session = runtime.block_on(wait_for_new_launch_session(&existing_session_ids, true));
+    let info = runtime
+        .block_on(strait::launch::request_launch_session_info(
+            &live_session.control_socket_path,
+        ))
+        .expect("session.info should succeed while mock TUI is running");
+    assert_eq!(info.session_id, live_session.session_id);
+    assert_eq!(info.mode, "observe");
+    assert!(
+        info.container_id.is_some() || info.container_name.is_some(),
+        "interactive launch should publish container identity"
+    );
+
     session.write_line("through-strait").unwrap();
     let input = session
         .wait_for_event("input", Duration::from_secs(10))
@@ -1680,6 +1741,7 @@ fn launch_observe_passthrough_supports_mock_tui_interaction() {
 
     let status = session.wait_for_exit(Duration::from_secs(20)).unwrap();
     assert!(status.success(), "launch command should exit successfully");
+    runtime.block_on(wait_for_launch_session_removed(&live_session.session_id));
 
     assert!(obs_path.exists(), "observation log should be written");
     let events = observation_events(&obs_path);
@@ -1690,5 +1752,368 @@ fn launch_observe_passthrough_supports_mock_tui_interaction() {
     assert!(
         !events_of_type(&events, "container_stop").is_empty(),
         "launch passthrough should still record container_stop"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn launch_observe_mock_tui_resize_reaches_container_and_cleans_up() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = launch_test_guard();
+    if !runtime.block_on(require_docker()) {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir
+        .path()
+        .join("interactive-resize-observations.jsonl");
+    let existing_session_ids: Vec<String> = strait::launch::list_launch_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect();
+    let args = vec![
+        "launch".to_string(),
+        "--observe".to_string(),
+        "--image".to_string(),
+        TEST_IMAGE.to_string(),
+        "--output".to_string(),
+        obs_path.display().to_string(),
+        mock_tui_fixture().display().to_string(),
+    ];
+
+    let mut session = PtySession::spawn(
+        strait_binary(),
+        &args,
+        repo_root(),
+        PtySize { rows: 24, cols: 80 },
+    )
+    .unwrap();
+
+    let boot = session
+        .wait_for_event("boot", Duration::from_secs(15))
+        .unwrap();
+    assert_eq!(boot["cols"].as_u64(), Some(80));
+    assert_eq!(boot["rows"].as_u64(), Some(24));
+
+    let draw = session
+        .wait_for_event("draw", Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(draw["reason"].as_str(), Some("start"));
+    assert_eq!(draw["cols"].as_u64(), Some(80));
+    assert_eq!(draw["rows"].as_u64(), Some(24));
+
+    let live_session = runtime.block_on(wait_for_new_launch_session(&existing_session_ids, true));
+    let observation = runtime
+        .block_on(strait::launch::request_launch_watch_attach(
+            &live_session.control_socket_path,
+        ))
+        .expect("watch.attach should succeed while mock TUI is running");
+    let observation_path = observation.path.clone();
+    let watch_task = runtime.spawn(async move {
+        wait_for_observation_socket_event(&observation_path, "tty_resized", Duration::from_secs(10))
+            .await
+    });
+
+    session
+        .resize(PtySize {
+            rows: 40,
+            cols: 100,
+        })
+        .unwrap();
+
+    let redraw = session
+        .wait_for_json(
+            |value| {
+                value.get("event").and_then(serde_json::Value::as_str) == Some("draw")
+                    && value.get("reason").and_then(serde_json::Value::as_str) == Some("resize")
+            },
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    assert_eq!(redraw["cols"].as_u64(), Some(100));
+    assert_eq!(redraw["rows"].as_u64(), Some(40));
+
+    let resize_event = runtime.block_on(async {
+        watch_task
+            .await
+            .expect("watch.attach resize observer task should complete")
+    });
+    assert_eq!(resize_event["rows"].as_i64(), Some(40));
+    assert_eq!(resize_event["cols"].as_i64(), Some(100));
+    assert_eq!(resize_event["source"].as_str(), Some("signal"));
+    assert_eq!(
+        resize_event["session"]["session_id"].as_str(),
+        Some(live_session.session_id.as_str())
+    );
+
+    session.write_line("exit").unwrap();
+    let exit = session
+        .wait_for_event("exit", Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(exit["code"].as_i64(), Some(0));
+    assert!(session
+        .wait_for_exit(Duration::from_secs(20))
+        .unwrap()
+        .success());
+
+    runtime.block_on(wait_for_launch_session_removed(&live_session.session_id));
+    assert!(
+        !live_session.control_socket_path.exists(),
+        "control socket should be removed after exit"
+    );
+    assert!(
+        !live_session.observation.path.exists(),
+        "observation socket should be removed after exit"
+    );
+
+    let events = observation_events(&obs_path);
+    let resize_events = events_of_type(&events, "tty_resized");
+    assert_eq!(resize_events.len(), 1, "resize should be recorded once");
+    assert_eq!(resize_events[0]["rows"].as_i64(), Some(40));
+    assert_eq!(resize_events[0]["cols"].as_i64(), Some(100));
+    assert_eq!(resize_events[0]["source"].as_str(), Some("signal"));
+}
+
+#[cfg(unix)]
+const CONNECT_PROBE_SCRIPT: &str = r#"
+printf '{"event":"ready"}\n'
+while IFS= read -r line; do
+  case "$line" in
+    probe)
+      status="connect_failed"
+      if exec 3<>/dev/tcp/127.0.0.1/3128 2>/dev/null; then
+        printf 'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n' >&3
+        if IFS= read -r -t 5 response <&3; then
+          case "$response" in
+            *200*) status="200" ;;
+            *403*) status="403" ;;
+            *) status="other" ;;
+          esac
+        else
+          status="timeout"
+        fi
+        exec 3>&-
+        exec 3<&-
+      fi
+      printf '{"event":"probe","status":"%s"}\n' "$status"
+      ;;
+    exit)
+      printf '{"event":"exit","code":0}\n'
+      exit 0
+      ;;
+  esac
+done
+printf '{"event":"exit","code":0}\n'
+"#;
+
+#[cfg(unix)]
+#[test]
+fn launch_policy_replace_live_updates_network_probe() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = launch_test_guard();
+    if !runtime.block_on(require_docker()) {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let policy_path = temp_dir.path().join("policy.cedar");
+    let obs_path = temp_dir.path().join("policy-replace-observations.jsonl");
+    write_fs_only_policy(&policy_path);
+
+    let existing_session_ids: Vec<String> = strait::launch::list_launch_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect();
+    let args = vec![
+        "launch".to_string(),
+        "--policy".to_string(),
+        policy_path.display().to_string(),
+        "--image".to_string(),
+        TEST_IMAGE.to_string(),
+        "--output".to_string(),
+        obs_path.display().to_string(),
+        "bash".to_string(),
+        "-lc".to_string(),
+        CONNECT_PROBE_SCRIPT.to_string(),
+    ];
+
+    let mut session = PtySession::spawn(
+        strait_binary(),
+        &args,
+        repo_root(),
+        PtySize { rows: 24, cols: 80 },
+    )
+    .unwrap();
+
+    session
+        .wait_for_event("ready", Duration::from_secs(15))
+        .unwrap();
+
+    let live_session = runtime.block_on(wait_for_new_launch_session(&existing_session_ids, true));
+    let info = runtime
+        .block_on(strait::launch::request_launch_session_info(
+            &live_session.control_socket_path,
+        ))
+        .expect("session.info should succeed while policy probe is running");
+    assert_eq!(info.mode, "enforce");
+
+    session.write_line("probe").unwrap();
+    let denied = session
+        .wait_for_event("probe", Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(denied["status"].as_str(), Some("403"));
+
+    let observation = runtime
+        .block_on(strait::launch::request_launch_watch_attach(
+            &live_session.control_socket_path,
+        ))
+        .expect("watch.attach should succeed for policy probe session");
+    let observation_path = observation.path.clone();
+    let watch_task = runtime.spawn(async move {
+        wait_for_observation_socket_event(
+            &observation_path,
+            "policy_reloaded",
+            Duration::from_secs(10),
+        )
+        .await
+    });
+
+    let update = runtime
+        .block_on(strait::launch::request_launch_policy_replace(
+            &live_session.control_socket_path,
+            PERMISSIVE_POLICY_TEXT,
+        ))
+        .expect("network-only policy.replace should succeed");
+    assert!(update.applied, "network-only policy should apply live");
+    assert!(
+        update.restart_required_domains.is_empty(),
+        "network-only update should not require restart"
+    );
+
+    let reload_event = runtime.block_on(async {
+        watch_task
+            .await
+            .expect("watch.attach policy observer task should complete")
+    });
+    assert_eq!(reload_event["applied"].as_bool(), Some(true));
+    assert_eq!(reload_event["source"].as_str(), Some("replace"));
+    assert_eq!(
+        reload_event["session"]["session_id"].as_str(),
+        Some(live_session.session_id.as_str())
+    );
+
+    session.write_line("probe").unwrap();
+    let allowed = session
+        .wait_for_event("probe", Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(allowed["status"].as_str(), Some("200"));
+
+    session.write_line("exit").unwrap();
+    session
+        .wait_for_event("exit", Duration::from_secs(10))
+        .unwrap();
+    assert!(session
+        .wait_for_exit(Duration::from_secs(20))
+        .unwrap()
+        .success());
+
+    runtime.block_on(wait_for_launch_session_removed(&live_session.session_id));
+
+    let events = observation_events(&obs_path);
+    let reloads = events_of_type(&events, "policy_reloaded");
+    assert_eq!(reloads.len(), 1, "live policy replace should be observed");
+    assert_eq!(reloads[0]["applied"].as_bool(), Some(true));
+    assert_eq!(reloads[0]["source"].as_str(), Some("replace"));
+}
+
+#[cfg(unix)]
+#[test]
+fn launch_policy_replace_invalid_update_keeps_existing_network_policy() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = launch_test_guard();
+    if !runtime.block_on(require_docker()) {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let policy_path = temp_dir.path().join("policy.cedar");
+    let obs_path = temp_dir
+        .path()
+        .join("policy-replace-invalid-observations.jsonl");
+    write_permissive_policy(&policy_path);
+
+    let existing_session_ids: Vec<String> = strait::launch::list_launch_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect();
+    let args = vec![
+        "launch".to_string(),
+        "--policy".to_string(),
+        policy_path.display().to_string(),
+        "--image".to_string(),
+        TEST_IMAGE.to_string(),
+        "--output".to_string(),
+        obs_path.display().to_string(),
+        "bash".to_string(),
+        "-lc".to_string(),
+        CONNECT_PROBE_SCRIPT.to_string(),
+    ];
+
+    let mut session = PtySession::spawn(
+        strait_binary(),
+        &args,
+        repo_root(),
+        PtySize { rows: 24, cols: 80 },
+    )
+    .unwrap();
+
+    session
+        .wait_for_event("ready", Duration::from_secs(15))
+        .unwrap();
+
+    let live_session = runtime.block_on(wait_for_new_launch_session(&existing_session_ids, true));
+
+    session.write_line("probe").unwrap();
+    let before = session
+        .wait_for_event("probe", Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(before["status"].as_str(), Some("200"));
+
+    let error = runtime
+        .block_on(strait::launch::request_launch_policy_replace(
+            &live_session.control_socket_path,
+            "not valid cedar {{{",
+        ))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("policy_update_failed"),
+        "invalid policy.replace should return a structured control error: {error}"
+    );
+
+    session.write_line("probe").unwrap();
+    let after = session
+        .wait_for_event("probe", Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(after["status"].as_str(), Some("200"));
+
+    session.write_line("exit").unwrap();
+    session
+        .wait_for_event("exit", Duration::from_secs(10))
+        .unwrap();
+    assert!(session
+        .wait_for_exit(Duration::from_secs(20))
+        .unwrap()
+        .success());
+
+    runtime.block_on(wait_for_launch_session_removed(&live_session.session_id));
+
+    let events = observation_events(&obs_path);
+    assert!(
+        events_of_type(&events, "policy_reloaded").is_empty(),
+        "failed policy.replace should not emit a policy_reloaded event"
     );
 }

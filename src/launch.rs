@@ -50,7 +50,10 @@ use tracing::{info, warn};
 
 use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
-use crate::config::ProxyContext;
+use crate::config::{
+    reload_policy, replace_policy, LivePolicyBounds, PolicyConfig, PolicyMutationOutcome,
+    ProxyContext,
+};
 use crate::container::{ContainerManager, ContainerPermission, ContainerPolicy};
 use crate::credentials::CredentialStore;
 use crate::mitm::handle_connection;
@@ -156,6 +159,9 @@ pub struct LaunchControlRequest {
     pub version: u32,
     /// Control method name.
     pub method: String,
+    /// Inline Cedar policy source for `policy.replace`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
 }
 
 impl LaunchControlRequest {
@@ -163,6 +169,15 @@ impl LaunchControlRequest {
         Self {
             version: SESSION_CONTROL_PROTOCOL_VERSION,
             method: method.as_str().to_string(),
+            policy: None,
+        }
+    }
+
+    fn with_policy(method: ControlMethod, policy: impl Into<String>) -> Self {
+        Self {
+            version: SESSION_CONTROL_PROTOCOL_VERSION,
+            method: method.as_str().to_string(),
+            policy: Some(policy.into()),
         }
     }
 }
@@ -176,6 +191,25 @@ pub struct LaunchControlError {
     pub message: String,
 }
 
+/// Structured result for a live policy mutation request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchPolicyMutationResult {
+    /// Whether the new policy was applied live.
+    pub applied: bool,
+    /// Policy domains that require a relaunch instead of a live update.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_required_domains: Vec<String>,
+}
+
+impl From<PolicyMutationOutcome> for LaunchPolicyMutationResult {
+    fn from(outcome: PolicyMutationOutcome) -> Self {
+        Self {
+            applied: outcome.applied,
+            restart_required_domains: outcome.restart_required_domains,
+        }
+    }
+}
+
 /// Successful result payloads for the local launch control protocol.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -186,6 +220,10 @@ pub enum LaunchControlResult {
     WatchAttach { observation: ObservationHandle },
     /// Result for `session.stop`.
     SessionStop { accepted: bool },
+    /// Result for `policy.reload`.
+    PolicyReload { update: LaunchPolicyMutationResult },
+    /// Result for `policy.replace`.
+    PolicyReplace { update: LaunchPolicyMutationResult },
 }
 
 /// Response envelope for the local launch control protocol.
@@ -213,7 +251,7 @@ impl LaunchControlResponse {
         }
     }
 
-    fn invalid_request(code: &str, message: impl Into<String>) -> Self {
+    fn failure(code: &str, message: impl Into<String>) -> Self {
         Self {
             version: SESSION_CONTROL_PROTOCOL_VERSION,
             ok: false,
@@ -224,6 +262,10 @@ impl LaunchControlResponse {
             }),
         }
     }
+
+    fn invalid_request(code: &str, message: impl Into<String>) -> Self {
+        Self::failure(code, message)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +273,8 @@ enum ControlMethod {
     SessionInfo,
     WatchAttach,
     SessionStop,
+    PolicyReload,
+    PolicyReplace,
 }
 
 impl ControlMethod {
@@ -239,6 +283,8 @@ impl ControlMethod {
             Self::SessionInfo => "session.info",
             Self::WatchAttach => "watch.attach",
             Self::SessionStop => "session.stop",
+            Self::PolicyReload => "policy.reload",
+            Self::PolicyReplace => "policy.replace",
         }
     }
 }
@@ -256,6 +302,8 @@ fn parse_control_method(request: &LaunchControlRequest) -> anyhow::Result<Contro
         "session.info" => Ok(ControlMethod::SessionInfo),
         "watch.attach" => Ok(ControlMethod::WatchAttach),
         "session.stop" => Ok(ControlMethod::SessionStop),
+        "policy.reload" => Ok(ControlMethod::PolicyReload),
+        "policy.replace" => Ok(ControlMethod::PolicyReplace),
         other => anyhow::bail!("unsupported control method '{other}'"),
     }
 }
@@ -510,11 +558,45 @@ pub async fn request_launch_session_stop(control_socket_path: &Path) -> anyhow::
     }
 }
 
+/// Request a live policy reload from the running session's configured source.
+#[cfg(unix)]
+pub async fn request_launch_policy_reload(
+    control_socket_path: &Path,
+) -> anyhow::Result<LaunchPolicyMutationResult> {
+    let response = send_launch_control_request(
+        control_socket_path,
+        &LaunchControlRequest::new(ControlMethod::PolicyReload),
+    )
+    .await?;
+    match response.result {
+        Some(LaunchControlResult::PolicyReload { update }) => Ok(update),
+        other => anyhow::bail!("unexpected policy.reload response: {other:?}"),
+    }
+}
+
+/// Request a live policy replacement from the running session.
+#[cfg(unix)]
+pub async fn request_launch_policy_replace(
+    control_socket_path: &Path,
+    policy: impl Into<String>,
+) -> anyhow::Result<LaunchPolicyMutationResult> {
+    let response = send_launch_control_request(
+        control_socket_path,
+        &LaunchControlRequest::with_policy(ControlMethod::PolicyReplace, policy),
+    )
+    .await?;
+    match response.result {
+        Some(LaunchControlResult::PolicyReplace { update }) => Ok(update),
+        other => anyhow::bail!("unexpected policy.replace response: {other:?}"),
+    }
+}
+
 #[cfg(unix)]
 async fn handle_launch_control_client(
     stream: tokio::net::UnixStream,
     metadata: Arc<RwLock<LaunchSessionMetadata>>,
     stop_tx: watch::Sender<bool>,
+    proxy_ctx: Arc<ProxyContext>,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
@@ -541,6 +623,51 @@ async fn handle_launch_control_client(
                 let _ = stop_tx.send(true);
                 LaunchControlResponse::success(LaunchControlResult::SessionStop { accepted: true })
             }
+            Ok(ControlMethod::PolicyReload) => {
+                let proxy_ctx = proxy_ctx.clone();
+                match tokio::task::spawn_blocking(move || reload_policy(proxy_ctx.as_ref())).await {
+                    Ok(Ok(outcome)) => {
+                        LaunchControlResponse::success(LaunchControlResult::PolicyReload {
+                            update: outcome.into(),
+                        })
+                    }
+                    Ok(Err(error)) => {
+                        LaunchControlResponse::failure("policy_update_failed", error.to_string())
+                    }
+                    Err(error) => LaunchControlResponse::failure(
+                        "internal_error",
+                        format!("policy reload task failed: {error}"),
+                    ),
+                }
+            }
+            Ok(ControlMethod::PolicyReplace) => match request.policy {
+                Some(policy) => {
+                    let proxy_ctx = proxy_ctx.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        replace_policy(proxy_ctx.as_ref(), policy)
+                    })
+                    .await
+                    {
+                        Ok(Ok(outcome)) => {
+                            LaunchControlResponse::success(LaunchControlResult::PolicyReplace {
+                                update: outcome.into(),
+                            })
+                        }
+                        Ok(Err(error)) => LaunchControlResponse::failure(
+                            "policy_update_failed",
+                            error.to_string(),
+                        ),
+                        Err(error) => LaunchControlResponse::failure(
+                            "internal_error",
+                            format!("policy replace task failed: {error}"),
+                        ),
+                    }
+                }
+                None => LaunchControlResponse::invalid_request(
+                    "missing_policy",
+                    "policy.replace requires inline Cedar policy text",
+                ),
+            },
             Err(error) => {
                 LaunchControlResponse::invalid_request("invalid_method", error.to_string())
             }
@@ -573,6 +700,7 @@ async fn start_launch_control_server(
     control_socket_path: PathBuf,
     metadata: Arc<RwLock<LaunchSessionMetadata>>,
     stop_tx: watch::Sender<bool>,
+    proxy_ctx: Arc<ProxyContext>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     #[cfg(unix)]
     if let Some(parent) = control_socket_path.parent() {
@@ -628,9 +756,10 @@ async fn start_launch_control_server(
                 Ok((stream, _addr)) => {
                     let metadata = metadata.clone();
                     let stop_tx = stop_tx.clone();
+                    let proxy_ctx = proxy_ctx.clone();
                     tokio::spawn(async move {
                         if let Err(error) =
-                            handle_launch_control_client(stream, metadata, stop_tx).await
+                            handle_launch_control_client(stream, metadata, stop_tx, proxy_ctx).await
                         {
                             tracing::debug!(error = %error, "launch control client error");
                         }
@@ -670,15 +799,17 @@ impl LaunchSession {
     async fn create(
         session_id: &str,
         mode: EnforcementMode,
+        proxy_ctx: Arc<ProxyContext>,
     ) -> anyhow::Result<(Self, watch::Receiver<bool>)> {
         let registry_dir = launch_session_registry_dir();
-        Self::create_in(&registry_dir, session_id, mode).await
+        Self::create_in(&registry_dir, session_id, mode, proxy_ctx).await
     }
 
     async fn create_in(
         root: &Path,
         session_id: &str,
         mode: EnforcementMode,
+        proxy_ctx: Arc<ProxyContext>,
     ) -> anyhow::Result<(Self, watch::Receiver<bool>)> {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
@@ -736,6 +867,7 @@ impl LaunchSession {
             metadata.read().await.control_socket_path.clone(),
             metadata.clone(),
             stop_tx.clone(),
+            proxy_ctx,
         )
         .await?;
 
@@ -1176,16 +1308,19 @@ async fn run_launch_observe_with_terminal_mode(
     let proxy_ctx = Arc::new(build_launch_proxy_context(
         session_ca.clone(),
         None, // no policy engine in observe mode
+        None,
         obs_stream.clone(),
         false, // not warn_only
         credential_store,
         mitm_hosts,
+        None,
     )?);
 
     #[cfg(unix)]
     let (launch_session, mut session_stop_rx) = LaunchSession::create(
         proxy_ctx.audit_logger.session_id(),
         EnforcementMode::Observe,
+        proxy_ctx.clone(),
     )
     .await?;
     #[cfg(unix)]
@@ -1474,15 +1609,26 @@ async fn run_launch_with_policy_with_terminal_mode(
     let proxy_ctx = Arc::new(build_launch_proxy_context(
         session_ca.clone(),
         Some(engine.clone()),
+        Some(PolicyConfig {
+            file: Some(policy_path.to_path_buf()),
+            git_url: None,
+            git_path: None,
+            schema: None,
+            poll_interval_secs: None,
+        }),
         obs_stream.clone(),
         mode == EnforcementMode::Warn,
         credential_store,
         mitm_hosts,
+        Some(LivePolicyBounds {
+            fs_candidate_paths: vec![cwd.to_string_lossy().to_string()],
+            agent_id: "agent".to_string(),
+        }),
     )?);
 
     #[cfg(unix)]
     let (launch_session, mut session_stop_rx) =
-        LaunchSession::create(proxy_ctx.audit_logger.session_id(), mode).await?;
+        LaunchSession::create(proxy_ctx.audit_logger.session_id(), mode, proxy_ctx.clone()).await?;
     #[cfg(unix)]
     launch_session.publish(&obs_stream).await?;
 
@@ -1753,13 +1899,16 @@ async fn run_mitm_unix_proxy_loop(listener: UnixListener, ctx: Arc<ProxyContext>
 /// - Observation stream attached for recording traffic
 /// - Optional credential store from `--config` for credential injection
 /// - Optional MITM host list from `--config`
+#[allow(clippy::too_many_arguments)]
 pub fn build_launch_proxy_context(
     session_ca: SessionCa,
     policy_engine: Option<PolicyEngine>,
+    policy_config: Option<PolicyConfig>,
     obs_stream: ObservationStream,
     warn_only: bool,
     credential_store: Option<Arc<CredentialStore>>,
     mitm_hosts: Vec<String>,
+    live_policy_bounds: Option<LivePolicyBounds>,
 ) -> anyhow::Result<ProxyContext> {
     let audit_logger = Arc::new(AuditLogger::new(None)?);
 
@@ -1787,11 +1936,12 @@ pub fn build_launch_proxy_context(
         identity_header: "X-Strait-Agent".to_string(),
         identity_default: "agent".to_string(),
         git_policy: None,
-        policy_config: None,
+        policy_config,
         observation_stream: Some(obs_stream),
         enforcement_mode,
         mitm_all,
         warn_only,
+        live_policy_bounds,
         upstream_addr_override: None,
         upstream_tls_override: None,
         upstream_connect_timeout: std::time::Duration::from_secs(30),
@@ -2542,10 +2692,12 @@ mod tests {
         let ctx = build_launch_proxy_context(
             session_ca,
             None, // observe mode — no policy
+            None,
             obs_stream,
             false,
             None,
             Vec::new(),
+            None,
         )
         .unwrap();
 
@@ -2589,10 +2741,12 @@ permit(
         let ctx = build_launch_proxy_context(
             session_ca,
             Some(engine),
+            None,
             obs_stream,
             true, // warn mode
             None,
             Vec::new(),
+            None,
         )
         .unwrap();
 
@@ -2639,10 +2793,12 @@ permit(
         let ctx = build_launch_proxy_context(
             session_ca,
             Some(engine),
+            None,
             obs_stream,
             false, // enforce mode
             None,
             Vec::new(),
+            None,
         )
         .unwrap();
 
@@ -2688,10 +2844,12 @@ permit(
         let ctx = build_launch_proxy_context(
             session_ca,
             None,
+            None,
             obs_stream,
             false,
             Some(store),
             Vec::new(),
+            None,
         )
         .unwrap();
 
@@ -2711,8 +2869,10 @@ permit(
 
         let hosts = vec!["api.github.com".to_string(), "api.openai.com".to_string()];
 
-        let ctx =
-            build_launch_proxy_context(session_ca, None, obs_stream, false, None, hosts).unwrap();
+        let ctx = build_launch_proxy_context(
+            session_ca, None, None, obs_stream, false, None, hosts, None,
+        )
+        .unwrap();
 
         assert_eq!(ctx.mitm_hosts.len(), 2);
         assert!(ctx.mitm_hosts.contains(&"api.github.com".to_string()));
@@ -2730,8 +2890,17 @@ permit(
         let session_ca = SessionCa::generate().unwrap();
         let obs_stream = ObservationStream::new();
 
-        let ctx = build_launch_proxy_context(session_ca, None, obs_stream, false, None, Vec::new())
-            .unwrap();
+        let ctx = build_launch_proxy_context(
+            session_ca,
+            None,
+            None,
+            obs_stream,
+            false,
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
 
         assert!(
             ctx.credential_store.is_none(),
@@ -2762,10 +2931,12 @@ permit(
             build_launch_proxy_context(
                 session_ca,
                 None,
+                None,
                 obs_stream.clone(),
                 false,
                 None,
                 Vec::new(),
+                None,
             )
             .unwrap(),
         );
@@ -2819,10 +2990,12 @@ permit(
             build_launch_proxy_context(
                 session_ca,
                 None,
+                None,
                 obs_stream.clone(),
                 false,
                 None,
                 Vec::new(),
+                None,
             )
             .unwrap(),
         );
@@ -2888,6 +3061,7 @@ permit(
             enforcement_mode: "observe".to_string(),
             mitm_all: false,
             warn_only: false,
+            live_policy_bounds: None,
             upstream_addr_override: None,
             upstream_tls_override: None,
             upstream_connect_timeout: std::time::Duration::from_secs(30),
@@ -2998,10 +3172,12 @@ permit(
             build_launch_proxy_context(
                 session_ca,
                 None,
+                None,
                 obs_stream.clone(),
                 false,
                 None,
                 Vec::new(),
+                None,
             )
             .unwrap(),
         );
@@ -3063,11 +3239,33 @@ permit(
     // -- Launch session control tests ----------------------------------------
 
     #[cfg(unix)]
+    fn test_launch_proxy_ctx(
+        policy_engine: Option<PolicyEngine>,
+        policy_config: Option<PolicyConfig>,
+        live_policy_bounds: Option<LivePolicyBounds>,
+    ) -> Arc<ProxyContext> {
+        Arc::new(
+            build_launch_proxy_context(
+                SessionCa::generate().unwrap(),
+                policy_engine,
+                policy_config,
+                ObservationStream::new(),
+                false,
+                None,
+                Vec::new(),
+                live_policy_bounds,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[cfg(unix)]
     #[test]
     fn control_request_parser_rejects_bad_version_and_method() {
         let wrong_version = LaunchControlRequest {
             version: 99,
             method: "session.info".to_string(),
+            policy: None,
         };
         let err = parse_control_method(&wrong_version).unwrap_err();
         assert!(
@@ -3079,6 +3277,7 @@ permit(
         let wrong_method = LaunchControlRequest {
             version: SESSION_CONTROL_PROTOCOL_VERSION,
             method: "session.nope".to_string(),
+            policy: None,
         };
         let err = parse_control_method(&wrong_method).unwrap_err();
         assert!(
@@ -3124,10 +3323,15 @@ permit(
     #[tokio::test]
     async fn launch_session_registry_writes_metadata_and_cleans_up() {
         let registry_root = tempfile::tempdir().unwrap();
-        let (session, _stop_rx) =
-            LaunchSession::create_in(registry_root.path(), "test-session", EnforcementMode::Warn)
-                .await
-                .unwrap();
+        let proxy_ctx = test_launch_proxy_ctx(None, None, None);
+        let (session, _stop_rx) = LaunchSession::create_in(
+            registry_root.path(),
+            "test-session",
+            EnforcementMode::Warn,
+            proxy_ctx,
+        )
+        .await
+        .unwrap();
         let obs_stream = ObservationStream::new();
         session.publish(&obs_stream).await.unwrap();
         let control_socket = session.control_socket_path().await;
@@ -3159,10 +3363,12 @@ permit(
     #[tokio::test]
     async fn launch_control_server_handles_info_attach_and_stop() {
         let registry_root = tempfile::tempdir().unwrap();
+        let proxy_ctx = test_launch_proxy_ctx(None, None, None);
         let (session, mut stop_rx) = LaunchSession::create_in(
             registry_root.path(),
             "test-session",
             EnforcementMode::Observe,
+            proxy_ctx,
         )
         .await
         .unwrap();
@@ -3200,10 +3406,12 @@ permit(
     #[tokio::test]
     async fn launch_control_server_preserves_early_stop_signal_for_initial_receiver() {
         let registry_root = tempfile::tempdir().unwrap();
+        let proxy_ctx = test_launch_proxy_ctx(None, None, None);
         let (session, stop_rx) = LaunchSession::create_in(
             registry_root.path(),
             "test-session",
             EnforcementMode::Observe,
+            proxy_ctx,
         )
         .await
         .unwrap();
@@ -3227,10 +3435,15 @@ permit(
         use std::os::unix::fs::PermissionsExt;
 
         let registry_root = tempfile::tempdir().unwrap();
-        let (session, _stop_rx) =
-            LaunchSession::create_in(registry_root.path(), "test-session", EnforcementMode::Warn)
-                .await
-                .unwrap();
+        let proxy_ctx = test_launch_proxy_ctx(None, None, None);
+        let (session, _stop_rx) = LaunchSession::create_in(
+            registry_root.path(),
+            "test-session",
+            EnforcementMode::Warn,
+            proxy_ctx,
+        )
+        .await
+        .unwrap();
         let obs_stream = ObservationStream::new();
         session.publish(&obs_stream).await.unwrap();
         let control_socket = session.control_socket_path().await;
@@ -3274,10 +3487,12 @@ permit(
     #[tokio::test]
     async fn launch_session_registry_publishes_only_ready_sessions() {
         let registry_root = tempfile::tempdir().unwrap();
+        let proxy_ctx = test_launch_proxy_ctx(None, None, None);
         let (session, _stop_rx) = LaunchSession::create_in(
             registry_root.path(),
             "test-session",
             EnforcementMode::Observe,
+            proxy_ctx,
         )
         .await
         .unwrap();
@@ -3319,10 +3534,15 @@ permit(
     #[tokio::test]
     async fn launch_session_registry_skips_invalid_metadata_entries() {
         let registry_root = tempfile::tempdir().unwrap();
-        let (session, _stop_rx) =
-            LaunchSession::create_in(registry_root.path(), "healthy", EnforcementMode::Warn)
-                .await
-                .unwrap();
+        let proxy_ctx = test_launch_proxy_ctx(None, None, None);
+        let (session, _stop_rx) = LaunchSession::create_in(
+            registry_root.path(),
+            "healthy",
+            EnforcementMode::Warn,
+            proxy_ctx,
+        )
+        .await
+        .unwrap();
         let obs_stream = ObservationStream::new();
         session.publish(&obs_stream).await.unwrap();
 
@@ -3337,6 +3557,221 @@ permit(
         let sessions = list_launch_sessions_in(registry_root.path()).unwrap();
         assert_eq!(sessions.len(), 1, "broken entries should be ignored");
         assert_eq!(sessions[0].session_id, "healthy");
+
+        drop(session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_control_policy_replace_updates_engine() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let policy_path = registry_root.path().join("policy.cedar");
+        std::fs::write(
+            &policy_path,
+            r#"
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource
+);
+"#,
+        )
+        .unwrap();
+        let engine = PolicyEngine::load(&policy_path, None).unwrap();
+        let proxy_ctx = test_launch_proxy_ctx(
+            Some(engine),
+            Some(PolicyConfig {
+                file: Some(policy_path),
+                git_url: None,
+                git_path: None,
+                schema: None,
+                poll_interval_secs: None,
+            }),
+            Some(LivePolicyBounds {
+                fs_candidate_paths: vec!["/workspace".to_string()],
+                agent_id: "agent".to_string(),
+            }),
+        );
+        let (session, _stop_rx) = LaunchSession::create_in(
+            registry_root.path(),
+            "test-session",
+            EnforcementMode::Enforce,
+            proxy_ctx.clone(),
+        )
+        .await
+        .unwrap();
+        session.publish(&ObservationStream::new()).await.unwrap();
+
+        let control_socket = session.control_socket_path().await;
+        let update =
+            request_launch_policy_replace(&control_socket, "forbid(principal, action, resource);")
+                .await
+                .unwrap();
+        assert!(
+            update.applied,
+            "replace should apply when only network changes"
+        );
+        assert!(
+            update.restart_required_domains.is_empty(),
+            "network-only replace should not require restart"
+        );
+
+        let engine = proxy_ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("example.com", "http:GET", "/", &[], "agent")
+            .unwrap();
+        assert!(
+            !decision.allowed,
+            "replacement policy should now deny requests"
+        );
+
+        drop(session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_control_policy_replace_invalid_keeps_previous_policy() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let policy_path = registry_root.path().join("policy.cedar");
+        std::fs::write(
+            &policy_path,
+            r#"
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource
+);
+"#,
+        )
+        .unwrap();
+        let engine = PolicyEngine::load(&policy_path, None).unwrap();
+        let proxy_ctx = test_launch_proxy_ctx(
+            Some(engine),
+            Some(PolicyConfig {
+                file: Some(policy_path),
+                git_url: None,
+                git_path: None,
+                schema: None,
+                poll_interval_secs: None,
+            }),
+            Some(LivePolicyBounds {
+                fs_candidate_paths: vec!["/workspace".to_string()],
+                agent_id: "agent".to_string(),
+            }),
+        );
+        let (session, _stop_rx) = LaunchSession::create_in(
+            registry_root.path(),
+            "test-session",
+            EnforcementMode::Enforce,
+            proxy_ctx.clone(),
+        )
+        .await
+        .unwrap();
+        session.publish(&ObservationStream::new()).await.unwrap();
+
+        let control_socket = session.control_socket_path().await;
+        let err = request_launch_policy_replace(&control_socket, "not valid cedar {{{")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("policy_update_failed"),
+            "invalid replace should surface a structured control error: {err}"
+        );
+
+        let engine = proxy_ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("example.com", "http:GET", "/", &[], "agent")
+            .unwrap();
+        assert!(
+            decision.allowed,
+            "invalid replace should leave the previous policy active"
+        );
+
+        drop(session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_control_policy_reload_reports_restart_required_for_fs_or_proc_changes() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let policy_path = registry_root.path().join("policy.cedar");
+        std::fs::write(
+            &policy_path,
+            r#"
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource
+);
+"#,
+        )
+        .unwrap();
+        let engine = PolicyEngine::load(&policy_path, None).unwrap();
+        let proxy_ctx = test_launch_proxy_ctx(
+            Some(engine),
+            Some(PolicyConfig {
+                file: Some(policy_path.clone()),
+                git_url: None,
+                git_path: None,
+                schema: None,
+                poll_interval_secs: None,
+            }),
+            Some(LivePolicyBounds {
+                fs_candidate_paths: vec!["/workspace".to_string()],
+                agent_id: "agent".to_string(),
+            }),
+        );
+        let (session, _stop_rx) = LaunchSession::create_in(
+            registry_root.path(),
+            "test-session",
+            EnforcementMode::Enforce,
+            proxy_ctx.clone(),
+        )
+        .await
+        .unwrap();
+        session.publish(&ObservationStream::new()).await.unwrap();
+
+        std::fs::write(
+            &policy_path,
+            r#"
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource
+);
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:read",
+    resource in Resource::"fs::/workspace"
+);
+permit(
+    principal == Agent::"agent",
+    action == Action::"proc:exec",
+    resource == Resource::"proc::git"
+);
+"#,
+        )
+        .unwrap();
+
+        let control_socket = session.control_socket_path().await;
+        let update = request_launch_policy_reload(&control_socket).await.unwrap();
+        assert!(
+            !update.applied,
+            "fs/proc changes should be restart-bound, not applied live"
+        );
+        assert_eq!(
+            update.restart_required_domains,
+            vec!["fs".to_string(), "proc".to_string()]
+        );
+
+        let engine = proxy_ctx.policy_engine.as_ref().unwrap().load();
+        let fs_decision = engine
+            .evaluate_fs("/workspace", "fs:read", "agent")
+            .unwrap();
+        assert!(
+            !fs_decision.allowed,
+            "restart-required reload should leave the previous policy active"
+        );
 
         drop(session);
     }

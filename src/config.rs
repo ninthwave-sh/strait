@@ -5,6 +5,7 @@
 //! of shared state that connection handlers need, replacing the previous 8+
 //! positional parameters.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
 use crate::credentials::CredentialStore;
 use crate::observe::ObservationStream;
-use crate::policy::PolicyEngine;
+use crate::policy::{extract_fs_permissions, extract_proc_permissions, PolicyEngine};
 
 // ---------------------------------------------------------------------------
 // TOML configuration types
@@ -419,6 +420,12 @@ pub struct ProxyContext {
     /// When true, policy denials are logged as warnings but traffic is still
     /// forwarded upstream. Used by `launch --warn` mode.
     pub warn_only: bool,
+    /// Live-update boundaries for launch sessions.
+    ///
+    /// When present, policy mutations may update network enforcement in place,
+    /// but any effective change to filesystem mounts or proc allowlists is
+    /// rejected with a restart-required outcome.
+    pub live_policy_bounds: Option<LivePolicyBounds>,
     /// Override the upstream TCP address for testing.
     ///
     /// When set, `handle_mitm` connects to this address instead of `{host}:{port}`.
@@ -429,6 +436,49 @@ pub struct ProxyContext {
     /// When set, `handle_mitm` uses this config instead of building one from
     /// webpki roots. Production code leaves this as `None`.
     pub upstream_tls_override: Option<Arc<rustls::ClientConfig>>,
+}
+
+/// Runtime information needed to keep launch-time fs/proc policy state restart-bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivePolicyBounds {
+    /// Paths whose mount permissions were derived from the Cedar policy at startup.
+    pub fs_candidate_paths: Vec<String>,
+    /// Agent identity used for launch-time fs/proc permission extraction.
+    pub agent_id: String,
+}
+
+/// Source for a live policy mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyMutation {
+    /// Reload from the configured file or git source.
+    Reload,
+    /// Replace the active policy with the provided Cedar text.
+    Replace { policy: String },
+}
+
+/// Result of attempting a live policy mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyMutationOutcome {
+    /// Whether the new policy was atomically applied.
+    pub applied: bool,
+    /// Policy domains that still require a restart to take effect.
+    pub restart_required_domains: Vec<String>,
+}
+
+impl PolicyMutationOutcome {
+    fn applied() -> Self {
+        Self {
+            applied: true,
+            restart_required_domains: Vec::new(),
+        }
+    }
+
+    fn restart_required(domains: Vec<String>) -> Self {
+        Self {
+            applied: false,
+            restart_required_domains: domains,
+        }
+    }
 }
 
 impl ProxyContext {
@@ -544,6 +594,7 @@ impl ProxyContext {
             enforcement_mode,
             mitm_all: false,
             warn_only: false,
+            live_policy_bounds: None,
             upstream_addr_override: None,
             upstream_tls_override: None,
         })
@@ -728,63 +779,170 @@ pub async fn git_policy_poll_task(ctx: Arc<ProxyContext>) {
 // SIGHUP policy reload
 // ---------------------------------------------------------------------------
 
-/// Reload the policy from its configured source (file or git).
-///
-/// On success, atomically swaps the policy in `ProxyContext.policy_engine` via
-/// [`ArcSwap`] and returns `Ok(())`. On failure, the previous policy is retained
-/// and the error is returned (caller should log it).
-///
-/// This is called by the SIGHUP handler task and can also be used for
-/// programmatic reload.
-pub fn reload_policy(ctx: &ProxyContext) -> anyhow::Result<()> {
+fn load_schema_text_for_replace(ctx: &ProxyContext) -> anyhow::Result<Option<(String, String)>> {
+    let schema_path = if let Some(git_state) = &ctx.git_policy {
+        git_state.schema_path.as_ref()
+    } else {
+        ctx.policy_config
+            .as_ref()
+            .and_then(|config| config.schema.as_ref())
+    };
+
+    schema_path
+        .map(|path| {
+            let schema = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read schema file: {}", path.display()))?;
+            Ok((schema, path.display().to_string()))
+        })
+        .transpose()
+}
+
+fn normalize_permissions(
+    permissions: impl IntoIterator<Item = crate::container::ContainerPermission>,
+) -> BTreeSet<String> {
+    permissions
+        .into_iter()
+        .map(|permission| match permission {
+            crate::container::ContainerPermission::FsRead(path) => format!("fs:read:{path}"),
+            crate::container::ContainerPermission::FsWrite(path) => format!("fs:write:{path}"),
+            crate::container::ContainerPermission::ProcExec(binary) => {
+                format!("proc:exec:{binary}")
+            }
+        })
+        .collect()
+}
+
+fn restart_required_domains(
+    ctx: &ProxyContext,
+    current_engine: &PolicyEngine,
+    new_engine: &PolicyEngine,
+) -> Vec<String> {
+    let Some(bounds) = &ctx.live_policy_bounds else {
+        return Vec::new();
+    };
+
+    let mut domains = Vec::new();
+    let current_fs = normalize_permissions(extract_fs_permissions(
+        current_engine,
+        &bounds.fs_candidate_paths,
+        &bounds.agent_id,
+    ));
+    let next_fs = normalize_permissions(extract_fs_permissions(
+        new_engine,
+        &bounds.fs_candidate_paths,
+        &bounds.agent_id,
+    ));
+    if current_fs != next_fs {
+        domains.push("fs".to_string());
+    }
+
+    let current_proc =
+        normalize_permissions(extract_proc_permissions(current_engine, &bounds.agent_id));
+    let next_proc = normalize_permissions(extract_proc_permissions(new_engine, &bounds.agent_id));
+    if current_proc != next_proc {
+        domains.push("proc".to_string());
+    }
+
+    domains
+}
+
+fn load_mutated_policy(
+    ctx: &ProxyContext,
+    mutation: &PolicyMutation,
+) -> anyhow::Result<PolicyEngine> {
     let policy_config = ctx
         .policy_config
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no policy configured, nothing to reload"))?;
+
+    match mutation {
+        PolicyMutation::Reload => {
+            if let Some(git_state) = &ctx.git_policy {
+                // Git mode: fetch latest, then reload from the local clone
+                let repo_dir = &git_state.repo_dir;
+
+                let fetch = std::process::Command::new("git")
+                    .args(["fetch", "origin", "--quiet"])
+                    .current_dir(repo_dir)
+                    .output()
+                    .context("failed to execute `git fetch`")?;
+
+                if !fetch.status.success() {
+                    let stderr = String::from_utf8_lossy(&fetch.stderr);
+                    anyhow::bail!("git fetch failed: {}", stderr.trim());
+                }
+
+                let reset = std::process::Command::new("git")
+                    .args(["reset", "--hard", "origin/HEAD", "--quiet"])
+                    .current_dir(repo_dir)
+                    .output()
+                    .context("failed to execute `git reset`")?;
+
+                if !reset.status.success() {
+                    let stderr = String::from_utf8_lossy(&reset.stderr);
+                    anyhow::bail!("git reset failed: {}", stderr.trim());
+                }
+
+                PolicyEngine::load(&git_state.policy_path, git_state.schema_path.as_deref())
+            } else if let Some(ref file) = policy_config.file {
+                PolicyEngine::load(file, policy_config.schema.as_deref())
+            } else {
+                anyhow::bail!("policy configuration has no file or git source");
+            }
+        }
+        PolicyMutation::Replace { policy } => {
+            let schema = load_schema_text_for_replace(ctx)?;
+            PolicyEngine::from_text(
+                policy,
+                schema.as_ref().map(|(text, _)| text.as_str()),
+                schema.as_ref().map(|(_, label)| label.as_str()),
+            )
+        }
+    }
+}
+
+/// Apply a live policy mutation, atomically swapping the policy engine when the
+/// update is valid and does not require restart-bound fs/proc changes.
+pub fn mutate_policy(
+    ctx: &ProxyContext,
+    mutation: PolicyMutation,
+) -> anyhow::Result<PolicyMutationOutcome> {
+    if ctx.policy_config.is_none() {
+        anyhow::bail!("no policy configured, nothing to reload");
+    }
 
     let swap = ctx
         .policy_engine
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("no policy engine initialized, nothing to reload"))?;
 
-    let new_engine = if let Some(git_state) = &ctx.git_policy {
-        // Git mode: fetch latest, then reload from the local clone
-        let repo_dir = &git_state.repo_dir;
-
-        // Fetch from origin
-        let fetch = std::process::Command::new("git")
-            .args(["fetch", "origin", "--quiet"])
-            .current_dir(repo_dir)
-            .output()
-            .context("failed to execute `git fetch`")?;
-
-        if !fetch.status.success() {
-            let stderr = String::from_utf8_lossy(&fetch.stderr);
-            anyhow::bail!("git fetch failed: {}", stderr.trim());
-        }
-
-        // Reset to latest origin/HEAD
-        let reset = std::process::Command::new("git")
-            .args(["reset", "--hard", "origin/HEAD", "--quiet"])
-            .current_dir(repo_dir)
-            .output()
-            .context("failed to execute `git reset`")?;
-
-        if !reset.status.success() {
-            let stderr = String::from_utf8_lossy(&reset.stderr);
-            anyhow::bail!("git reset failed: {}", stderr.trim());
-        }
-
-        PolicyEngine::load(&git_state.policy_path, git_state.schema_path.as_deref())?
-    } else if let Some(ref file) = policy_config.file {
-        // File mode: re-read from disk
-        PolicyEngine::load(file, policy_config.schema.as_deref())?
-    } else {
-        anyhow::bail!("policy configuration has no file or git source");
-    };
+    let current_engine = swap.load();
+    let new_engine = load_mutated_policy(ctx, &mutation)?;
+    let restart_required = restart_required_domains(ctx, current_engine.as_ref(), &new_engine);
+    if !restart_required.is_empty() {
+        return Ok(PolicyMutationOutcome::restart_required(restart_required));
+    }
 
     swap.store(Arc::new(new_engine));
-    Ok(())
+    Ok(PolicyMutationOutcome::applied())
+}
+
+/// Reload the policy from its configured source (file or git).
+pub fn reload_policy(ctx: &ProxyContext) -> anyhow::Result<PolicyMutationOutcome> {
+    mutate_policy(ctx, PolicyMutation::Reload)
+}
+
+/// Replace the active policy with the provided Cedar source.
+pub fn replace_policy(
+    ctx: &ProxyContext,
+    policy: impl Into<String>,
+) -> anyhow::Result<PolicyMutationOutcome> {
+    mutate_policy(
+        ctx,
+        PolicyMutation::Replace {
+            policy: policy.into(),
+        },
+    )
 }
 
 /// Background task that listens for `SIGHUP` and triggers a policy reload.
@@ -817,8 +975,14 @@ pub async fn sighup_reload_task(ctx: Arc<ProxyContext>) {
         let result = tokio::task::spawn_blocking(move || reload_policy(&reload_ctx)).await;
 
         match result {
-            Ok(Ok(())) => {
+            Ok(Ok(outcome)) if outcome.applied => {
                 info!("policy reloaded successfully via SIGHUP");
+            }
+            Ok(Ok(outcome)) => {
+                warn!(
+                    domains = ?outcome.restart_required_domains,
+                    "SIGHUP policy reload requires restart to apply fs/proc changes; keeping previous policy"
+                );
             }
             Ok(Err(e)) => {
                 error!(
@@ -1699,7 +1863,12 @@ permit(
         std::fs::write(pf.path(), r#"forbid(principal, action, resource);"#).unwrap();
 
         // Reload via reload_policy
-        reload_policy(&ctx).unwrap();
+        let outcome = reload_policy(&ctx).unwrap();
+        assert!(outcome.applied, "reload should report an applied update");
+        assert!(
+            outcome.restart_required_domains.is_empty(),
+            "network-only reload should not require restart"
+        );
 
         // Verify deny-all is now active
         let engine = ctx.policy_engine.as_ref().unwrap().load();
@@ -1740,6 +1909,127 @@ permit(
         assert!(
             decision.allowed,
             "old policy should be retained on reload failure"
+        );
+    }
+
+    #[test]
+    fn replace_policy_swaps_engine() {
+        let permit_all = r#"permit(principal, action, resource);"#;
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(permit_all.as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"",
+            pf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        let outcome = replace_policy(&ctx, "forbid(principal, action, resource);").unwrap();
+        assert!(outcome.applied, "replace should apply a valid policy");
+        assert!(
+            outcome.restart_required_domains.is_empty(),
+            "network-only replace should not require restart"
+        );
+
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(!decision.allowed, "replacement policy should deny");
+    }
+
+    #[test]
+    fn replace_policy_invalid_keeps_old_policy() {
+        let permit_all = r#"permit(principal, action, resource);"#;
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(permit_all.as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"",
+            pf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+
+        let result = replace_policy(&ctx, "this is not valid cedar {{{}}}");
+        assert!(result.is_err(), "replace with invalid syntax should fail");
+
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("host", "http:GET", "/", &[], "test")
+            .unwrap();
+        assert!(
+            decision.allowed,
+            "old policy should be retained when replace fails"
+        );
+    }
+
+    #[test]
+    fn reload_policy_fs_or_proc_change_requires_restart() {
+        let permit_all = r#"
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource
+);
+"#;
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(permit_all.as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"",
+            pf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let mut ctx = ProxyContext::from_config(&config).unwrap();
+        ctx.live_policy_bounds = Some(LivePolicyBounds {
+            fs_candidate_paths: vec!["/workspace".to_string()],
+            agent_id: "agent".to_string(),
+        });
+
+        std::fs::write(
+            pf.path(),
+            r#"
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource
+);
+permit(
+    principal == Agent::"agent",
+    action == Action::"fs:read",
+    resource in Resource::"fs::/workspace"
+);
+permit(
+    principal == Agent::"agent",
+    action == Action::"proc:exec",
+    resource == Resource::"proc::git"
+);
+"#,
+        )
+        .unwrap();
+
+        let outcome = reload_policy(&ctx).unwrap();
+        assert!(!outcome.applied, "fs/proc changes should be restart-bound");
+        assert_eq!(
+            outcome.restart_required_domains,
+            vec!["fs".to_string(), "proc".to_string()]
+        );
+
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let fs_decision = engine
+            .evaluate_fs("/workspace", "fs:read", "agent")
+            .unwrap();
+        assert!(
+            !fs_decision.allowed,
+            "restart-required reload should keep the previous policy active"
         );
     }
 

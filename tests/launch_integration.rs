@@ -8,7 +8,14 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+#[cfg(unix)]
 use std::time::Duration;
+
+#[cfg(unix)]
+mod support;
+
+#[cfg(unix)]
+use support::pty::{PtySession, PtySize};
 
 /// Container image used for integration tests.
 const TEST_IMAGE: &str = "ubuntu:24.04";
@@ -124,6 +131,21 @@ fn events_of_type<'a>(
         .iter()
         .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some(event_type))
         .collect()
+}
+
+#[cfg(unix)]
+fn repo_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+#[cfg(unix)]
+fn mock_tui_fixture() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_mock-tui-fixture"))
+}
+
+#[cfg(unix)]
+fn strait_binary() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_strait"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,5 +1135,228 @@ async fn warn_proxy_path_end_to_end() {
     assert_eq!(
         exit_code, 0,
         "CONNECT through gateway should succeed in warn mode"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PTY-backed interactive tests
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn mock_tui_reports_ttys_and_initial_draw() {
+    let mut session = PtySession::spawn(
+        mock_tui_fixture(),
+        &[] as &[&str],
+        repo_root(),
+        PtySize { rows: 24, cols: 80 },
+    )
+    .unwrap();
+
+    let boot = session
+        .wait_for_event("boot", Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(boot["stdin_tty"].as_bool(), Some(true));
+    assert_eq!(boot["stdout_tty"].as_bool(), Some(true));
+    assert_eq!(boot["cols"].as_u64(), Some(80));
+    assert_eq!(boot["rows"].as_u64(), Some(24));
+
+    let draw = session
+        .wait_for_event("draw", Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(draw["reason"].as_str(), Some("start"));
+    assert_eq!(draw["seq"].as_u64(), Some(1));
+    assert_eq!(draw["cols"].as_u64(), Some(80));
+    assert_eq!(draw["rows"].as_u64(), Some(24));
+
+    session.write_line("exit").unwrap();
+    let exit = session
+        .wait_for_event("exit", Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(exit["code"].as_i64(), Some(0));
+    assert!(session
+        .wait_for_exit(Duration::from_secs(3))
+        .unwrap()
+        .success());
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_helper_delivers_input_to_mock_tui() {
+    let mut session = PtySession::spawn(
+        mock_tui_fixture(),
+        &[] as &[&str],
+        repo_root(),
+        PtySize { rows: 24, cols: 80 },
+    )
+    .unwrap();
+
+    session
+        .wait_for_event("boot", Duration::from_secs(3))
+        .unwrap();
+    session
+        .wait_for_event("draw", Duration::from_secs(3))
+        .unwrap();
+
+    session.write_line("alpha bravo").unwrap();
+    let input = session
+        .wait_for_event("input", Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(input["line"].as_str(), Some("alpha bravo"));
+
+    session.write_line("exit").unwrap();
+    session
+        .wait_for_event("exit", Duration::from_secs(3))
+        .unwrap();
+    assert!(session
+        .wait_for_exit(Duration::from_secs(3))
+        .unwrap()
+        .success());
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_helper_triggers_resize_redraw() {
+    let mut session = PtySession::spawn(
+        mock_tui_fixture(),
+        &[] as &[&str],
+        repo_root(),
+        PtySize { rows: 24, cols: 80 },
+    )
+    .unwrap();
+
+    session
+        .wait_for_event("boot", Duration::from_secs(3))
+        .unwrap();
+    session
+        .wait_for_event("draw", Duration::from_secs(3))
+        .unwrap();
+
+    session
+        .resize(PtySize {
+            rows: 40,
+            cols: 100,
+        })
+        .unwrap();
+
+    let redraw = session
+        .wait_for_json(
+            |value| {
+                value.get("event").and_then(serde_json::Value::as_str) == Some("draw")
+                    && value.get("reason").and_then(serde_json::Value::as_str) == Some("resize")
+            },
+            Duration::from_secs(3),
+        )
+        .unwrap();
+
+    assert_eq!(redraw["seq"].as_u64(), Some(2));
+    assert_eq!(redraw["cols"].as_u64(), Some(100));
+    assert_eq!(redraw["rows"].as_u64(), Some(40));
+
+    session.write_line("exit").unwrap();
+    session
+        .wait_for_event("exit", Duration::from_secs(3))
+        .unwrap();
+    assert!(session
+        .wait_for_exit(Duration::from_secs(3))
+        .unwrap()
+        .success());
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_helper_is_stable_across_repeated_runs() {
+    for round in 0..3 {
+        let mut session = PtySession::spawn(
+            mock_tui_fixture(),
+            &[] as &[&str],
+            repo_root(),
+            PtySize { rows: 24, cols: 80 },
+        )
+        .unwrap();
+
+        session
+            .wait_for_event("boot", Duration::from_secs(3))
+            .unwrap();
+        session
+            .wait_for_event("draw", Duration::from_secs(3))
+            .unwrap();
+
+        let line = format!("round-{round}");
+        session.write_line(&line).unwrap();
+        let input = session
+            .wait_for_event("input", Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(input["line"].as_str(), Some(line.as_str()));
+
+        session.write_line("exit").unwrap();
+        session
+            .wait_for_event("exit", Duration::from_secs(3))
+            .unwrap();
+        assert!(session
+            .wait_for_exit(Duration::from_secs(3))
+            .unwrap()
+            .success());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn launch_observe_passthrough_supports_mock_tui_interaction() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    if !runtime.block_on(require_docker()) {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("interactive-observations.jsonl");
+    let args = vec![
+        "launch".to_string(),
+        "--observe".to_string(),
+        "--image".to_string(),
+        TEST_IMAGE.to_string(),
+        "--output".to_string(),
+        obs_path.display().to_string(),
+        mock_tui_fixture().display().to_string(),
+    ];
+
+    let mut session = PtySession::spawn(
+        strait_binary(),
+        &args,
+        repo_root(),
+        PtySize { rows: 24, cols: 80 },
+    )
+    .unwrap();
+
+    let boot = session
+        .wait_for_event("boot", Duration::from_secs(15))
+        .unwrap();
+    assert_eq!(boot["stdin_tty"].as_bool(), Some(true));
+    assert_eq!(boot["stdout_tty"].as_bool(), Some(true));
+
+    session.write_line("through-strait").unwrap();
+    let input = session
+        .wait_for_event("input", Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(input["line"].as_str(), Some("through-strait"));
+
+    session.write_line("exit").unwrap();
+    let exit = session
+        .wait_for_event("exit", Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(exit["code"].as_i64(), Some(0));
+
+    let status = session.wait_for_exit(Duration::from_secs(20)).unwrap();
+    assert!(status.success(), "launch command should exit successfully");
+
+    assert!(obs_path.exists(), "observation log should be written");
+    let events = observation_events(&obs_path);
+    assert!(
+        !events_of_type(&events, "container_start").is_empty(),
+        "launch passthrough should still record container_start"
+    );
+    assert!(
+        !events_of_type(&events, "container_stop").is_empty(),
+        "launch passthrough should still record container_stop"
     );
 }

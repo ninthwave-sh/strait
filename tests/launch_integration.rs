@@ -290,6 +290,15 @@ async fn launch_observe_echo_hello() {
         Some(TEST_IMAGE),
         "container_start should record the image"
     );
+    assert!(
+        starts[0]["session"]["session_id"].as_str().is_some(),
+        "container_start should include session context"
+    );
+    assert_eq!(
+        starts[0]["session"]["mode"].as_str(),
+        Some("observe"),
+        "container_start should tag the launch mode"
+    );
 
     // container_stop should have exit_code 0
     assert_eq!(
@@ -369,7 +378,7 @@ async fn launch_observe_sets_initial_terminal_size() {
             "sleep 0.5; stty size > /test-out/start.txt".to_string(),
         ],
         Some(TEST_IMAGE),
-        Some(obs_path),
+        Some(obs_path.clone()),
         None,
         Vec::new(),
         vec![],
@@ -465,7 +474,7 @@ async fn launch_warn_sets_initial_terminal_size() {
             "sleep 0.5; stty size > /test-out/start.txt".to_string(),
         ],
         Some(TEST_IMAGE),
-        Some(obs_path),
+        Some(obs_path.clone()),
         None,
         Vec::new(),
         vec![],
@@ -517,7 +526,7 @@ async fn launch_observe_forwards_terminal_resizes() {
             .to_string(),
         ],
         Some(TEST_IMAGE),
-        Some(obs_path),
+        Some(obs_path.clone()),
         None,
         Vec::new(),
         vec![],
@@ -553,6 +562,17 @@ async fn launch_observe_forwards_terminal_resizes() {
         .expect("container should record the forwarded terminal resize");
     assert_eq!(start_size.trim(), "12 34");
     assert_eq!(resized_size.trim(), "40 100");
+
+    let events = observation_events(&obs_path);
+    let resize_events = events_of_type(&events, "tty_resized");
+    assert_eq!(resize_events.len(), 1, "TTY resize should be observed once");
+    assert_eq!(resize_events[0]["rows"].as_i64(), Some(40));
+    assert_eq!(resize_events[0]["cols"].as_i64(), Some(100));
+    assert_eq!(resize_events[0]["source"].as_str(), Some("scripted"));
+    assert_eq!(
+        resize_events[0]["session"]["mode"].as_str(),
+        Some("observe")
+    );
 }
 
 /// Non-TTY launches skip terminal management even if scripted resize events exist.
@@ -720,6 +740,59 @@ async fn launch_watch_attach_returns_observation_socket() {
 
     assert_eq!(event["type"], "container_start");
     assert_eq!(event["image"].as_str(), Some(TEST_IMAGE));
+    assert_eq!(
+        event["session"]["session_id"].as_str(),
+        Some(session.session_id.as_str())
+    );
+    assert_eq!(event["session"]["mode"].as_str(), Some("observe"));
+
+    let exit_code = stop_launch_session(&session, launch_task).await;
+    assert_eq!(exit_code, 130);
+}
+
+/// Multiple observers can attach through the session API and receive the same stream.
+#[tokio::test]
+async fn launch_watch_attach_supports_multiple_consumers() {
+    use tokio::io::AsyncBufReadExt;
+
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let (_temp_dir, launch_task, session) = start_managed_observe_launch().await;
+
+    let observation = strait::launch::request_launch_watch_attach(&session.control_socket_path)
+        .await
+        .expect("watch.attach should succeed");
+
+    let first = tokio::net::UnixStream::connect(&observation.path)
+        .await
+        .expect("first observer should connect");
+    let second = tokio::net::UnixStream::connect(&observation.path)
+        .await
+        .expect("second observer should connect");
+
+    async fn read_container_start(stream: tokio::net::UnixStream) -> serde_json::Value {
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let bytes = reader.read_line(&mut line).await.unwrap();
+            assert!(bytes > 0, "observation socket should keep streaming");
+            let event: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+            if event.get("type").and_then(|value| value.as_str()) == Some("container_start") {
+                return event;
+            }
+        }
+    }
+
+    let (first_event, second_event) =
+        tokio::join!(read_container_start(first), read_container_start(second));
+    assert_eq!(first_event["type"], "container_start");
+    assert_eq!(second_event["type"], "container_start");
+    assert_eq!(first_event["session"]["session_id"], session.session_id);
+    assert_eq!(second_event["session"]["session_id"], session.session_id);
 
     let exit_code = stop_launch_session(&session, launch_task).await;
     assert_eq!(exit_code, 130);

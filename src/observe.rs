@@ -30,7 +30,7 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 4096;
 ///
 /// Bumped when the event format changes. Consumers can use this to handle
 /// backward/forward compatibility across strait versions.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Default capacity for the recent-events ring buffer used for watch catch-up.
 const DEFAULT_RING_BUFFER_CAPACITY: usize = 256;
@@ -48,6 +48,15 @@ fn default_version() -> u32 {
     1
 }
 
+/// Session metadata attached to launch-scoped observation events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObservationSessionContext {
+    /// Stable identifier for the running launch session.
+    pub session_id: String,
+    /// Active enforcement mode for the session.
+    pub mode: String,
+}
+
 /// A single observation event with a timestamp and typed payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObservationEvent {
@@ -59,6 +68,9 @@ pub struct ObservationEvent {
     pub version: u32,
     /// ISO-8601 timestamp (UTC, millisecond precision).
     pub timestamp: String,
+    /// Launch session context for live session-scoped events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<ObservationSessionContext>,
     /// The event payload.
     #[serde(flatten)]
     pub event: EventKind,
@@ -112,6 +124,23 @@ pub enum EventKind {
         /// Human-readable reason for the violation.
         reason: String,
     },
+    /// Live policy state changed through the launch control plane.
+    PolicyReloaded {
+        /// Whether the new policy was applied live.
+        applied: bool,
+        /// The control-plane action that triggered the mutation.
+        source: String,
+        /// Policy domains that still require restart-bound updates.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        restart_required_domains: Vec<String>,
+    },
+    /// Running container TTY resized through the launch control plane.
+    TtyResized {
+        rows: u16,
+        cols: u16,
+        /// Origin of the resize event.
+        source: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +158,8 @@ pub struct ObservationStream {
     file_writer: Option<Arc<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>>,
     /// Bounded ring buffer of recent events for catch-up on new connections.
     recent_events: Arc<std::sync::Mutex<VecDeque<ObservationEvent>>>,
+    /// Optional launch session metadata attached to emitted events.
+    session_context: Arc<std::sync::Mutex<Option<ObservationSessionContext>>>,
     /// Maximum number of events to keep in the ring buffer.
     ring_buffer_capacity: usize,
 }
@@ -154,7 +185,15 @@ impl ObservationStream {
             recent_events: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(
                 DEFAULT_RING_BUFFER_CAPACITY,
             ))),
+            session_context: Arc::new(std::sync::Mutex::new(None)),
             ring_buffer_capacity: DEFAULT_RING_BUFFER_CAPACITY,
+        }
+    }
+
+    /// Attach launch session metadata that will be included on emitted events.
+    pub fn set_session_context(&self, session_context: ObservationSessionContext) {
+        if let Ok(mut current) = self.session_context.lock() {
+            *current = Some(session_context);
         }
     }
 
@@ -217,6 +256,11 @@ impl ObservationStream {
         let observation = ObservationEvent {
             version: SCHEMA_VERSION,
             timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            session: self
+                .session_context
+                .lock()
+                .ok()
+                .and_then(|session| session.clone()),
             event,
         };
 
@@ -632,6 +676,7 @@ mod tests {
         let event = ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::NetworkRequest {
                 method: "GET".to_string(),
                 host: "api.github.com".to_string(),
@@ -657,6 +702,7 @@ mod tests {
         let event = ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::ContainerStart {
                 container_id: "abc123".to_string(),
                 image: "node:20-slim".to_string(),
@@ -674,6 +720,7 @@ mod tests {
         let event = ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::ContainerStop {
                 container_id: "abc123".to_string(),
                 exit_code: Some(0),
@@ -691,6 +738,7 @@ mod tests {
         let event = ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::ContainerStop {
                 container_id: "abc123".to_string(),
                 exit_code: None,
@@ -707,6 +755,7 @@ mod tests {
         let event = ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::Mount {
                 path: "/workspace".to_string(),
                 mode: "read-only".to_string(),
@@ -724,6 +773,7 @@ mod tests {
         let event = ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::FsAccess {
                 path: "/etc/passwd".to_string(),
                 operation: "read".to_string(),
@@ -741,6 +791,7 @@ mod tests {
         let event = ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::ProcExec {
                 pid: 42,
                 command: "node index.js".to_string(),
@@ -758,6 +809,7 @@ mod tests {
         let original = ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::NetworkRequest {
                 method: "POST".to_string(),
                 host: "api.example.com".to_string(),
@@ -771,6 +823,48 @@ mod tests {
         let json_str = serde_json::to_string(&original).unwrap();
         let deserialized: ObservationEvent = serde_json::from_str(&json_str).unwrap();
         assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn runtime_mutation_event_serializes_with_session_context() {
+        let event = ObservationEvent {
+            version: SCHEMA_VERSION,
+            timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: Some(ObservationSessionContext {
+                session_id: "session-123".to_string(),
+                mode: "warn".to_string(),
+            }),
+            event: EventKind::PolicyReloaded {
+                applied: true,
+                source: "reload".to_string(),
+                restart_required_domains: vec!["fs".to_string()],
+            },
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "policy_reloaded");
+        assert_eq!(json["session"]["session_id"], "session-123");
+        assert_eq!(json["session"]["mode"], "warn");
+        assert_eq!(json["source"], "reload");
+        assert_eq!(json["restart_required_domains"][0], "fs");
+    }
+
+    #[test]
+    fn session_context_defaults_to_none_when_missing_in_json() {
+        let json = r#"{
+            "version": 1,
+            "timestamp": "2026-03-27T00:00:00.000Z",
+            "type": "network_request",
+            "method": "GET",
+            "host": "api.github.com",
+            "path": "/repos",
+            "decision": "allow",
+            "latency_us": 100
+        }"#;
+
+        let event: ObservationEvent = serde_json::from_str(json).unwrap();
+        assert!(event.session.is_none());
+        assert_eq!(event.version, 1);
     }
 
     // -- Broadcast channel tests -----------------------------------------------
@@ -1282,6 +1376,7 @@ mod tests {
             ObservationEvent {
                 version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+                session: None,
                 event: EventKind::NetworkRequest {
                     method: "GET".to_string(),
                     host: "api.github.com".to_string(),
@@ -1294,6 +1389,7 @@ mod tests {
             ObservationEvent {
                 version: 1,
                 timestamp: "2026-03-27T00:00:01.000Z".to_string(),
+                session: None,
                 event: EventKind::FsAccess {
                     path: "/workspace/src".to_string(),
                     operation: "read".to_string(),
@@ -1323,6 +1419,7 @@ mod tests {
         let event = ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::ProcExec {
                 pid: 42,
                 command: "node index.js".to_string(),
@@ -1386,6 +1483,7 @@ mod tests {
         let event = ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::ContainerStart {
                 container_id: "c1".to_string(),
                 image: "alpine".to_string(),
@@ -1422,6 +1520,7 @@ mod tests {
             let event = ObservationEvent {
                 version: SCHEMA_VERSION,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+                session: None,
                 event: EventKind::NetworkRequest {
                     method: "GET".to_string(),
                     host: "api.github.com".to_string(),

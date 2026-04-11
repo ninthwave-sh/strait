@@ -329,7 +329,9 @@ fn evaluate_event(
         // Container lifecycle and policy violation events cannot be evaluated against a Cedar policy.
         EventKind::ContainerStart { .. }
         | EventKind::ContainerStop { .. }
-        | EventKind::PolicyViolation { .. } => EventEvaluation::Skip,
+        | EventKind::PolicyViolation { .. }
+        | EventKind::PolicyReloaded { .. }
+        | EventKind::TtyResized { .. } => EventEvaluation::Skip,
     }
 }
 
@@ -409,6 +411,23 @@ fn format_event_summary(event: &ObservationEvent) -> String {
         } => {
             format!("policy:{decision} {action} {resource}")
         }
+        EventKind::PolicyReloaded {
+            applied,
+            source,
+            restart_required_domains,
+        } => {
+            if restart_required_domains.is_empty() {
+                format!("policy reload {source} (applied: {applied})")
+            } else {
+                format!(
+                    "policy reload {source} (applied: {applied}, restart: {})",
+                    restart_required_domains.join(",")
+                )
+            }
+        }
+        EventKind::TtyResized { rows, cols, source } => {
+            format!("tty resize {cols}x{rows} ({source})")
+        }
     }
 }
 
@@ -451,6 +470,7 @@ mod tests {
         ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::NetworkRequest {
                 method: method.to_string(),
                 host: host.to_string(),
@@ -591,6 +611,7 @@ permit(
             ObservationEvent {
                 version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+                session: None,
                 event: EventKind::ContainerStart {
                     container_id: "abc123".to_string(),
                     image: "node:20-slim".to_string(),
@@ -599,6 +620,7 @@ permit(
             ObservationEvent {
                 version: 1,
                 timestamp: "2026-03-27T00:00:01.000Z".to_string(),
+                session: None,
                 event: EventKind::ContainerStop {
                     container_id: "abc123".to_string(),
                     exit_code: Some(0),
@@ -755,6 +777,7 @@ permit(
         let events = vec![ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::FsAccess {
                 path: "/workspace/src/main.rs".to_string(),
                 operation: "read".to_string(),
@@ -785,6 +808,7 @@ permit(
         let events = vec![ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::ProcExec {
                 pid: 42,
                 command: "node index.js".to_string(),
@@ -815,6 +839,7 @@ permit(
         let events = vec![ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::Mount {
                 path: "/workspace".to_string(),
                 mode: "read-only".to_string(),
@@ -1016,6 +1041,7 @@ permit(
             ObservationEvent {
                 version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+                session: None,
                 event: EventKind::FsAccess {
                     path: "/workspace/secret/keys".to_string(),
                     operation: "read".to_string(),
@@ -1024,6 +1050,7 @@ permit(
             ObservationEvent {
                 version: 1,
                 timestamp: "2026-03-27T00:00:01.000Z".to_string(),
+                session: None,
                 event: EventKind::FsAccess {
                     path: "/workspace/src/main.rs".to_string(),
                     operation: "read".to_string(),
@@ -1064,6 +1091,7 @@ permit(
             ObservationEvent {
                 version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+                session: None,
                 event: EventKind::ProcExec {
                     pid: 1,
                     command: "node index.js".to_string(),
@@ -1072,6 +1100,7 @@ permit(
             ObservationEvent {
                 version: 1,
                 timestamp: "2026-03-27T00:00:01.000Z".to_string(),
+                session: None,
                 event: EventKind::ProcExec {
                     pid: 2,
                     command: "rm -rf /".to_string(),

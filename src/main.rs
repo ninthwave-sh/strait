@@ -108,13 +108,15 @@ TLS TRUST:
 
     /// Watch live observation events from a running strait session.
     ///
-    /// Connects to the Unix socket observation server and renders a colored
-    /// real-time stream of agent activity. Auto-reconnects if the socket
-    /// disconnects. Exits cleanly on Ctrl+C.
+    /// Connects to the live stream for the newest published launch session
+    /// and renders a colored real-time stream of agent activity. Falls back
+    /// to legacy socket discovery when no session is published. Auto-reconnects
+    /// if the stream disconnects. Exits cleanly on Ctrl+C.
     Watch {
         /// Path to the observation Unix socket.
         ///
-        /// If omitted, auto-discovers by looking for /tmp/strait-*.sock.
+        /// If omitted, auto-discovers the newest published launch session and
+        /// falls back to legacy `/tmp/strait-*.sock` discovery.
         #[arg(short, long, value_name = "PATH")]
         socket: Option<PathBuf>,
     },

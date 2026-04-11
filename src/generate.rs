@@ -247,7 +247,9 @@ fn event_to_action_resource(event: &EventKind) -> Option<(String, String)> {
         // Container lifecycle and policy violation events don't map to Cedar actions.
         EventKind::ContainerStart { .. }
         | EventKind::ContainerStop { .. }
-        | EventKind::PolicyViolation { .. } => None,
+        | EventKind::PolicyViolation { .. }
+        | EventKind::PolicyReloaded { .. }
+        | EventKind::TtyResized { .. } => None,
     }
 }
 
@@ -454,6 +456,7 @@ mod tests {
         ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::NetworkRequest {
                 method: method.to_string(),
                 host: host.to_string(),
@@ -469,6 +472,7 @@ mod tests {
         ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::FsAccess {
                 path: path.to_string(),
                 operation: operation.to_string(),
@@ -736,6 +740,7 @@ mod tests {
             ObservationEvent {
                 version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+                session: None,
                 event: EventKind::ContainerStart {
                     container_id: "abc123".to_string(),
                     image: "node:20".to_string(),
@@ -744,6 +749,7 @@ mod tests {
             ObservationEvent {
                 version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+                session: None,
                 event: EventKind::ContainerStop {
                     container_id: "abc123".to_string(),
                     exit_code: Some(0),
@@ -765,6 +771,7 @@ mod tests {
         let events = vec![ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::ProcExec {
                 pid: 42,
                 command: "node index.js".to_string(),
@@ -875,6 +882,7 @@ mod tests {
         ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
+            session: None,
             event: EventKind::NetworkRequest {
                 method: method.to_string(),
                 host: host.to_string(),

@@ -1,8 +1,8 @@
 //! Real-time colored viewer for observation events.
 //!
-//! Connects to the Unix socket observation server started by `strait proxy`
+//! Connects to the live observation stream for a running strait launch session
 //! and renders a colored stream of agent activity. Auto-reconnects if the
-//! socket disconnects. Exits cleanly on Ctrl+C.
+//! stream disconnects. Exits cleanly on Ctrl+C.
 //!
 //! Color scheme:
 //! - **Green** — allowed actions
@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::launch::{list_launch_sessions, request_launch_watch_attach, LaunchSessionMetadata};
 use crate::observe::{EventKind, ObservationEvent};
 
 // ---------------------------------------------------------------------------
@@ -77,7 +78,9 @@ pub fn classify_event(event: &EventKind) -> EventColor {
         },
         EventKind::ContainerStart { .. }
         | EventKind::ContainerStop { .. }
-        | EventKind::Mount { .. } => EventColor::Lifecycle,
+        | EventKind::Mount { .. }
+        | EventKind::PolicyReloaded { .. }
+        | EventKind::TtyResized { .. } => EventColor::Lifecycle,
         EventKind::FsAccess { .. } | EventKind::ProcExec { .. } => EventColor::Passthrough,
         EventKind::PolicyViolation { decision, .. } => match decision.as_str() {
             "deny" => EventColor::Deny,
@@ -192,6 +195,31 @@ fn format_event_parts(event: &EventKind) -> (String, String, String) {
             let detail = format!("{decision}: {reason}");
             (format!("policy:{action}"), resource.clone(), detail)
         }
+        EventKind::PolicyReloaded {
+            applied,
+            source,
+            restart_required_domains,
+        } => {
+            let detail = if restart_required_domains.is_empty() {
+                if *applied {
+                    "applied".to_string()
+                } else {
+                    "restart required".to_string()
+                }
+            } else {
+                format!(
+                    "{}; restart {}",
+                    if *applied { "applied" } else { "not applied" },
+                    restart_required_domains.join(",")
+                )
+            };
+            ("policy:reload".to_string(), source.clone(), detail)
+        }
+        EventKind::TtyResized { rows, cols, source } => (
+            "tty:resize".to_string(),
+            format!("{cols}x{rows}"),
+            source.clone(),
+        ),
     }
 }
 
@@ -232,11 +260,8 @@ pub fn format_event(event: &ObservationEvent, max_width: usize) -> String {
 
 /// Discover an active observation socket.
 ///
-/// Searches the active Strait runtime directory first, then legacy fallback
-/// locations for older sessions.
-///
-/// Returns the newest `strait-*.sock` match by modification time across
-/// all candidate directories.
+/// Prefers the newest published launch session via `watch.attach`, then
+/// falls back to legacy ad hoc socket discovery for older runtimes.
 pub fn discover_socket() -> Option<PathBuf> {
     let mut candidates = vec![crate::observe::runtime_dir()];
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
@@ -244,6 +269,34 @@ pub fn discover_socket() -> Option<PathBuf> {
     }
     candidates.push(PathBuf::from("/tmp"));
     discover_socket_in_dirs(&candidates)
+}
+
+fn session_modified_time(session: &LaunchSessionMetadata) -> Option<std::time::SystemTime> {
+    std::fs::metadata(&session.control_socket_path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+}
+
+fn newest_launch_session(
+    sessions: impl IntoIterator<Item = LaunchSessionMetadata>,
+) -> Option<LaunchSessionMetadata> {
+    sessions.into_iter().max_by(|left, right| {
+        session_modified_time(left)
+            .cmp(&session_modified_time(right))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    })
+}
+
+async fn discover_session_socket() -> Option<PathBuf> {
+    let session = newest_launch_session(list_launch_sessions().ok()?)?;
+    let observation = request_launch_watch_attach(&session.control_socket_path)
+        .await
+        .ok()?;
+    if observation.transport == "unix_socket" {
+        Some(observation.path)
+    } else {
+        None
+    }
 }
 
 /// Discover the newest observation socket across multiple directories.
@@ -349,6 +402,9 @@ async fn resolve_socket(explicit_path: &Option<PathBuf>) -> PathBuf {
             p.clone()
         }
         None => loop {
+            if let Some(p) = discover_session_socket().await {
+                break p;
+            }
             if let Some(p) = discover_socket() {
                 break p;
             }
@@ -397,6 +453,7 @@ mod tests {
         ObservationEvent {
             version: 1,
             timestamp: "2026-03-27T14:32:01.000Z".to_string(),
+            session: None,
             event,
         }
     }
@@ -514,6 +571,16 @@ mod tests {
         let event = EventKind::Mount {
             path: "/workspace".into(),
             mode: "read-only".into(),
+        };
+        assert_eq!(classify_event(&event), EventColor::Lifecycle);
+    }
+
+    #[test]
+    fn policy_reload_classified_lifecycle() {
+        let event = EventKind::PolicyReloaded {
+            applied: true,
+            source: "reload".into(),
+            restart_required_domains: Vec::new(),
         };
         assert_eq!(classify_event(&event), EventColor::Lifecycle);
     }
@@ -685,6 +752,20 @@ mod tests {
         assert!(output.contains("mount"));
         assert!(output.contains("/workspace"));
         assert!(output.contains("read-only"));
+    }
+
+    #[test]
+    fn format_tty_resize_colored_cyan() {
+        let event = make_event(EventKind::TtyResized {
+            rows: 40,
+            cols: 100,
+            source: "scripted".into(),
+        });
+        let output = format_event(&event, 120);
+        assert!(output.contains(CYAN));
+        assert!(output.contains("tty:resize"));
+        assert!(output.contains("100x40"));
+        assert!(output.contains("scripted"));
     }
 
     // -- Event formatting: passthrough (dim) ----------------------------------

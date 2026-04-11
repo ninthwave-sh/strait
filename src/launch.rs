@@ -57,7 +57,7 @@ use crate::config::{
 use crate::container::{ContainerManager, ContainerPermission, ContainerPolicy};
 use crate::credentials::CredentialStore;
 use crate::mitm::handle_connection;
-use crate::observe::{EventKind, ObservationStream};
+use crate::observe::{EventKind, ObservationSessionContext, ObservationStream};
 use crate::policy::{extract_fs_permissions, extract_proc_permissions, PolicyEngine};
 
 /// Enforcement mode for the launch orchestrator.
@@ -624,9 +624,12 @@ async fn handle_launch_control_client(
                 LaunchControlResponse::success(LaunchControlResult::SessionStop { accepted: true })
             }
             Ok(ControlMethod::PolicyReload) => {
-                let proxy_ctx = proxy_ctx.clone();
-                match tokio::task::spawn_blocking(move || reload_policy(proxy_ctx.as_ref())).await {
+                let reload_ctx = proxy_ctx.clone();
+                let obs_ctx = proxy_ctx.clone();
+                match tokio::task::spawn_blocking(move || reload_policy(reload_ctx.as_ref())).await
+                {
                     Ok(Ok(outcome)) => {
+                        emit_policy_reload_event(obs_ctx.as_ref(), "reload", &outcome);
                         LaunchControlResponse::success(LaunchControlResult::PolicyReload {
                             update: outcome.into(),
                         })
@@ -642,13 +645,15 @@ async fn handle_launch_control_client(
             }
             Ok(ControlMethod::PolicyReplace) => match request.policy {
                 Some(policy) => {
-                    let proxy_ctx = proxy_ctx.clone();
+                    let replace_ctx = proxy_ctx.clone();
+                    let obs_ctx = proxy_ctx.clone();
                     match tokio::task::spawn_blocking(move || {
-                        replace_policy(proxy_ctx.as_ref(), policy)
+                        replace_policy(replace_ctx.as_ref(), policy)
                     })
                     .await
                     {
                         Ok(Ok(outcome)) => {
+                            emit_policy_reload_event(obs_ctx.as_ref(), "replace", &outcome);
                             LaunchControlResponse::success(LaunchControlResult::PolicyReplace {
                                 update: outcome.into(),
                             })
@@ -786,6 +791,28 @@ fn launch_session_output_lines(metadata: &LaunchSessionMetadata) -> Vec<String> 
     ]
 }
 
+fn emit_policy_reload_event(
+    proxy_ctx: &ProxyContext,
+    source: &str,
+    outcome: &PolicyMutationOutcome,
+) {
+    if let Some(obs_stream) = proxy_ctx.observation_stream.as_ref() {
+        obs_stream.emit(EventKind::PolicyReloaded {
+            applied: outcome.applied,
+            source: source.to_string(),
+            restart_required_domains: outcome.restart_required_domains.clone(),
+        });
+    }
+}
+
+fn emit_tty_resized_event(obs_stream: &ObservationStream, size: TerminalSize, source: &str) {
+    obs_stream.emit(EventKind::TtyResized {
+        rows: size.rows,
+        cols: size.cols,
+        source: source.to_string(),
+    });
+}
+
 #[cfg(unix)]
 struct LaunchSession {
     metadata: Arc<RwLock<LaunchSessionMetadata>>,
@@ -884,6 +911,11 @@ impl LaunchSession {
 
     async fn publish(&self, obs_stream: &ObservationStream) -> anyhow::Result<()> {
         let observation_socket_path = self.observation_socket_path().await;
+        let metadata = self.metadata().await;
+        obs_stream.set_session_context(ObservationSessionContext {
+            session_id: metadata.session_id.clone(),
+            mode: metadata.mode.clone(),
+        });
         obs_stream
             .start_socket_server_at(&observation_socket_path)
             .await
@@ -893,7 +925,6 @@ impl LaunchSession {
                     observation_socket_path.display()
                 )
             })?;
-        let metadata = self.metadata().await;
         write_launch_session_metadata(&self.metadata_path, &metadata)
     }
 
@@ -1416,6 +1447,7 @@ async fn run_launch_observe_with_terminal_mode(
         container_name.clone(),
         terminal.initial_size,
         terminal.resize_source.clone(),
+        obs_stream.clone(),
     ));
     let session_stop = async {
         #[cfg(unix)]
@@ -1758,6 +1790,7 @@ async fn run_launch_with_policy_with_terminal_mode(
         container_name.clone(),
         terminal.initial_size,
         terminal.resize_source.clone(),
+        obs_stream.clone(),
     ));
     let session_stop = async {
         #[cfg(unix)]
@@ -2060,6 +2093,7 @@ async fn attach_and_wait(
     container_name: String,
     initial_tty_size: Option<TerminalSize>,
     resize_source: TerminalResizeSource,
+    obs_stream: ObservationStream,
 ) -> anyhow::Result<i32> {
     use bollard::container::{AttachContainerOptions, StartContainerOptions};
 
@@ -2130,9 +2164,13 @@ async fn attach_and_wait(
         }
     }));
 
-    let mut resize_task =
-        spawn_resize_forwarder(docker.clone(), container_name.clone(), resize_source)
-            .map(AbortOnDropTask::new);
+    let mut resize_task = spawn_resize_forwarder(
+        docker.clone(),
+        container_name.clone(),
+        resize_source,
+        obs_stream,
+    )
+    .map(AbortOnDropTask::new);
 
     // Wait for the output stream to close (container has exited)
     let _ = output_task.join().await;
@@ -2339,6 +2377,7 @@ fn spawn_resize_forwarder(
     docker: bollard::Docker,
     container_name: String,
     resize_source: TerminalResizeSource,
+    obs_stream: ObservationStream,
 ) -> Option<tokio::task::JoinHandle<()>> {
     match resize_source {
         TerminalResizeSource::Disabled => None,
@@ -2357,12 +2396,14 @@ fn spawn_resize_forwarder(
                 if let Some(size) = current_terminal_size() {
                     if let Err(e) = resize_container_tty(&docker, &container_name, size).await {
                         warn!(error = %e, "failed to forward terminal resize");
+                    } else {
+                        emit_tty_resized_event(&obs_stream, size, "signal");
                     }
                 }
             }
         })),
         TerminalResizeSource::Scripted(events) => Some(tokio::spawn(async move {
-            forward_scripted_terminal_resizes(docker, container_name, events).await;
+            forward_scripted_terminal_resizes(docker, container_name, events, obs_stream).await;
         })),
     }
 }
@@ -2372,6 +2413,7 @@ fn spawn_resize_forwarder(
     _docker: bollard::Docker,
     _container_name: String,
     _resize_source: TerminalResizeSource,
+    _obs_stream: ObservationStream,
 ) -> Option<tokio::task::JoinHandle<()>> {
     None
 }
@@ -2380,12 +2422,15 @@ async fn forward_scripted_terminal_resizes(
     docker: bollard::Docker,
     container_name: String,
     events: Vec<ScriptedTerminalResize>,
+    obs_stream: ObservationStream,
 ) {
     for event in events {
         tokio::time::sleep(event.after).await;
         if let Err(e) = resize_container_tty(&docker, &container_name, event.size).await {
             warn!(error = %e, "failed to forward scripted terminal resize");
             break;
+        } else {
+            emit_tty_resized_event(&obs_stream, event.size, "scripted");
         }
     }
 }
@@ -3772,6 +3817,97 @@ permit(
             !fs_decision.allowed,
             "restart-required reload should leave the previous policy active"
         );
+
+        drop(session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_control_policy_reload_emits_session_tagged_observation_event() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let policy_path = registry_root.path().join("policy.cedar");
+        std::fs::write(
+            &policy_path,
+            r#"
+permit(
+    principal == Agent::"agent",
+    action == Action::"http:GET",
+    resource
+);
+"#,
+        )
+        .unwrap();
+        let engine = PolicyEngine::load(&policy_path, None).unwrap();
+        let obs_stream = ObservationStream::new();
+        let proxy_ctx = Arc::new(
+            build_launch_proxy_context(
+                SessionCa::generate().unwrap(),
+                Some(engine),
+                Some(PolicyConfig {
+                    file: Some(policy_path.clone()),
+                    git_url: None,
+                    git_path: None,
+                    schema: None,
+                    poll_interval_secs: None,
+                }),
+                obs_stream.clone(),
+                true,
+                None,
+                Vec::new(),
+                Some(LivePolicyBounds {
+                    fs_candidate_paths: vec!["/workspace".to_string()],
+                    agent_id: "agent".to_string(),
+                }),
+            )
+            .unwrap(),
+        );
+        let (session, _stop_rx) = LaunchSession::create_in(
+            registry_root.path(),
+            "test-session",
+            EnforcementMode::Warn,
+            proxy_ctx.clone(),
+        )
+        .await
+        .unwrap();
+        session.publish(&obs_stream).await.unwrap();
+
+        std::fs::write(
+            &policy_path,
+            r#"
+forbid(principal, action, resource);
+"#,
+        )
+        .unwrap();
+
+        let control_socket = session.control_socket_path().await;
+        let update = request_launch_policy_reload(&control_socket).await.unwrap();
+        assert!(update.applied, "network-only reload should apply live");
+
+        let events = obs_stream.recent_events();
+        let runtime_event = events
+            .into_iter()
+            .find(|event| matches!(event.event, EventKind::PolicyReloaded { .. }))
+            .expect("policy.reload should emit an observation event");
+
+        assert_eq!(
+            runtime_event.session,
+            Some(ObservationSessionContext {
+                session_id: "test-session".to_string(),
+                mode: "warn".to_string(),
+            })
+        );
+        match runtime_event.event {
+            EventKind::PolicyReloaded {
+                applied,
+                source,
+                restart_required_domains,
+            } => {
+                assert!(applied);
+                assert_eq!(source, "reload");
+                assert!(restart_required_domains.is_empty());
+            }
+            other => panic!("unexpected runtime event: {other:?}"),
+        }
 
         drop(session);
     }

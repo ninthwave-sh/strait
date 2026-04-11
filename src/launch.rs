@@ -563,34 +563,22 @@ async fn run_launch_observe_with_terminal_mode(
     // 8. Attach to container, start it, pipe I/O, and wait for exit
     let container_name = container_mgr.container_name().unwrap().to_string();
 
-    let exit_code = {
-        let run_future = attach_and_wait(
-            container_mgr.docker(),
-            &container_name,
-            terminal.initial_size,
-            terminal.resize_source.clone(),
-        );
-        let ctrl_c = tokio::signal::ctrl_c();
-        let sigterm = sigterm_signal();
-
-        tokio::select! {
-            result = run_future => {
-                result?
-            }
-            _ = ctrl_c => {
-                // In raw terminal mode, Ctrl+C goes to the container (byte 0x03).
-                // This branch handles the non-TTY case (piped stdin).
-                eprintln!("\nInterrupted — cleaning up...");
-                container_mgr.stop_container().await.ok();
-                130 // Standard exit code for SIGINT
-            }
-            _ = sigterm => {
-                eprintln!("\nTerminated — cleaning up...");
-                container_mgr.stop_container().await.ok();
-                143 // Standard exit code for SIGTERM (128 + 15)
-            }
-        }
-    };
+    let (run_future, abort_handle) = futures_util::future::abortable(attach_and_wait(
+        container_mgr.docker().clone(),
+        container_name.clone(),
+        terminal.initial_size,
+        terminal.resize_source.clone(),
+    ));
+    let exit_code = wait_for_launch_completion(
+        run_future,
+        abort_handle,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+        sigterm_signal(),
+        Some(&mut container_mgr),
+    )
+    .await?;
 
     // 9. Emit container stop observation event
     obs_stream.emit(EventKind::ContainerStop {
@@ -876,32 +864,22 @@ async fn run_launch_with_policy_with_terminal_mode(
     // 10. Attach to container, start it, pipe I/O, and wait for exit
     let container_name = container_mgr.container_name().unwrap().to_string();
 
-    let exit_code = {
-        let run_future = attach_and_wait(
-            container_mgr.docker(),
-            &container_name,
-            terminal.initial_size,
-            terminal.resize_source.clone(),
-        );
-        let ctrl_c = tokio::signal::ctrl_c();
-        let sigterm = sigterm_signal();
-
-        tokio::select! {
-            result = run_future => {
-                result?
-            }
-            _ = ctrl_c => {
-                eprintln!("\nInterrupted — cleaning up...");
-                container_mgr.stop_container().await.ok();
-                130
-            }
-            _ = sigterm => {
-                eprintln!("\nTerminated — cleaning up...");
-                container_mgr.stop_container().await.ok();
-                143 // Standard exit code for SIGTERM (128 + 15)
-            }
-        }
-    };
+    let (run_future, abort_handle) = futures_util::future::abortable(attach_and_wait(
+        container_mgr.docker().clone(),
+        container_name.clone(),
+        terminal.initial_size,
+        terminal.resize_source.clone(),
+    ));
+    let exit_code = wait_for_launch_completion(
+        run_future,
+        abort_handle,
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+        },
+        sigterm_signal(),
+        Some(&mut container_mgr),
+    )
+    .await?;
 
     // 11. Emit container stop observation event
     obs_stream.emit(EventKind::ContainerStop {
@@ -1085,6 +1063,51 @@ async fn sigterm_signal() {
     std::future::pending::<()>().await;
 }
 
+async fn wait_for_launch_completion<Run, CtrlC, Sigterm>(
+    run_future: Run,
+    abort_handle: futures_util::future::AbortHandle,
+    ctrl_c: CtrlC,
+    sigterm: Sigterm,
+    container_mgr: Option<&mut ContainerManager>,
+) -> anyhow::Result<i32>
+where
+    Run: std::future::Future<Output = Result<anyhow::Result<i32>, futures_util::future::Aborted>>,
+    CtrlC: std::future::Future<Output = ()>,
+    Sigterm: std::future::Future<Output = ()>,
+{
+    tokio::pin!(run_future);
+    tokio::pin!(ctrl_c);
+    tokio::pin!(sigterm);
+    let mut container_mgr = container_mgr;
+
+    tokio::select! {
+        result = &mut run_future => {
+            match result {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!("attach task aborted")),
+            }
+        }
+        _ = &mut ctrl_c => {
+            eprintln!("\nInterrupted — cleaning up...");
+            abort_handle.abort();
+            let _ = (&mut run_future).await;
+            if let Some(container_mgr) = container_mgr.as_mut() {
+                (*container_mgr).stop_container().await.ok();
+            }
+            Ok(130)
+        }
+        _ = &mut sigterm => {
+            eprintln!("\nTerminated — cleaning up...");
+            abort_handle.abort();
+            let _ = (&mut run_future).await;
+            if let Some(container_mgr) = container_mgr.as_mut() {
+                (*container_mgr).stop_container().await.ok();
+            }
+            Ok(143)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Container attach and TTY passthrough
 // ---------------------------------------------------------------------------
@@ -1094,13 +1117,12 @@ async fn sigterm_signal() {
 /// The attach is created before starting the container to avoid missing
 /// early output. Returns the container's exit code.
 async fn attach_and_wait(
-    docker: &bollard::Docker,
-    container_name: &str,
+    docker: bollard::Docker,
+    container_name: String,
     initial_tty_size: Option<TerminalSize>,
     resize_source: TerminalResizeSource,
 ) -> anyhow::Result<i32> {
     use bollard::container::{AttachContainerOptions, StartContainerOptions};
-    use tokio::task::JoinHandle;
 
     // Attach before starting to not miss any output
     let attach_options = AttachContainerOptions::<String> {
@@ -1112,23 +1134,23 @@ async fn attach_and_wait(
     };
 
     let attach = docker
-        .attach_container(container_name, Some(attach_options))
+        .attach_container(&container_name, Some(attach_options))
         .await
         .context("failed to attach to container")?;
 
     // Start the container
     docker
-        .start_container(container_name, None::<StartContainerOptions<String>>)
+        .start_container(&container_name, None::<StartContainerOptions<String>>)
         .await
         .context("failed to start container")?;
 
-    info!(container_name = container_name, "container started");
+    info!(container_name = %container_name, "container started");
 
     if let Some(size) = initial_tty_size {
-        if let Err(error) = resize_container_tty(docker, container_name, size).await {
+        if let Err(error) = resize_container_tty(&docker, &container_name, size).await {
             warn!(
                 error = %error,
-                container_name = container_name,
+                container_name = %container_name,
                 "failed to apply initial container TTY size after start; continuing"
             );
         }
@@ -1137,7 +1159,7 @@ async fn attach_and_wait(
     // Pipe container output to host stdout.
     // When the container exits, the output stream closes.
     let mut output = attach.output;
-    let output_task = tokio::spawn(async move {
+    let output_task = AbortOnDropTask::new(tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         while let Some(Ok(chunk)) = output.next().await {
             let bytes = chunk.into_bytes();
@@ -1146,11 +1168,11 @@ async fn attach_and_wait(
             }
             let _ = stdout.flush().await;
         }
-    });
+    }));
 
     // Pipe host stdin to container stdin
     let mut input = attach.input;
-    let input_task = tokio::spawn(async move {
+    let mut input_task = AbortOnDropTask::new(tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 4096];
         loop {
@@ -1167,15 +1189,16 @@ async fn attach_and_wait(
                 Err(_) => break,
             }
         }
-    });
+    }));
 
-    let resize_task: Option<JoinHandle<()>> =
-        spawn_resize_forwarder(docker.clone(), container_name.to_string(), resize_source);
+    let mut resize_task =
+        spawn_resize_forwarder(docker.clone(), container_name.clone(), resize_source)
+            .map(AbortOnDropTask::new);
 
     // Wait for the output stream to close (container has exited)
-    let _ = output_task.await;
+    let _ = output_task.join().await;
     input_task.abort();
-    if let Some(task) = resize_task {
+    if let Some(task) = resize_task.as_mut() {
         task.abort();
     }
 
@@ -1183,7 +1206,7 @@ async fn attach_and_wait(
     // with auto_remove=false so it still exists after exit. This avoids a
     // Docker API quirk where wait_container returns status_code=0 for TTY
     // containers regardless of the actual exit code.
-    let exit_code = match docker.inspect_container(container_name, None).await {
+    let exit_code = match docker.inspect_container(&container_name, None).await {
         Ok(info) => info
             .state
             .and_then(|s| s.exit_code)
@@ -1207,6 +1230,35 @@ struct TerminalSession {
     resize_source: TerminalResizeSource,
     #[cfg(unix)]
     _guard: Option<CleanupGuard>,
+}
+
+struct AbortOnDropTask<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortOnDropTask<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn abort(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+        }
+    }
+
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        let handle = self.handle.take().expect("task handle should exist");
+        handle.await
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        self.abort();
+    }
 }
 
 impl Default for TerminalSession {
@@ -1582,6 +1634,80 @@ mod tests {
             cleaned.load(Ordering::SeqCst),
             "cleanup guard should run its callback on drop"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_launch_completion_aborts_task_on_ctrl_c() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let task_dropped = Arc::new(AtomicBool::new(false));
+        let (run_future, abort_handle) = {
+            let task_dropped = Arc::clone(&task_dropped);
+            futures_util::future::abortable(async move {
+                let _flag = DropFlag(task_dropped);
+                std::future::pending::<()>().await;
+                Ok::<i32, anyhow::Error>(0)
+            })
+        };
+
+        let exit_code = wait_for_launch_completion(
+            run_future,
+            abort_handle,
+            std::future::ready(()),
+            std::future::pending::<()>(),
+            None,
+        )
+        .await
+        .expect("ctrl-c branch should return an exit code");
+
+        tokio::task::yield_now().await;
+        assert_eq!(exit_code, 130);
+        assert!(task_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn wait_for_launch_completion_aborts_task_on_sigterm() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let task_dropped = Arc::new(AtomicBool::new(false));
+        let (run_future, abort_handle) = {
+            let task_dropped = Arc::clone(&task_dropped);
+            futures_util::future::abortable(async move {
+                let _flag = DropFlag(task_dropped);
+                std::future::pending::<()>().await;
+                Ok::<i32, anyhow::Error>(0)
+            })
+        };
+
+        let exit_code = wait_for_launch_completion(
+            run_future,
+            abort_handle,
+            std::future::pending::<()>(),
+            std::future::ready(()),
+            None,
+        )
+        .await
+        .expect("sigterm branch should return an exit code");
+
+        tokio::task::yield_now().await;
+        assert_eq!(exit_code, 143);
+        assert!(task_dropped.load(Ordering::SeqCst));
     }
 
     // -- ProxyContext builder tests -------------------------------------------

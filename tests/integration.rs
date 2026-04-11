@@ -679,6 +679,7 @@ fn build_sigv4_proxy_context(
         enforcement_mode: "observe".to_string(),
         mitm_all: false,
         warn_only: false,
+        live_policy_bounds: None,
         upstream_addr_override: Some(echo_addr),
         upstream_tls_override: Some(tls_config),
         upstream_connect_timeout: Duration::from_secs(30),
@@ -1457,6 +1458,104 @@ async fn keepalive_deny_mid_loop_continues() {
         .await
         .unwrap();
     let _ = read_http_response(&mut reader).await;
+}
+
+/// Live policy replacement updates subsequent requests without dropping the
+/// existing keep-alive session.
+#[tokio::test]
+async fn keepalive_live_policy_replace_affects_subsequent_requests() {
+    let (echo_addr, _pem, _der) = start_keepalive_echo_server().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let policy_path = dir.path().join("policy.cedar");
+    std::fs::write(&policy_path, "permit(principal, action, resource);").unwrap();
+
+    let mut ctx = strait_test_helpers::build_production_mitm_context(
+        echo_addr,
+        "api.github.com",
+        std::time::Duration::from_secs(5),
+    );
+    ctx.enforcement_mode = "enforce".to_string();
+    ctx.policy_config = Some(strait::config::PolicyConfig {
+        file: Some(policy_path),
+        git_url: None,
+        git_path: None,
+        schema: None,
+        poll_interval_secs: None,
+    });
+    ctx.policy_engine = Some(arc_swap::ArcSwap::from_pointee(
+        strait::policy::PolicyEngine::load(
+            ctx.policy_config
+                .as_ref()
+                .and_then(|config| config.file.as_deref())
+                .unwrap(),
+            None,
+        )
+        .unwrap(),
+    ));
+
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+
+    let ctx = Arc::new(ctx);
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        let (client, peer) = proxy_listener.accept().await.unwrap();
+        let _ = strait::mitm::handle_connection(client, peer, &ctx_clone).await;
+    });
+
+    let tls = connect_through_mitm(proxy_addr, &ca_pem, "api.github.com").await;
+    let (read_half, mut write_half) = tokio::io::split(tls);
+    let mut reader = BufReader::new(read_half);
+
+    write_half
+        .write_all(b"GET /before-reload HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+        .await
+        .unwrap();
+    let response1 = read_http_response(&mut reader).await;
+    assert!(
+        response1.contains("200 OK"),
+        "initial request should use the original policy: {response1}"
+    );
+
+    let outcome = strait::config::replace_policy(
+        ctx.as_ref(),
+        r#"
+@id("allow-all")
+permit(principal, action, resource);
+
+@id("deny-after-replace")
+forbid(principal, action, resource)
+when { context.path == "/after-reload" };
+"#,
+    )
+    .unwrap();
+    assert!(outcome.applied, "network-only replace should apply live");
+
+    write_half
+        .write_all(b"GET /after-reload HTTP/1.1\r\nHost: api.github.com\r\n\r\n")
+        .await
+        .unwrap();
+    let response2 = read_http_response(&mut reader).await;
+    assert!(
+        response2.contains("403 Forbidden"),
+        "subsequent request should observe the updated policy: {response2}"
+    );
+    assert!(
+        !response2.contains("Connection: close"),
+        "policy deny should keep the session alive: {response2}"
+    );
+
+    write_half
+        .write_all(b"GET /still-open HTTP/1.1\r\nHost: api.github.com\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let response3 = read_http_response(&mut reader).await;
+    assert!(
+        response3.contains("200 OK"),
+        "keep-alive session should continue after the live update: {response3}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2444,6 +2543,7 @@ fn build_test_proxy_context() -> strait::config::ProxyContext {
         enforcement_mode: "observe".to_string(),
         mitm_all: false,
         warn_only: false,
+        live_policy_bounds: None,
         upstream_addr_override: None,
         upstream_tls_override: None,
         upstream_connect_timeout: std::time::Duration::from_secs(30),
@@ -3202,6 +3302,7 @@ async fn upstream_connect_timeout_returns_504() {
         enforcement_mode: "observe".to_string(),
         mitm_all: false,
         warn_only: false,
+        live_policy_bounds: None,
         upstream_addr_override: Some(stalled_addr),
         upstream_tls_override: Some(tls_config),
         // Very short timeout so the test completes quickly
@@ -3273,6 +3374,7 @@ async fn upstream_response_timeout_returns_504() {
         enforcement_mode: "observe".to_string(),
         mitm_all: false,
         warn_only: false,
+        live_policy_bounds: None,
         upstream_addr_override: Some(stalled_addr),
         upstream_tls_override: Some(tls_config),
         upstream_connect_timeout: std::time::Duration::from_secs(30),
@@ -3344,6 +3446,7 @@ async fn normal_upstream_succeeds_with_timeouts_configured() {
         enforcement_mode: "observe".to_string(),
         mitm_all: false,
         warn_only: false,
+        live_policy_bounds: None,
         upstream_addr_override: Some(echo_addr),
         upstream_tls_override: Some(tls_config),
         upstream_connect_timeout: std::time::Duration::from_secs(5),
@@ -3445,6 +3548,7 @@ mod strait_test_helpers {
             enforcement_mode: "observe".to_string(),
             mitm_all: false,
             warn_only: false,
+            live_policy_bounds: None,
             upstream_addr_override: Some(echo_addr),
             upstream_tls_override: Some(tls_config),
             upstream_connect_timeout: std::time::Duration::from_secs(30),
@@ -3507,6 +3611,7 @@ when {{ context.path == "{deny_path}" }};
             enforcement_mode: "enforce".to_string(),
             mitm_all: false,
             warn_only: false,
+            live_policy_bounds: None,
             upstream_addr_override: Some(echo_addr),
             upstream_tls_override: Some(tls_config),
             upstream_connect_timeout: std::time::Duration::from_secs(30),
@@ -3546,6 +3651,7 @@ when {{ context.path == "{deny_path}" }};
             enforcement_mode: "observe".to_string(),
             mitm_all: false,
             warn_only: false,
+            live_policy_bounds: None,
             upstream_addr_override: upstream_addr,
             upstream_tls_override: None,
             upstream_connect_timeout: std::time::Duration::from_secs(30),
@@ -3583,6 +3689,7 @@ when {{ context.path == "{deny_path}" }};
             enforcement_mode: "enforce".to_string(),
             mitm_all: false,
             warn_only: false,
+            live_policy_bounds: None,
             upstream_addr_override: None,
             upstream_tls_override: None,
             upstream_connect_timeout: std::time::Duration::from_secs(30),

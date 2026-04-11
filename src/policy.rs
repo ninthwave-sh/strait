@@ -45,28 +45,22 @@ pub struct PolicyEngine {
 }
 
 impl PolicyEngine {
-    /// Load a Cedar policy file from disk, optionally validating it against a
-    /// `.cedarschema` file. Returns an error if the file cannot be read,
-    /// contains invalid Cedar syntax, or violates the schema.
-    pub fn load(path: &Path, schema_path: Option<&Path>) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read policy file: {}", path.display()))?;
-
+    fn from_policy_text(
+        text: &str,
+        schema_text: Option<&str>,
+        schema_label: Option<&str>,
+    ) -> anyhow::Result<Self> {
         // Check for old-format (pre-v0.3) actions before parsing
-        check_old_format_actions(&text)?;
+        check_old_format_actions(text)?;
 
-        let policy_set = PolicySet::from_str(&text)
+        let policy_set = PolicySet::from_str(text)
             .map_err(|e| anyhow::anyhow!("invalid Cedar policy file: {e}"))?;
 
         // Validate against schema if provided
-        if let Some(schema_path) = schema_path {
-            let schema_text = std::fs::read_to_string(schema_path).with_context(|| {
-                format!("failed to read schema file: {}", schema_path.display())
-            })?;
-
-            let (schema, _warnings) = Schema::from_cedarschema_str(&schema_text).map_err(|e| {
-                anyhow::anyhow!("invalid Cedar schema file {}: {e}", schema_path.display())
-            })?;
+        if let Some(schema_text) = schema_text {
+            let schema_label = schema_label.unwrap_or("<inline schema>");
+            let (schema, _warnings) = Schema::from_cedarschema_str(schema_text)
+                .map_err(|e| anyhow::anyhow!("invalid Cedar schema file {schema_label}: {e}"))?;
 
             let validator = Validator::new(schema);
             let result = validator.validate(&policy_set, ValidationMode::Strict);
@@ -76,8 +70,7 @@ impl PolicyEngine {
                     .map(|e| format!("  - {e}"))
                     .collect();
                 anyhow::bail!(
-                    "Cedar policy validation failed against schema {}:\n{}",
-                    schema_path.display(),
+                    "Cedar policy validation failed against schema {schema_label}:\n{}",
                     errors.join("\n")
                 );
             }
@@ -87,6 +80,32 @@ impl PolicyEngine {
             policy_set: Arc::new(policy_set),
             authorizer: Arc::new(Authorizer::new()),
         })
+    }
+
+    /// Load a Cedar policy file from disk, optionally validating it against a
+    /// `.cedarschema` file. Returns an error if the file cannot be read,
+    /// contains invalid Cedar syntax, or violates the schema.
+    pub fn load(path: &Path, schema_path: Option<&Path>) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read policy file: {}", path.display()))?;
+        let schema_text = schema_path
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("failed to read schema file: {}", path.display()))
+            })
+            .transpose()?;
+        let schema_label = schema_path.map(|path| path.display().to_string());
+        Self::from_policy_text(&text, schema_text.as_deref(), schema_label.as_deref())
+    }
+
+    /// Load a Cedar policy from an in-memory string, optionally validating it
+    /// against an in-memory Cedar schema string.
+    pub fn from_text(
+        policy_text: &str,
+        schema_text: Option<&str>,
+        schema_label: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Self::from_policy_text(policy_text, schema_text, schema_label)
     }
 
     /// Evaluate a request against the loaded policy set.

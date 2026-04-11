@@ -277,6 +277,53 @@ async fn launch_observe_sets_initial_terminal_size() {
     assert_eq!(start_size.trim(), "12 34");
 }
 
+/// Fast-exit TTY launches still return the real exit code and emit stop events
+/// even if the initial resize races with container shutdown.
+#[tokio::test]
+async fn launch_observe_tty_fast_exit_still_cleans_up() {
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+
+    let exit_code = strait::launch::run_launch_observe_with_test_terminal(
+        vec!["true".to_string()],
+        Some(TEST_IMAGE),
+        Some(obs_path.clone()),
+        None,
+        Vec::new(),
+        vec![],
+        vec![],
+        true,
+        strait::launch::TestTerminalOptions {
+            stdin_is_terminal: true,
+            initial_size: Some(strait::launch::TerminalSize { rows: 12, cols: 34 }),
+            resize_events: Vec::new(),
+        },
+    )
+    .await
+    .expect("fast-exit TTY launch should still succeed");
+
+    assert_eq!(
+        exit_code, 0,
+        "fast-exit TTY command should preserve exit code"
+    );
+
+    let events = observation_events(&obs_path);
+    let stops = events_of_type(&events, "container_stop");
+    assert!(
+        !stops.is_empty(),
+        "fast-exit TTY run should emit container_stop"
+    );
+    assert_eq!(
+        stops[0]["exit_code"].as_i64(),
+        Some(0),
+        "container_stop should record the real exit code"
+    );
+}
+
 /// TTY observe launches forward live resize events to the running container.
 #[tokio::test]
 async fn launch_observe_forwards_terminal_resizes() {

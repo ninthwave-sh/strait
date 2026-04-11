@@ -1063,9 +1063,17 @@ async fn attach_and_wait(
     info!(container_name = container_name, "container started");
 
     if let Some(size) = initial_tty_size {
-        resize_container_tty(docker, container_name, size)
-            .await
-            .context("failed to apply initial container TTY size")?;
+        if let Err(error) = resize_container_tty(docker, container_name, size).await {
+            if initial_resize_error_is_benign(&error) {
+                warn!(
+                    error = %error,
+                    container_name = container_name,
+                    "container exited before initial TTY resize completed"
+                );
+            } else {
+                return Err(error).context("failed to apply initial container TTY size");
+            }
+        }
     }
 
     // Pipe container output to host stdout.
@@ -1275,6 +1283,13 @@ async fn resize_container_tty(
                 size.cols, size.rows
             )
         })
+}
+
+fn initial_resize_error_is_benign(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("is not running")
+        || message.contains("no such container")
+        || message.contains("container not running")
 }
 
 #[cfg(unix)]
@@ -1496,6 +1511,19 @@ mod tests {
             terminal_size_from_rows_and_cols(24, 80),
             Some(TerminalSize { rows: 24, cols: 80 })
         );
+    }
+
+    #[test]
+    fn initial_resize_error_classifier_allows_exited_container_cases() {
+        assert!(initial_resize_error_is_benign(&anyhow::anyhow!(
+            "409 container is not running"
+        )));
+        assert!(initial_resize_error_is_benign(&anyhow::anyhow!(
+            "404 no such container"
+        )));
+        assert!(!initial_resize_error_is_benign(&anyhow::anyhow!(
+            "permission denied"
+        )));
     }
 
     #[cfg(unix)]

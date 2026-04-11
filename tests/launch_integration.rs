@@ -2037,9 +2037,17 @@ fn launch_policy_replace_live_updates_running_session() {
 
     let events = observation_events(&obs_path);
     let reloads = events_of_type(&events, "policy_reloaded");
-    assert_eq!(reloads.len(), 1, "live policy replace should be observed");
-    assert_eq!(reloads[0]["applied"].as_bool(), Some(true));
-    assert_eq!(reloads[0]["source"].as_str(), Some("replace"));
+    assert_eq!(
+        reloads.len(),
+        2,
+        "each successful live policy replace should be observed"
+    );
+    assert!(reloads
+        .iter()
+        .all(|event| event["applied"].as_bool() == Some(true)));
+    assert!(reloads
+        .iter()
+        .all(|event| event["source"].as_str() == Some("replace")));
 }
 
 #[cfg(unix)]

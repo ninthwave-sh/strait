@@ -155,13 +155,16 @@ fn launch_test_guard() -> MutexGuard<'static, ()> {
 
 async fn wait_for_new_launch_session(
     existing_session_ids: &[String],
+    require_container_identity: bool,
 ) -> strait::launch::LaunchSessionMetadata {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let sessions = strait::launch::list_launch_sessions().unwrap();
             if let Some(session) = sessions.into_iter().find(|candidate| {
                 !existing_session_ids.contains(&candidate.session_id)
-                    && (candidate.container_id.is_some() || candidate.container_name.is_some())
+                    && (!require_container_identity
+                        || candidate.container_id.is_some()
+                        || candidate.container_name.is_some())
             }) {
                 return session;
             }
@@ -200,7 +203,7 @@ async fn start_managed_observe_launch() -> (
         .await
     });
 
-    let session = wait_for_new_launch_session(&existing_session_ids).await;
+    let session = wait_for_new_launch_session(&existing_session_ids, true).await;
     (temp_dir, launch_task, session)
 }
 
@@ -748,6 +751,50 @@ async fn launch_session_stop_cleans_up_session_resources() {
     assert!(
         !session_dir.exists(),
         "session registry directory should be removed on cleanup"
+    );
+}
+
+/// `session.stop` is honored even if it arrives as soon as the registry entry appears.
+#[tokio::test]
+async fn launch_session_stop_before_container_startup_completes() {
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let existing_session_ids: Vec<String> = strait::launch::list_launch_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|session| session.session_id)
+        .collect();
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+
+    let launch_task = tokio::spawn(async move {
+        strait::launch::run_launch_observe(
+            vec!["sh".to_string(), "-lc".to_string(), "sleep 60".to_string()],
+            Some(TEST_IMAGE),
+            Some(obs_path),
+            None,
+            Vec::new(),
+            vec![],
+            vec![],
+            false,
+        )
+        .await
+    });
+
+    let session = wait_for_new_launch_session(&existing_session_ids, false).await;
+    assert!(
+        session.container_id.is_none() && session.container_name.is_none(),
+        "registry entry should appear before container identity is published"
+    );
+
+    let exit_code = stop_launch_session(&session, launch_task).await;
+    assert_eq!(
+        exit_code, 130,
+        "early session.stop should still terminate the launch"
     );
 }
 

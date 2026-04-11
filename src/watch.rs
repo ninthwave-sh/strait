@@ -232,17 +232,17 @@ pub fn format_event(event: &ObservationEvent, max_width: usize) -> String {
 
 /// Discover an active observation socket.
 ///
-/// Searches the same directories as `resolve_socket_dir` in `observe.rs`:
-/// 1. `/tmp`
-/// 2. `XDG_RUNTIME_DIR` (if set)
+/// Searches the active Strait runtime directory first, then legacy fallback
+/// locations for older sessions.
 ///
 /// Returns the newest `strait-*.sock` match by modification time across
 /// all candidate directories.
 pub fn discover_socket() -> Option<PathBuf> {
-    let mut candidates = vec![PathBuf::from("/tmp")];
+    let mut candidates = vec![crate::observe::runtime_dir()];
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
         candidates.push(PathBuf::from(xdg));
     }
+    candidates.push(PathBuf::from("/tmp"));
     discover_socket_in_dirs(&candidates)
 }
 

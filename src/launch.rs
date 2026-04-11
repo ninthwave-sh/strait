@@ -270,6 +270,28 @@ fn write_launch_session_metadata(
     path: &Path,
     metadata: &LaunchSessionMetadata,
 ) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create launch session metadata directory '{}'",
+                    parent.display()
+                )
+            })?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
+                || {
+                    format!(
+                        "failed to secure launch session directory '{}'",
+                        parent.display()
+                    )
+                },
+            )?;
+        }
+    }
+
     let json = serde_json::to_vec_pretty(metadata)
         .context("failed to serialize launch session metadata")?;
     std::fs::write(path, json).with_context(|| {
@@ -278,6 +300,19 @@ fn write_launch_session_metadata(
             path.display()
         )
     })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).with_context(
+            || {
+                format!(
+                    "failed to secure launch session metadata '{}'",
+                    path.display()
+                )
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -490,6 +525,26 @@ async fn start_launch_control_server(
     metadata: Arc<RwLock<LaunchSessionMetadata>>,
     stop_tx: watch::Sender<bool>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    #[cfg(unix)]
+    if let Some(parent) = control_socket_path.parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create launch control socket directory '{}'",
+                parent.display()
+            )
+        })?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).with_context(
+            || {
+                format!(
+                    "failed to secure launch control socket directory '{}'",
+                    parent.display()
+                )
+            },
+        )?;
+    }
+
     if control_socket_path.exists() {
         std::fs::remove_file(&control_socket_path).with_context(|| {
             format!(
@@ -505,6 +560,18 @@ async fn start_launch_control_server(
             control_socket_path.display()
         )
     })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&control_socket_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to secure launch control socket '{}'",
+                    control_socket_path.display()
+                )
+            })?;
+    }
 
     Ok(tokio::spawn(async move {
         loop {
@@ -547,12 +614,14 @@ struct LaunchSession {
     session_dir: PathBuf,
     metadata_path: PathBuf,
     control_task: tokio::task::JoinHandle<()>,
-    stop_tx: watch::Sender<bool>,
 }
 
 #[cfg(unix)]
 impl LaunchSession {
-    async fn create(session_id: &str, mode: EnforcementMode) -> anyhow::Result<Self> {
+    async fn create(
+        session_id: &str,
+        mode: EnforcementMode,
+    ) -> anyhow::Result<(Self, watch::Receiver<bool>)> {
         let registry_dir = launch_session_registry_dir();
         Self::create_in(&registry_dir, session_id, mode).await
     }
@@ -561,22 +630,42 @@ impl LaunchSession {
         root: &Path,
         session_id: &str,
         mode: EnforcementMode,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(Self, watch::Receiver<bool>)> {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
         let registry_dir = root.to_path_buf();
-        std::fs::create_dir_all(&registry_dir).with_context(|| {
+        let mut registry_builder = std::fs::DirBuilder::new();
+        registry_builder.recursive(true).mode(0o700);
+        registry_builder.create(&registry_dir).with_context(|| {
             format!(
                 "failed to create launch session registry '{}'",
                 registry_dir.display()
             )
         })?;
+        std::fs::set_permissions(&registry_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| {
+                format!(
+                    "failed to secure launch session registry '{}'",
+                    registry_dir.display()
+                )
+            })?;
 
         let session_dir = registry_dir.join(session_id);
-        std::fs::create_dir_all(&session_dir).with_context(|| {
+        let mut session_builder = std::fs::DirBuilder::new();
+        session_builder.recursive(true).mode(0o700);
+        session_builder.create(&session_dir).with_context(|| {
             format!(
                 "failed to create launch session directory '{}'",
                 session_dir.display()
             )
         })?;
+        std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| {
+                format!(
+                    "failed to secure launch session directory '{}'",
+                    session_dir.display()
+                )
+            })?;
 
         let metadata_path = session_dir.join(SESSION_METADATA_FILE_NAME);
         let metadata = LaunchSessionMetadata {
@@ -594,7 +683,7 @@ impl LaunchSession {
         write_launch_session_metadata(&metadata_path, &metadata)?;
 
         let metadata = Arc::new(RwLock::new(metadata));
-        let (stop_tx, _stop_rx) = watch::channel(false);
+        let (stop_tx, stop_rx) = watch::channel(false);
         let control_task = start_launch_control_server(
             metadata.read().await.control_socket_path.clone(),
             metadata.clone(),
@@ -602,13 +691,15 @@ impl LaunchSession {
         )
         .await?;
 
-        Ok(Self {
-            metadata,
-            session_dir,
-            metadata_path,
-            control_task,
-            stop_tx,
-        })
+        Ok((
+            Self {
+                metadata,
+                session_dir,
+                metadata_path,
+                control_task,
+            },
+            stop_rx,
+        ))
     }
 
     async fn set_container(
@@ -633,10 +724,6 @@ impl LaunchSession {
 
     async fn observation_socket_path(&self) -> PathBuf {
         self.metadata.read().await.observation.path.clone()
-    }
-
-    fn stop_receiver(&self) -> watch::Receiver<bool> {
-        self.stop_tx.subscribe()
     }
 }
 
@@ -1033,7 +1120,7 @@ async fn run_launch_observe_with_terminal_mode(
     )?);
 
     #[cfg(unix)]
-    let launch_session = LaunchSession::create(
+    let (launch_session, mut session_stop_rx) = LaunchSession::create(
         proxy_ctx.audit_logger.session_id(),
         EnforcementMode::Observe,
     )
@@ -1146,8 +1233,11 @@ async fn run_launch_observe_with_terminal_mode(
     let session_stop = async {
         #[cfg(unix)]
         {
-            let mut rx = launch_session.stop_receiver();
-            rx.changed()
+            if *session_stop_rx.borrow() {
+                return Ok::<(), anyhow::Error>(());
+            }
+            session_stop_rx
+                .changed()
                 .await
                 .context("launch control stop channel closed unexpectedly")?;
             Ok::<(), anyhow::Error>(())
@@ -1337,7 +1427,8 @@ async fn run_launch_with_policy_with_terminal_mode(
     )?);
 
     #[cfg(unix)]
-    let launch_session = LaunchSession::create(proxy_ctx.audit_logger.session_id(), mode).await?;
+    let (launch_session, mut session_stop_rx) =
+        LaunchSession::create(proxy_ctx.audit_logger.session_id(), mode).await?;
     #[cfg(unix)]
     {
         let observation_socket_path = launch_session.observation_socket_path().await;
@@ -1482,8 +1573,11 @@ async fn run_launch_with_policy_with_terminal_mode(
     let session_stop = async {
         #[cfg(unix)]
         {
-            let mut rx = launch_session.stop_receiver();
-            rx.changed()
+            if *session_stop_rx.borrow() {
+                return Ok::<(), anyhow::Error>(());
+            }
+            session_stop_rx
+                .changed()
                 .await
                 .context("launch control stop channel closed unexpectedly")?;
             Ok::<(), anyhow::Error>(())
@@ -2972,7 +3066,7 @@ permit(
     #[tokio::test]
     async fn launch_session_registry_writes_metadata_and_cleans_up() {
         let registry_root = tempfile::tempdir().unwrap();
-        let session =
+        let (session, _stop_rx) =
             LaunchSession::create_in(registry_root.path(), "test-session", EnforcementMode::Warn)
                 .await
                 .unwrap();
@@ -3001,7 +3095,7 @@ permit(
     #[tokio::test]
     async fn launch_control_server_handles_info_attach_and_stop() {
         let registry_root = tempfile::tempdir().unwrap();
-        let session = LaunchSession::create_in(
+        let (session, mut stop_rx) = LaunchSession::create_in(
             registry_root.path(),
             "test-session",
             EnforcementMode::Observe,
@@ -3027,12 +3121,71 @@ permit(
         assert_eq!(observation.transport, "unix_socket");
         assert_eq!(observation.path, info.observation.path);
 
-        let mut stop_rx = session.stop_receiver();
         request_launch_session_stop(&control_socket).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), stop_rx.changed())
             .await
             .expect("session.stop should notify the launch loop")
             .expect("session.stop channel should stay open");
+
+        drop(session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_control_server_preserves_early_stop_signal_for_initial_receiver() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let (session, stop_rx) = LaunchSession::create_in(
+            registry_root.path(),
+            "test-session",
+            EnforcementMode::Observe,
+        )
+        .await
+        .unwrap();
+
+        let control_socket = session.control_socket_path().await;
+        request_launch_session_stop(&control_socket).await.unwrap();
+
+        assert!(
+            *stop_rx.borrow(),
+            "initial stop receiver should see an already-sent stop request"
+        );
+
+        drop(session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_session_registry_permissions_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let registry_root = tempfile::tempdir().unwrap();
+        let (session, _stop_rx) =
+            LaunchSession::create_in(registry_root.path(), "test-session", EnforcementMode::Warn)
+                .await
+                .unwrap();
+        let control_socket = session.control_socket_path().await;
+        let session_dir = registry_root.path().join("test-session");
+        let metadata_path = session_dir.join(SESSION_METADATA_FILE_NAME);
+
+        let session_mode = std::fs::metadata(&session_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let metadata_mode = std::fs::metadata(&metadata_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let socket_mode = std::fs::metadata(&control_socket)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(session_mode, 0o700, "session directory should be private");
+        assert_eq!(metadata_mode, 0o600, "metadata file should be private");
+        assert_eq!(socket_mode, 0o600, "control socket should be private");
 
         drop(session);
     }

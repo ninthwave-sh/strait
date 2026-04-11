@@ -17,6 +17,8 @@ use std::time::Duration;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+#[cfg(unix)]
+use tracing::warn;
 
 /// Default broadcast channel capacity.
 ///
@@ -386,19 +388,62 @@ fn resolve_socket_dir_with_candidates(candidates: &[PathBuf]) -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+#[cfg(unix)]
+fn ensure_dir_with_mode(path: &Path, mode: u32) -> bool {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    if !path.exists() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(mode);
+        if let Err(error) = builder.create(path) {
+            warn!(path = %path.display(), error = %error, "failed to create runtime directory");
+            return false;
+        }
+    }
+
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        warn!(path = %path.display(), error = %error, "failed to secure runtime directory permissions");
+        return false;
+    }
+
+    dir_is_writable(path)
+}
+
 /// Determine the best directory for the observation socket.
 ///
 /// Tries, in order:
-/// 1. `/tmp`
-/// 2. `XDG_RUNTIME_DIR` (Linux user-specific runtime directory)
-/// 3. Current working directory (last resort)
+/// 1. `XDG_RUNTIME_DIR/strait` (Linux user runtime dir)
+/// 2. `$HOME/.local/state/strait/runtime`
+/// 3. `TMPDIR/strait-<uid>`
+/// 4. Current working directory (last resort)
 #[cfg(unix)]
 fn resolve_socket_dir() -> PathBuf {
-    let mut candidates = vec![PathBuf::from("/tmp")];
+    let mut private_candidates = Vec::new();
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-        candidates.push(PathBuf::from(xdg));
+        private_candidates.push(PathBuf::from(xdg).join("strait"));
     }
-    resolve_socket_dir_with_candidates(&candidates)
+    if let Ok(home) = std::env::var("HOME") {
+        private_candidates.push(
+            PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("strait")
+                .join("runtime"),
+        );
+    }
+
+    let uid = unsafe { libc::geteuid() };
+    private_candidates.push(std::env::temp_dir().join(format!("strait-{uid}")));
+
+    for candidate in &private_candidates {
+        if ensure_dir_with_mode(candidate, 0o700) {
+            return candidate.clone();
+        }
+    }
+
+    resolve_socket_dir_with_candidates(&[
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    ])
 }
 
 #[cfg(unix)]
@@ -437,6 +482,28 @@ impl ObservationStream {
     /// This is the lower-level variant of [`start_socket_server`] that
     /// allows callers (and tests) to control the socket location.
     pub async fn start_socket_server_at(&self, path: &Path) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to create observation socket directory '{}': {}",
+                    parent.display(),
+                    e
+                )
+            })?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| {
+                    anyhow::anyhow!(
+                        "failed to secure observation socket directory '{}': {}",
+                        parent.display(),
+                        e
+                    )
+                },
+            )?;
+        }
+
         // Remove stale socket from a prior run.
         if path.exists() {
             std::fs::remove_file(path).map_err(|e| {
@@ -448,6 +515,21 @@ impl ObservationStream {
         let listener = tokio::net::UnixListener::bind(path).map_err(|e| {
             anyhow::anyhow!("failed to bind Unix socket at '{}': {}", path.display(), e)
         })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| {
+                    anyhow::anyhow!(
+                        "failed to secure observation socket '{}': {}",
+                        path.display(),
+                        e
+                    )
+                },
+            )?;
+        }
 
         tracing::info!(path = %path.display(), "observation socket server started");
 

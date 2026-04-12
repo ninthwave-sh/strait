@@ -98,6 +98,9 @@ pub const SESSION_CONTROL_PROTOCOL_VERSION: u32 = 1;
 pub const LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE: &str =
     "Live updates apply to network policy only; filesystem or process policy changes require relaunch.";
 
+/// Container-visible path for the operator workspace.
+const CONTAINER_WORKSPACE_PATH: &str = "/workspace";
+
 /// Directory name under the runtime directory that stores active launch sessions.
 #[cfg(unix)]
 const SESSION_REGISTRY_DIR_NAME: &str = "strait-sessions";
@@ -117,6 +120,19 @@ const SESSION_OBSERVATION_SOCKET_NAME: &str = "observe.sock";
 /// Exit code returned when a launch session is stopped via the control socket.
 #[cfg(unix)]
 const SESSION_STOP_EXIT_CODE: i32 = 130;
+
+fn launch_live_policy_bounds(cwd: &Path) -> LivePolicyBounds {
+    let cwd = cwd.to_string_lossy().to_string();
+    let mut fs_candidate_paths = vec![cwd.clone()];
+    if cwd != CONTAINER_WORKSPACE_PATH {
+        fs_candidate_paths.push(CONTAINER_WORKSPACE_PATH.to_string());
+    }
+
+    LivePolicyBounds {
+        fs_candidate_paths,
+        agent_id: "agent".to_string(),
+    }
+}
 
 /// Return the proxy Unix socket path for a given session temp directory.
 ///
@@ -1678,10 +1694,7 @@ async fn run_launch_with_policy_with_terminal_mode(
         mode == EnforcementMode::Warn,
         credential_store,
         mitm_hosts,
-        Some(LivePolicyBounds {
-            fs_candidate_paths: vec![cwd.to_string_lossy().to_string()],
-            agent_id: "agent".to_string(),
-        }),
+        Some(launch_live_policy_bounds(&cwd)),
     )?);
 
     #[cfg(unix)]
@@ -3401,6 +3414,28 @@ permit(
                 )
             }),
             "launch output should explain the live update boundary: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn launch_live_policy_bounds_include_workspace_alias() {
+        let bounds = launch_live_policy_bounds(Path::new("/tmp/strait-project"));
+        assert_eq!(
+            bounds.fs_candidate_paths,
+            vec![
+                "/tmp/strait-project".to_string(),
+                CONTAINER_WORKSPACE_PATH.to_string()
+            ]
+        );
+        assert_eq!(bounds.agent_id, "agent");
+    }
+
+    #[test]
+    fn launch_live_policy_bounds_avoid_duplicate_workspace_alias() {
+        let bounds = launch_live_policy_bounds(Path::new(CONTAINER_WORKSPACE_PATH));
+        assert_eq!(
+            bounds.fs_candidate_paths,
+            vec![CONTAINER_WORKSPACE_PATH.to_string()]
         );
     }
 

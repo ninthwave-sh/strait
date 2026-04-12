@@ -10,6 +10,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
 
 #[cfg(unix)]
 mod support;
@@ -141,6 +143,11 @@ fn repo_root() -> &'static Path {
 #[cfg(unix)]
 fn mock_tui_fixture() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_mock-tui-fixture"))
+}
+
+#[cfg(unix)]
+fn live_policy_probe_fixture() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_live-policy-probe-fixture"))
 }
 
 #[cfg(unix)]
@@ -286,6 +293,21 @@ async fn wait_for_observation_socket_event(
     })
     .await
     .expect("expected observation event should arrive before timeout")
+}
+
+#[cfg(unix)]
+async fn start_upstream_close_server() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = stream.read(&mut [0_u8; 1024]).await;
+        }
+    });
+
+    addr
 }
 
 // ---------------------------------------------------------------------------
@@ -1882,38 +1904,6 @@ fn launch_observe_mock_tui_resize_reaches_container_and_cleans_up() {
 }
 
 #[cfg(unix)]
-const CONNECT_PROBE_SCRIPT: &str = r#"
-printf '{"event":"ready"}\n'
-while IFS= read -r line; do
-  case "$line" in
-    probe)
-      status="connect_failed"
-      if exec 3<>/dev/tcp/127.0.0.1/3128 2>/dev/null; then
-        printf 'CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n' >&3
-        if IFS= read -r -t 5 response <&3; then
-          case "$response" in
-            *200*) status="200" ;;
-            *403*) status="403" ;;
-            *) status="other" ;;
-          esac
-        else
-          status="timeout"
-        fi
-        exec 3>&-
-        exec 3<&-
-      fi
-      printf '{"event":"probe","status":"%s"}\n' "$status"
-      ;;
-    exit)
-      printf '{"event":"exit","code":0}\n'
-      exit 0
-      ;;
-  esac
-done
-printf '{"event":"exit","code":0}\n'
-"#;
-
-#[cfg(unix)]
 #[test]
 fn launch_policy_replace_live_updates_running_session() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1925,6 +1915,11 @@ fn launch_policy_replace_live_updates_running_session() {
     let temp_dir = tempfile::tempdir().unwrap();
     let policy_path = temp_dir.path().join("policy.cedar");
     let obs_path = temp_dir.path().join("policy-replace-observations.jsonl");
+    let upstream_addr = runtime.block_on(start_upstream_close_server());
+    let probe_mount = format!(
+        "{}:/usr/local/bin/live-policy-probe-fixture:ro",
+        live_policy_probe_fixture().display()
+    );
     write_fs_only_policy(&policy_path);
 
     let existing_session_ids: Vec<String> = strait::launch::list_launch_sessions()
@@ -1940,9 +1935,15 @@ fn launch_policy_replace_live_updates_running_session() {
         TEST_IMAGE.to_string(),
         "--output".to_string(),
         obs_path.display().to_string(),
-        "bash".to_string(),
-        "-lc".to_string(),
-        CONNECT_PROBE_SCRIPT.to_string(),
+        "--mount".to_string(),
+        probe_mount,
+        "live-policy-probe-fixture".to_string(),
+        "--host".to_string(),
+        upstream_addr.ip().to_string(),
+        "--port".to_string(),
+        upstream_addr.port().to_string(),
+        "--path".to_string(),
+        "/policy-probe".to_string(),
     ];
 
     let mut session = PtySession::spawn(
@@ -1965,10 +1966,11 @@ fn launch_policy_replace_live_updates_running_session() {
         .expect("session.info should succeed while policy probe is running");
     assert_eq!(info.mode, "enforce");
 
-    // Launch sessions default to `mitm_all=true`, so a bare CONNECT handshake
-    // only proves the gateway/proxy path is reachable. The control-plane
-    // response and observation event are the supported contract for a live
-    // network-only policy mutation on a running session.
+    session.write_line("probe").unwrap();
+    let denied = session
+        .wait_for_event("probe", Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(denied["status"].as_str(), Some("403"));
 
     let observation = runtime
         .block_on(strait::launch::request_launch_watch_attach(
@@ -2009,20 +2011,11 @@ fn launch_policy_replace_live_updates_running_session() {
         Some(live_session.session_id.as_str())
     );
 
-    let follow_up = runtime
-        .block_on(strait::launch::request_launch_policy_replace(
-            &live_session.control_socket_path,
-            FS_ONLY_POLICY_TEXT,
-        ))
-        .expect("replacing back to the original network policy should also succeed");
-    assert!(
-        follow_up.applied,
-        "reverting a network-only policy change should stay live"
-    );
-    assert!(
-        follow_up.restart_required_domains.is_empty(),
-        "reverting the network policy should still avoid restart"
-    );
+    session.write_line("probe").unwrap();
+    let allowed = session
+        .wait_for_event("probe", Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(allowed["status"].as_str(), Some("upstream_error"));
 
     session.write_line("exit").unwrap();
     session
@@ -2037,17 +2030,20 @@ fn launch_policy_replace_live_updates_running_session() {
 
     let events = observation_events(&obs_path);
     let reloads = events_of_type(&events, "policy_reloaded");
-    assert_eq!(
-        reloads.len(),
-        2,
-        "each successful live policy replace should be observed"
-    );
-    assert!(reloads
-        .iter()
-        .all(|event| event["applied"].as_bool() == Some(true)));
-    assert!(reloads
-        .iter()
-        .all(|event| event["source"].as_str() == Some("replace")));
+    assert_eq!(reloads.len(), 1, "live policy replace should be observed");
+    assert_eq!(reloads[0]["applied"].as_bool(), Some(true));
+    assert_eq!(reloads[0]["source"].as_str(), Some("replace"));
+
+    let upstream_host = upstream_addr.ip().to_string();
+    let requests: Vec<_> = events_of_type(&events, "network_request")
+        .into_iter()
+        .filter(|event| event["method"].as_str() == Some("GET"))
+        .filter(|event| event["host"].as_str() == Some(upstream_host.as_str()))
+        .filter(|event| event["path"].as_str() == Some("/policy-probe"))
+        .collect();
+    assert_eq!(requests.len(), 2, "probe should emit two HTTP requests");
+    assert_eq!(requests[0]["decision"].as_str(), Some("deny"));
+    assert_eq!(requests[1]["decision"].as_str(), Some("allow"));
 }
 
 #[cfg(unix)]
@@ -2064,6 +2060,11 @@ fn launch_policy_replace_invalid_update_keeps_existing_network_policy() {
     let obs_path = temp_dir
         .path()
         .join("policy-replace-invalid-observations.jsonl");
+    let upstream_addr = runtime.block_on(start_upstream_close_server());
+    let probe_mount = format!(
+        "{}:/usr/local/bin/live-policy-probe-fixture:ro",
+        live_policy_probe_fixture().display()
+    );
     write_permissive_policy(&policy_path);
 
     let existing_session_ids: Vec<String> = strait::launch::list_launch_sessions()
@@ -2079,9 +2080,15 @@ fn launch_policy_replace_invalid_update_keeps_existing_network_policy() {
         TEST_IMAGE.to_string(),
         "--output".to_string(),
         obs_path.display().to_string(),
-        "bash".to_string(),
-        "-lc".to_string(),
-        CONNECT_PROBE_SCRIPT.to_string(),
+        "--mount".to_string(),
+        probe_mount,
+        "live-policy-probe-fixture".to_string(),
+        "--host".to_string(),
+        upstream_addr.ip().to_string(),
+        "--port".to_string(),
+        upstream_addr.port().to_string(),
+        "--path".to_string(),
+        "/policy-probe".to_string(),
     ];
 
     let mut session = PtySession::spawn(
@@ -2102,7 +2109,7 @@ fn launch_policy_replace_invalid_update_keeps_existing_network_policy() {
     let before = session
         .wait_for_event("probe", Duration::from_secs(10))
         .unwrap();
-    assert_eq!(before["status"].as_str(), Some("200"));
+    assert_eq!(before["status"].as_str(), Some("upstream_error"));
 
     let error = runtime
         .block_on(strait::launch::request_launch_policy_replace(
@@ -2119,7 +2126,7 @@ fn launch_policy_replace_invalid_update_keeps_existing_network_policy() {
     let after = session
         .wait_for_event("probe", Duration::from_secs(10))
         .unwrap();
-    assert_eq!(after["status"].as_str(), Some("200"));
+    assert_eq!(after["status"].as_str(), Some("upstream_error"));
 
     session.write_line("exit").unwrap();
     session
@@ -2137,4 +2144,19 @@ fn launch_policy_replace_invalid_update_keeps_existing_network_policy() {
         events_of_type(&events, "policy_reloaded").is_empty(),
         "failed policy.replace should not emit a policy_reloaded event"
     );
+    let upstream_host = upstream_addr.ip().to_string();
+    let requests: Vec<_> = events_of_type(&events, "network_request")
+        .into_iter()
+        .filter(|event| event["method"].as_str() == Some("GET"))
+        .filter(|event| event["host"].as_str() == Some(upstream_host.as_str()))
+        .filter(|event| event["path"].as_str() == Some("/policy-probe"))
+        .collect();
+    assert_eq!(
+        requests.len(),
+        2,
+        "both probe attempts should hit policy evaluation"
+    );
+    assert!(requests
+        .iter()
+        .all(|event| event["decision"].as_str() == Some("allow")));
 }

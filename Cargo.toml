@@ -55,6 +55,10 @@ libc = "0.2"
 name = "mock-tui-fixture"
 path = "tests/fixtures/mock_tui.rs"
 
+[[bin]]
+name = "live-policy-probe-fixture"
+path = "tests/fixtures/live_policy_probe.rs"
+
 [profile.release]
 strip = true
 lto = true

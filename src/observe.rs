@@ -162,6 +162,16 @@ pub struct ObservationStream {
     session_context: Arc<std::sync::Mutex<Option<ObservationSessionContext>>>,
     /// Maximum number of events to keep in the ring buffer.
     ring_buffer_capacity: usize,
+    /// Active socket server task, if one has been started.
+    #[cfg(unix)]
+    socket_server: Arc<std::sync::Mutex<Option<SocketServerHandle>>>,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct SocketServerHandle {
+    path: PathBuf,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Default for ObservationStream {
@@ -187,6 +197,8 @@ impl ObservationStream {
             ))),
             session_context: Arc::new(std::sync::Mutex::new(None)),
             ring_buffer_capacity: DEFAULT_RING_BUFFER_CAPACITY,
+            #[cfg(unix)]
+            socket_server: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -322,6 +334,22 @@ impl ObservationStream {
             if let Ok(mut w) = writer.lock() {
                 if let Err(e) = w.flush() {
                     tracing::warn!(error = %e, "failed to flush observation log");
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ObservationStream {
+    fn drop(&mut self) {
+        self.flush();
+
+        #[cfg(unix)]
+        if Arc::strong_count(&self.socket_server) == 1 {
+            if let Ok(mut socket_server) = self.socket_server.lock() {
+                if let Some(server) = socket_server.take() {
+                    server.task.abort();
+                    let _ = std::fs::remove_file(&server.path);
                 }
             }
         }
@@ -526,6 +554,13 @@ impl ObservationStream {
     /// This is the lower-level variant of [`start_socket_server`] that
     /// allows callers (and tests) to control the socket location.
     pub async fn start_socket_server_at(&self, path: &Path) -> anyhow::Result<()> {
+        if let Ok(mut socket_server) = self.socket_server.lock() {
+            if let Some(server) = socket_server.take() {
+                server.task.abort();
+                let _ = std::fs::remove_file(&server.path);
+            }
+        }
+
         #[cfg(unix)]
         if let Some(parent) = path.parent() {
             use std::os::unix::fs::PermissionsExt;
@@ -580,7 +615,7 @@ impl ObservationStream {
         let tx = self.tx.clone();
         let recent_events = self.recent_events.clone();
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
@@ -653,6 +688,13 @@ impl ObservationStream {
                 }
             }
         });
+
+        if let Ok(mut socket_server) = self.socket_server.lock() {
+            *socket_server = Some(SocketServerHandle {
+                path: path.to_path_buf(),
+                task,
+            });
+        }
 
         Ok(())
     }
@@ -1071,6 +1113,31 @@ mod tests {
 
         let client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         assert!(client.peer_addr().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_stream_closes_connected_socket_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+
+        let stream = ObservationStream::new();
+        stream.start_socket_server_at(&sock_path).await.unwrap();
+
+        let client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let mut reader = tokio::io::BufReader::new(client);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(stream);
+
+        let mut line = String::new();
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            reader.read_line(&mut line).await.unwrap()
+        })
+        .await
+        .expect("dropping the stream should close connected socket clients");
+
+        assert_eq!(bytes, 0, "socket client should observe EOF after drop");
     }
 
     #[cfg(unix)]

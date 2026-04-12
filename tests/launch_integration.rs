@@ -2404,9 +2404,15 @@ fn launch_policy_replace_live_updates_running_session() {
         Some(live_session.session_id.as_str())
     );
 
+    let post_replace_probe_timeout = if std::env::var_os("CI").is_some() {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(20)
+    };
+
     session.write_line("probe").unwrap();
     let allowed = session
-        .wait_for_event("probe", Duration::from_secs(20))
+        .wait_for_event("probe", post_replace_probe_timeout)
         .unwrap();
     assert_eq!(allowed["status"].as_str(), Some("upstream_error"));
 

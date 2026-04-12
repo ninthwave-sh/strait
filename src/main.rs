@@ -18,8 +18,7 @@ use strait::config::sighup_reload_task;
 use strait::config::{git_policy_poll_task, ProxyContext, StraitConfig};
 #[cfg(unix)]
 use strait::launch::{
-    latest_launch_session, LaunchPolicyMutationResult, LaunchSessionMetadata,
-    LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE,
+    LaunchPolicyMutationResult, LaunchSessionMetadata, LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE,
 };
 use strait::mitm::handle_connection;
 
@@ -592,6 +591,47 @@ async fn inspect_running_sessions() -> anyhow::Result<Vec<LaunchSessionMetadata>
 }
 
 #[cfg(unix)]
+fn session_registry_candidates_newest_first(
+    sessions: impl IntoIterator<Item = LaunchSessionMetadata>,
+) -> Vec<LaunchSessionMetadata> {
+    let mut sessions: Vec<_> = sessions.into_iter().collect();
+    sessions.sort_by(|left, right| {
+        std::fs::metadata(&right.control_socket_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .cmp(
+                &std::fs::metadata(&left.control_socket_path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok()),
+            )
+            .then_with(|| right.session_id.cmp(&left.session_id))
+    });
+    sessions
+}
+
+#[cfg(unix)]
+async fn resolve_default_target_session(
+    sessions: Vec<LaunchSessionMetadata>,
+) -> anyhow::Result<LaunchSessionMetadata> {
+    if sessions.is_empty() {
+        anyhow::bail!("no active strait sessions found; start one with `strait launch ...`");
+    }
+
+    for candidate in session_registry_candidates_newest_first(sessions) {
+        match strait::launch::request_launch_session_info(&candidate.control_socket_path).await {
+            Ok(session) => return Ok(session),
+            Err(error) => warn!(
+                session_id = %candidate.session_id,
+                error = %error,
+                "skipping launch session that could not be queried while resolving default target"
+            ),
+        }
+    }
+
+    anyhow::bail!("no active strait sessions found; start one with `strait launch ...`");
+}
+
+#[cfg(unix)]
 async fn resolve_target_session(session_id: Option<&str>) -> anyhow::Result<LaunchSessionMetadata> {
     let discovered = if let Some(session_id) = session_id {
         strait::launch::list_launch_sessions()?
@@ -599,8 +639,7 @@ async fn resolve_target_session(session_id: Option<&str>) -> anyhow::Result<Laun
             .find(|session| session.session_id == session_id)
             .with_context(|| format!("no active strait session found for '{session_id}'"))?
     } else {
-        latest_launch_session()?
-            .context("no active strait sessions found; start one with `strait launch ...`")?
+        return resolve_default_target_session(strait::launch::list_launch_sessions()?).await;
     };
 
     strait::launch::request_launch_session_info(&discovered.control_socket_path)
@@ -875,6 +914,10 @@ async fn run_observe(
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    #[cfg(unix)]
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    #[cfg(unix)]
+    use tokio::net::UnixListener;
 
     fn render_help(command: &mut clap::Command) -> String {
         let mut buf = Vec::new();
@@ -1156,6 +1199,97 @@ mod tests {
             help.contains("Live updates apply to network policy only."),
             "launch help should describe the live update boundary: {help}"
         );
+    }
+
+    #[cfg(unix)]
+    async fn spawn_session_info_server(
+        socket_path: &std::path::Path,
+        session: LaunchSessionMetadata,
+    ) -> tokio::task::JoinHandle<()> {
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        if socket_path.exists() {
+            std::fs::remove_file(socket_path).unwrap();
+        }
+        let listener = UnixListener::bind(socket_path).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut request = String::new();
+                let bytes = reader.read_line(&mut request).await.unwrap();
+                if bytes == 0 {
+                    continue;
+                }
+
+                let response = strait::launch::LaunchControlResponse {
+                    version: strait::launch::SESSION_CONTROL_PROTOCOL_VERSION,
+                    ok: true,
+                    result: Some(strait::launch::LaunchControlResult::SessionInfo {
+                        session: session.clone(),
+                    }),
+                    error: None,
+                };
+                let response_line = serde_json::to_string(&response).unwrap();
+                write_half
+                    .write_all(response_line.as_bytes())
+                    .await
+                    .unwrap();
+                write_half.write_all(b"\n").await.unwrap();
+                write_half.flush().await.unwrap();
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_session_resolution_skips_newer_stale_registry_entries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let live_socket = temp_dir.path().join("live.sock");
+        let stale_socket = temp_dir.path().join("stale.sock");
+
+        let live_session = LaunchSessionMetadata {
+            version: strait::launch::SESSION_CONTROL_PROTOCOL_VERSION,
+            session_id: "live-session".to_string(),
+            mode: "observe".to_string(),
+            control_socket_path: live_socket.clone(),
+            observation: strait::launch::ObservationHandle {
+                transport: "unix_socket".to_string(),
+                path: temp_dir.path().join("live-observe.sock"),
+            },
+            container_id: None,
+            container_name: None,
+        };
+
+        let server = spawn_session_info_server(&live_socket, live_session.clone()).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let stale_listener = UnixListener::bind(&stale_socket).unwrap();
+        drop(stale_listener);
+
+        let stale_session = LaunchSessionMetadata {
+            version: strait::launch::SESSION_CONTROL_PROTOCOL_VERSION,
+            session_id: "stale-session".to_string(),
+            mode: "observe".to_string(),
+            control_socket_path: stale_socket,
+            observation: strait::launch::ObservationHandle {
+                transport: "unix_socket".to_string(),
+                path: temp_dir.path().join("stale-observe.sock"),
+            },
+            container_id: None,
+            container_name: None,
+        };
+
+        let resolved = resolve_default_target_session(vec![live_session.clone(), stale_session])
+            .await
+            .unwrap();
+        assert_eq!(resolved.session_id, live_session.session_id);
+
+        server.abort();
+        let _ = tokio::fs::remove_file(&live_socket).await;
     }
 
     #[test]

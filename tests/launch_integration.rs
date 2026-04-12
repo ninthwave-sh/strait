@@ -534,6 +534,101 @@ async fn session_cli_watch_streams_session_events() {
 }
 
 #[tokio::test]
+async fn session_cli_watch_missing_session_fails_fast() {
+    let missing_session = "definitely-missing-session";
+
+    let watch = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_strait_cli(&["session", "watch", "--session", missing_session]),
+    )
+    .await
+    .expect("session watch should fail promptly for a missing session");
+
+    let stderr = output_text(&watch.stderr);
+    assert!(
+        !watch.status.success(),
+        "session watch should fail for a missing session: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "no active strait session found for '{missing_session}'"
+        )),
+        "session watch should surface the missing session error: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn session_cli_watch_exits_when_target_session_stops() {
+    use tokio::io::AsyncBufReadExt;
+
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let (_temp_dir, launch_task, session) = start_managed_observe_launch().await;
+
+    let mut child = tokio::process::Command::new(strait_binary())
+        .args(["session", "watch", "--session", session.session_id.as_str()])
+        .current_dir(repo_root())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("session watch should start");
+
+    let stdout = child.stdout.take().expect("watch stdout should be piped");
+    let stderr = child.stderr.take().expect("watch stderr should be piped");
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr = tokio::io::BufReader::new(stderr);
+        let mut bytes = Vec::new();
+        stderr
+            .read_to_end(&mut bytes)
+            .await
+            .expect("watch stderr should remain readable");
+        bytes
+    });
+
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match lines.next_line().await.unwrap() {
+                Some(line) if line.contains("container:start") => return,
+                Some(_) => continue,
+                None => panic!("session watch exited before streaming container events"),
+            }
+        }
+    })
+    .await
+    .expect("session watch should stream events promptly before stop");
+
+    strait::launch::request_launch_session_stop(&session.control_socket_path)
+        .await
+        .expect("session.stop should succeed");
+
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("session watch should exit after the session stops")
+        .expect("session watch process should remain waitable");
+
+    let stderr = output_text(&stderr_task.await.expect("stderr task should finish"));
+    assert!(
+        !status.success(),
+        "session watch should exit once the targeted session disappears: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "no active strait session found for '{}'",
+            session.session_id
+        )),
+        "session watch should stop reconnecting when the target session ends: {stderr}"
+    );
+
+    let exit_code = wait_for_launch_task_exit(launch_task).await;
+    assert_eq!(exit_code, 130, "session stop should terminate the session");
+    wait_for_launch_session_removed(&session.session_id).await;
+}
+
+#[tokio::test]
 async fn session_cli_reload_replace_and_stop_use_control_api() {
     let _guard = launch_test_guard();
     if !require_docker().await {

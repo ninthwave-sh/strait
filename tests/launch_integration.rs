@@ -165,11 +165,12 @@ fn launch_test_guard() -> MutexGuard<'static, ()> {
 }
 
 #[cfg(unix)]
-fn run_strait_cli(args: &[&str]) -> std::process::Output {
-    std::process::Command::new(strait_binary())
+async fn run_strait_cli(args: &[&str]) -> std::process::Output {
+    tokio::process::Command::new(strait_binary())
         .args(args)
         .current_dir(repo_root())
         .output()
+        .await
         .expect("strait CLI should run")
 }
 
@@ -451,7 +452,7 @@ async fn session_cli_list_and_info_report_active_session() {
 
     let (_temp_dir, launch_task, session) = start_managed_observe_launch().await;
 
-    let list = run_strait_cli(&["session", "list"]);
+    let list = run_strait_cli(&["session", "list"]).await;
     let list_stdout = output_text(&list.stdout);
     assert!(
         list.status.success(),
@@ -466,7 +467,7 @@ async fn session_cli_list_and_info_report_active_session() {
         "session list should show the enforcement mode: {list_stdout}"
     );
 
-    let info = run_strait_cli(&["session", "info", "--session", &session.session_id]);
+    let info = run_strait_cli(&["session", "info", "--session", &session.session_id]).await;
     let info_stdout = output_text(&info.stdout);
     assert!(
         info.status.success(),
@@ -550,7 +551,8 @@ permit(
         start_managed_policy_launch(initial_policy).await;
 
     std::fs::write(&policy_path, "forbid(principal, action, resource);\n").unwrap();
-    let reload = run_strait_cli(&["session", "reload-policy", "--session", &session.session_id]);
+    let reload =
+        run_strait_cli(&["session", "reload-policy", "--session", &session.session_id]).await;
     let reload_stdout = output_text(&reload.stdout);
     assert!(
         reload.status.success(),
@@ -579,7 +581,8 @@ permit(
         "--session",
         &session.session_id,
         replace_policy_path.to_str().unwrap(),
-    ]);
+    ])
+    .await;
     let replace_stdout = output_text(&replace.stdout);
     assert!(
         replace.status.success(),
@@ -607,7 +610,7 @@ permit(
     )
     .unwrap();
     let reload_restart =
-        run_strait_cli(&["session", "reload-policy", "--session", &session.session_id]);
+        run_strait_cli(&["session", "reload-policy", "--session", &session.session_id]).await;
     let reload_restart_stderr = output_text(&reload_restart.stderr);
     assert!(
         !reload_restart.status.success(),
@@ -641,7 +644,8 @@ permit(
         "--session",
         &session.session_id,
         replace_restart_path.to_str().unwrap(),
-    ]);
+    ])
+    .await;
     let replace_restart_stderr = output_text(&replace_restart.stderr);
     assert!(
         !replace_restart.status.success(),
@@ -652,7 +656,7 @@ permit(
         "replace failure should explain the live update boundary: {replace_restart_stderr}"
     );
 
-    let stop = run_strait_cli(&["session", "stop", "--session", &session.session_id]);
+    let stop = run_strait_cli(&["session", "stop", "--session", &session.session_id]).await;
     let stop_stdout = output_text(&stop.stdout);
     assert!(
         stop.status.success(),

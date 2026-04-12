@@ -39,8 +39,9 @@ Strait evolves from an HTTPS policy proxy into a unified agent policy platform. 
   ┌───────────────────────▼─────────────────────────────────┐
   │ Strait Host Process                                      │
   │  - Container lifecycle (docker/podman CLI or API)        │
-  │  - Observation: proxy audit stream (network events)      │
-  │  - `strait watch` colored output via Unix socket         │
+  │  - Local control API (`session.info`, `policy.replace`)  │
+  │  - Observation stream (JSONL + attach socket)            │
+  │  - `strait session watch` colored output for one session │
   │  - `strait generate` policy from observations            │
   │  - `strait test --replay` verification                   │
   └─────────────────────────────────────────────────────────┘
@@ -106,20 +107,60 @@ What makes Strait's approach unique:
 
 ```
 strait proxy --config strait.toml                              # existing HTTPS proxy mode
-strait launch --observe ./agent                                # container + observe all activity
-strait launch --warn policy.cedar ./agent                      # container + log what would be blocked
-strait launch --policy policy.cedar ./agent                    # container + enforce policy
+strait launch --observe -- ./agent                             # container + observe all activity
+strait launch --warn policy.cedar -- ./agent                   # container + log what would be blocked
+strait launch --policy policy.cedar -- ./agent                 # container + enforce policy
+strait session list                                            # list active launch sessions
+strait session info --session <id>                             # inspect one running session
+strait session watch --session <id>                            # watch one running session
+strait session reload-policy --session <id>                    # reload policy source
+strait session replace-policy --session <id> policy.cedar      # swap policy text
+strait session stop --session <id>                             # stop one running session
 strait generate observations.jsonl                             # generate Cedar policy from observations
 strait test --replay observations.jsonl --policy policy.cedar  # verify policy
-strait watch                                                   # connect to Unix socket, render colored events
+strait watch                                                   # compatibility alias for newest session
 ```
+
+### Interactive Session Model
+
+- Each `strait launch` creates a stable session ID and publishes launch metadata in the local session registry.
+- The control plane is a local Unix socket speaking a small JSON protocol with these shipped methods: `session.info`, `watch.attach`, `session.stop`, `policy.reload`, and `policy.replace`.
+- Operators should target sessions explicitly with `--session <id>` instead of relying on newest-session discovery.
+- The agent keeps full terminal control through the container PTY, so interactive TUIs remain attached to the launch terminal while control and observation run from separate terminals.
 
 ### I/O Architecture
 
-- Agent gets full terminal control via container TTY (interactive TUI support — Claude Code, vim, etc.)
-- Observations stream to Unix socket (`/tmp/strait-<pid>.sock`)
-- `strait watch` connects to socket for live colored output in a second terminal
-- Observation events also persisted to JSONL file for `strait generate` and `strait test`
+- Agent gets full terminal control via container TTY for interactive tools such as Claude Code, vim, or test fixtures.
+- `strait launch` prints the session ID, control socket path, and observation socket path once the session is ready.
+- `strait session watch --session <id>` resolves the observation attach handle over the control API, then streams events for that session only.
+- Observation events are persisted to JSONL for `strait generate` and `strait test --replay`, while the same event stream fans out live to watch clients.
+
+### Runtime Events
+
+The shipped observation schema includes these launch-session event types:
+
+| JSONL type | `strait session watch` label | Meaning |
+|-----------|-------------------------------|---------|
+| `container_start` | `container:start` | Container created and started |
+| `container_stop` | `container:stop` | Container exited or was stopped |
+| `mount` | `mount` | Bind mount applied to the launched container |
+| `network_request` | `http:METHOD` | HTTP request decision (`allow`, `deny`, `warn`, `passthrough`) |
+| `policy_violation` | `policy:http:*` or similar | Warn/enforce violation detail |
+| `policy_reloaded` | `policy:reload` | Control-plane policy mutation outcome |
+| `tty_resized` | `tty:resize` | PTY resize propagated into the running container |
+
+`policy_reloaded` carries `applied`, `source`, and `restart_required_domains`. `tty_resized` carries `rows`, `cols`, and `source`.
+
+### Live Policy Update Boundary
+
+- `policy.reload` and `policy.replace` can update network policy live.
+- Filesystem and process policy remain restart-bound because bind mounts and executable availability are baked into the running container.
+- A successful network-only mutation returns `applied: true` with an empty `restart_required_domains`.
+- A mutation that changes `fs:` or `proc:` permissions is rejected for live apply and reports the restart-required domains instead.
+
+This boundary should be documented everywhere with the exact operator text shipped by the CLI:
+
+> Live updates apply to network policy only; filesystem or process policy changes require relaunch.
 
 ### Progressive Enforcement
 
@@ -149,12 +190,13 @@ Ship on existing `Action::"GET"` entity model. Work items in `.ninthwave/todos/`
 
 Breaking change: entity model gains `http:`, `fs:`, `proc:` namespaces.
 - `strait launch` CLI with container management
+- Local session control API for launched sessions
 - Entity model migration
 - Container bind-mounts from Cedar filesystem policy
-- Unified observation stream (proxy audit + container events) via Unix socket
+- Unified observation stream (proxy audit + container events) via JSONL + attach socket
 - `strait generate` — Cedar policy from observation data
 - `strait test --replay` — verify policy against observed traffic
-- `strait watch` — colored real-time observation viewer
+- `strait session watch` — colored real-time observation viewer
 - Progressive enforcement: `--observe` / `--warn` / `--policy` modes
 
 ### v0.4+ — Future

@@ -309,6 +309,31 @@ async fn discover_session_socket() -> Option<PathBuf> {
     discover_session_socket_from_sessions(sessions).await
 }
 
+enum NamedSessionSocketStatus {
+    Ready(PathBuf),
+    Missing,
+    Pending,
+}
+
+async fn discover_named_session_socket_status(
+    session_id: &str,
+) -> anyhow::Result<NamedSessionSocketStatus> {
+    let sessions = list_launch_sessions()?;
+    let matching = sessions
+        .into_iter()
+        .filter(|session| session.session_id == session_id)
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Ok(NamedSessionSocketStatus::Missing);
+    }
+
+    if let Some(path) = discover_session_socket_from_sessions(matching).await {
+        Ok(NamedSessionSocketStatus::Ready(path))
+    } else {
+        Ok(NamedSessionSocketStatus::Pending)
+    }
+}
+
 /// Discover the newest observation socket across multiple directories.
 fn discover_socket_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
@@ -364,7 +389,22 @@ fn discover_socket_in(dir: &Path) -> Option<PathBuf> {
 /// auto-discovery.
 pub async fn run(explicit_path: Option<PathBuf>) -> anyhow::Result<()> {
     tokio::select! {
-        result = watch_loop(explicit_path) => result,
+        result = watch_loop(explicit_path, None, true) => result,
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("\n{DIM}Stopped.{RESET}");
+            Ok(())
+        }
+    }
+}
+
+/// Run the watch loop for a session-discovered observation stream.
+///
+/// If `session_id` is omitted, targets the newest published launch session.
+/// Unlike the legacy `watch` alias, this path does not fall back to ad hoc
+/// socket discovery.
+pub async fn run_session(session_id: Option<String>) -> anyhow::Result<()> {
+    tokio::select! {
+        result = watch_loop(None, session_id, false) => result,
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\n{DIM}Stopped.{RESET}");
             Ok(())
@@ -373,9 +413,13 @@ pub async fn run(explicit_path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 /// Inner watch loop that resolves the socket and reconnects on failure.
-async fn watch_loop(explicit_path: Option<PathBuf>) -> anyhow::Result<()> {
+async fn watch_loop(
+    explicit_path: Option<PathBuf>,
+    session_id: Option<String>,
+    legacy_fallback: bool,
+) -> anyhow::Result<()> {
     loop {
-        let path = resolve_socket(&explicit_path).await;
+        let path = resolve_socket(&explicit_path, session_id.as_deref(), legacy_fallback).await?;
 
         eprintln!("{DIM}Connecting to {}{RESET}", path.display());
 
@@ -402,21 +446,39 @@ async fn watch_loop(explicit_path: Option<PathBuf>) -> anyhow::Result<()> {
 ///
 /// If an explicit path is given, waits for it to appear on disk.
 /// Otherwise auto-discovers, waiting if no socket is found.
-async fn resolve_socket(explicit_path: &Option<PathBuf>) -> PathBuf {
-    match explicit_path {
-        Some(p) => {
+async fn resolve_socket(
+    explicit_path: &Option<PathBuf>,
+    session_id: Option<&str>,
+    legacy_fallback: bool,
+) -> anyhow::Result<PathBuf> {
+    match (explicit_path, session_id) {
+        (Some(p), _) => {
             while !p.exists() {
                 eprintln!("{DIM}Waiting for strait launch...{RESET}");
                 tokio::time::sleep(RECONNECT_DELAY).await;
             }
-            p.clone()
+            Ok(p.clone())
         }
-        None => loop {
-            if let Some(p) = discover_session_socket().await {
-                break p;
+        (None, Some(session_id)) => loop {
+            match discover_named_session_socket_status(session_id).await? {
+                NamedSessionSocketStatus::Ready(path) => break Ok(path),
+                NamedSessionSocketStatus::Missing => {
+                    anyhow::bail!("no active strait session found for '{session_id}'");
+                }
+                NamedSessionSocketStatus::Pending => {
+                    eprintln!("{DIM}Waiting for strait launch...{RESET}");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                }
             }
-            if let Some(p) = discover_socket() {
-                break p;
+        },
+        (None, None) => loop {
+            if let Some(path) = discover_session_socket().await {
+                break Ok(path);
+            }
+            if legacy_fallback {
+                if let Some(path) = discover_socket() {
+                    break Ok(path);
+                }
             }
             eprintln!("{DIM}Waiting for strait launch...{RESET}");
             tokio::time::sleep(RECONNECT_DELAY).await;

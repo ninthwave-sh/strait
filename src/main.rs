@@ -16,6 +16,10 @@ use strait::watch;
 #[cfg(unix)]
 use strait::config::sighup_reload_task;
 use strait::config::{git_policy_poll_task, ProxyContext, StraitConfig};
+#[cfg(unix)]
+use strait::launch::{
+    LaunchPolicyMutationResult, LaunchSessionMetadata, LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE,
+};
 use strait::mitm::handle_connection;
 
 #[derive(Parser)]
@@ -43,6 +47,67 @@ enum TemplateAction {
         /// If omitted, both files are printed to stdout.
         #[arg(long, value_name = "DIR")]
         output_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// List active launch sessions discovered through the local registry.
+    List,
+
+    /// Inspect a running launch session through the control API.
+    Info {
+        /// Session ID to target.
+        ///
+        /// If omitted, targets the newest active launch session.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+    },
+
+    /// Watch the live observation stream for a running launch session.
+    Watch {
+        /// Session ID to target.
+        ///
+        /// If omitted, targets the newest active launch session.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+    },
+
+    /// Reload policy from the session's configured source.
+    ///
+    /// Live updates apply to network policy only. Filesystem or process
+    /// policy changes require relaunch.
+    ReloadPolicy {
+        /// Session ID to target.
+        ///
+        /// If omitted, targets the newest active launch session.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+    },
+
+    /// Replace the active policy with the contents of a Cedar policy file.
+    ///
+    /// Live updates apply to network policy only. Filesystem or process
+    /// policy changes require relaunch.
+    ReplacePolicy {
+        /// Session ID to target.
+        ///
+        /// If omitted, targets the newest active launch session.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+
+        /// Path to the Cedar policy file to apply.
+        #[arg(value_name = "POLICY_FILE")]
+        policy: PathBuf,
+    },
+
+    /// Stop a running launch session through the control API.
+    Stop {
+        /// Session ID to target.
+        ///
+        /// If omitted, targets the newest active launch session.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
     },
 }
 
@@ -108,6 +173,7 @@ TLS TRUST:
 
     /// Watch live observation events from a running strait session.
     ///
+    /// Compatibility alias for `strait session watch`.
     /// Connects to the live stream for the newest published launch session
     /// and renders a colored real-time stream of agent activity. Falls back
     /// to legacy socket discovery when no session is published. Auto-reconnects
@@ -141,6 +207,16 @@ TLS TRUST:
         action: TemplateAction,
     },
 
+    /// Manage running launch sessions over the local control API.
+    #[command(after_help = "\
+LIVE POLICY UPDATES:
+  Live updates apply to network policy only.
+  Filesystem or process policy changes require relaunch.")]
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+
     /// Launch a command in a sandboxed container with Cedar policy enforcement.
     ///
     /// Runs the specified command inside a container with filesystem and network
@@ -152,7 +228,18 @@ TLS TRUST:
     ///
     /// Network traffic routes through the built-in proxy. Filesystem access is
     /// controlled via bind-mount restrictions derived from Cedar `fs:` policies.
-    #[command(group(ArgGroup::new("mode").required(true).args(["observe", "warn", "policy"])))]
+    #[command(
+        group(ArgGroup::new("mode").required(true).args(["observe", "warn", "policy"])),
+        after_help = "\
+SESSION MANAGEMENT:
+  strait launch prints a session ID once the session is ready.
+  Use `strait session info|watch|reload-policy|replace-policy|stop`
+  to manage that running session.
+
+LIVE POLICY UPDATES:
+  Live updates apply to network policy only.
+  Filesystem or process policy changes require relaunch."
+    )]
     Launch {
         /// Run in observation mode: allow all activity, record to JSONL.
         ///
@@ -314,6 +401,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Watch { socket } => {
             watch::run(socket).await?;
         }
+        Commands::Session { action } => {
+            run_session_command(action).await?;
+        }
         Commands::Proxy { config } => {
             run_proxy(config).await?;
         }
@@ -435,6 +525,199 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+async fn run_session_command(action: SessionAction) -> anyhow::Result<()> {
+    match action {
+        SessionAction::List => {
+            let sessions = inspect_running_sessions().await?;
+            print!("{}", format_session_list(&sessions));
+        }
+        SessionAction::Info { session } => {
+            let session = resolve_target_session(session.as_deref()).await?;
+            print!("{}", format_session_info(&session));
+        }
+        SessionAction::Watch { session } => {
+            watch::run_session(session).await?;
+        }
+        SessionAction::ReloadPolicy { session } => {
+            let session = resolve_target_session(session.as_deref()).await?;
+            let update =
+                strait::launch::request_launch_policy_reload(&session.control_socket_path).await?;
+            report_policy_update("Policy reload", &session, &update)?;
+        }
+        SessionAction::ReplacePolicy { session, policy } => {
+            let session = resolve_target_session(session.as_deref()).await?;
+            let policy_text = std::fs::read_to_string(&policy)
+                .with_context(|| format!("failed to read policy file '{}'", policy.display()))?;
+            let update = strait::launch::request_launch_policy_replace(
+                &session.control_socket_path,
+                policy_text,
+            )
+            .await?;
+            report_policy_update("Policy replace", &session, &update)?;
+        }
+        SessionAction::Stop { session } => {
+            let session = resolve_target_session(session.as_deref()).await?;
+            strait::launch::request_launch_session_stop(&session.control_socket_path).await?;
+            println!("Stop requested for session {}.", session.session_id);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn run_session_command(_action: SessionAction) -> anyhow::Result<()> {
+    anyhow::bail!("session commands are only supported on Unix platforms")
+}
+
+#[cfg(unix)]
+async fn inspect_running_sessions() -> anyhow::Result<Vec<LaunchSessionMetadata>> {
+    let mut sessions = Vec::new();
+    for candidate in strait::launch::list_launch_sessions()? {
+        match strait::launch::request_launch_session_info(&candidate.control_socket_path).await {
+            Ok(session) => sessions.push(session),
+            Err(error) => warn!(
+                session_id = %candidate.session_id,
+                error = %error,
+                "skipping launch session that could not be queried"
+            ),
+        }
+    }
+    sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    Ok(sessions)
+}
+
+#[cfg(unix)]
+fn session_registry_candidates_newest_first(
+    sessions: impl IntoIterator<Item = LaunchSessionMetadata>,
+) -> Vec<LaunchSessionMetadata> {
+    let mut sessions: Vec<_> = sessions.into_iter().collect();
+    sessions.sort_by(|left, right| {
+        std::fs::metadata(&right.control_socket_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .cmp(
+                &std::fs::metadata(&left.control_socket_path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok()),
+            )
+            .then_with(|| right.session_id.cmp(&left.session_id))
+    });
+    sessions
+}
+
+#[cfg(unix)]
+async fn resolve_default_target_session(
+    sessions: Vec<LaunchSessionMetadata>,
+) -> anyhow::Result<LaunchSessionMetadata> {
+    if sessions.is_empty() {
+        anyhow::bail!("no active strait sessions found; start one with `strait launch ...`");
+    }
+
+    for candidate in session_registry_candidates_newest_first(sessions) {
+        match strait::launch::request_launch_session_info(&candidate.control_socket_path).await {
+            Ok(session) => return Ok(session),
+            Err(error) => warn!(
+                session_id = %candidate.session_id,
+                error = %error,
+                "skipping launch session that could not be queried while resolving default target"
+            ),
+        }
+    }
+
+    anyhow::bail!("no active strait sessions found; start one with `strait launch ...`");
+}
+
+#[cfg(unix)]
+async fn resolve_target_session(session_id: Option<&str>) -> anyhow::Result<LaunchSessionMetadata> {
+    let discovered = if let Some(session_id) = session_id {
+        strait::launch::list_launch_sessions()?
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .with_context(|| format!("no active strait session found for '{session_id}'"))?
+    } else {
+        return resolve_default_target_session(strait::launch::list_launch_sessions()?).await;
+    };
+
+    strait::launch::request_launch_session_info(&discovered.control_socket_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to query session '{}' over the control API",
+                discovered.session_id
+            )
+        })
+}
+
+#[cfg(unix)]
+fn format_session_list(sessions: &[LaunchSessionMetadata]) -> String {
+    if sessions.is_empty() {
+        return "No active strait sessions.\n".to_string();
+    }
+
+    let mut lines = vec![format!(
+        "{:<36}  {:<8}  {}",
+        "SESSION ID", "MODE", "CONTAINER"
+    )];
+    for session in sessions {
+        let container = session
+            .container_name
+            .as_deref()
+            .or(session.container_id.as_deref())
+            .unwrap_or("-");
+        lines.push(format!(
+            "{:<36}  {:<8}  {}",
+            session.session_id, session.mode, container
+        ));
+    }
+    format!("{}\n", lines.join("\n"))
+}
+
+#[cfg(unix)]
+fn format_session_info(session: &LaunchSessionMetadata) -> String {
+    let container_id = session.container_id.as_deref().unwrap_or("-");
+    let container_name = session.container_name.as_deref().unwrap_or("-");
+
+    format!(
+        "\
+Session ID: {}
+Mode: {}
+Control socket: {}
+Observation socket: {}
+Container ID: {}
+Container name: {}
+Policy updates: {}
+",
+        session.session_id,
+        session.mode,
+        session.control_socket_path.display(),
+        session.observation.path.display(),
+        container_id,
+        container_name,
+        LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE,
+    )
+}
+
+#[cfg(unix)]
+fn report_policy_update(
+    action: &str,
+    session: &LaunchSessionMetadata,
+    update: &LaunchPolicyMutationResult,
+) -> anyhow::Result<()> {
+    if update.applied {
+        println!("{action} applied live for session {}.", session.session_id);
+        println!("{LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE}");
+        return Ok(());
+    }
+
+    let domains = update.restart_required_domains.join(", ");
+    anyhow::bail!(
+        "{action} requires relaunch for {domains} policy changes in session {}. {LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE}",
+        session.session_id
+    )
 }
 
 /// Shared proxy startup: write CA cert, bind listener, print port.
@@ -631,6 +914,16 @@ async fn run_observe(
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    #[cfg(unix)]
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    #[cfg(unix)]
+    use tokio::net::UnixListener;
+
+    fn render_help(command: &mut clap::Command) -> String {
+        let mut buf = Vec::new();
+        command.write_long_help(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
 
     #[test]
     fn test_cli_debug_assert() {
@@ -744,6 +1037,100 @@ mod tests {
     }
 
     #[test]
+    fn test_session_list_subcommand_parses() {
+        let cli = Cli::try_parse_from(["strait", "session", "list"]).unwrap();
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::List,
+            } => {}
+            _ => panic!("expected Session::List subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_session_info_subcommand_parses() {
+        let cli =
+            Cli::try_parse_from(["strait", "session", "info", "--session", "session-123"]).unwrap();
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::Info { session },
+            } => {
+                assert_eq!(session.as_deref(), Some("session-123"));
+            }
+            _ => panic!("expected Session::Info subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_session_watch_subcommand_parses() {
+        let cli = Cli::try_parse_from(["strait", "session", "watch"]).unwrap();
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::Watch { session },
+            } => {
+                assert!(session.is_none(), "session should default to newest");
+            }
+            _ => panic!("expected Session::Watch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_session_reload_policy_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "session",
+            "reload-policy",
+            "--session",
+            "session-123",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::ReloadPolicy { session },
+            } => {
+                assert_eq!(session.as_deref(), Some("session-123"));
+            }
+            _ => panic!("expected Session::ReloadPolicy subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_session_replace_policy_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "session",
+            "replace-policy",
+            "--session",
+            "session-123",
+            "policy.cedar",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::ReplacePolicy { session, policy },
+            } => {
+                assert_eq!(session.as_deref(), Some("session-123"));
+                assert_eq!(policy.to_str().unwrap(), "policy.cedar");
+            }
+            _ => panic!("expected Session::ReplacePolicy subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_session_stop_subcommand_parses() {
+        let cli =
+            Cli::try_parse_from(["strait", "session", "stop", "--session", "session-123"]).unwrap();
+        match cli.command {
+            Commands::Session {
+                action: SessionAction::Stop { session },
+            } => {
+                assert_eq!(session.as_deref(), Some("session-123"));
+            }
+            _ => panic!("expected Session::Stop subcommand"),
+        }
+    }
+
+    #[test]
     fn test_help_lists_all_subcommands() {
         let cmd = Cli::command();
         let subcommand_names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
@@ -776,6 +1163,133 @@ mod tests {
             subcommand_names.contains(&"diff"),
             "missing 'diff' subcommand"
         );
+        assert!(
+            subcommand_names.contains(&"session"),
+            "missing 'session' subcommand"
+        );
+    }
+
+    #[test]
+    fn test_session_help_mentions_live_update_boundary() {
+        let mut cmd = Cli::command();
+        let session = cmd.find_subcommand_mut("session").unwrap();
+        let help = render_help(session);
+
+        assert!(
+            help.contains("Live updates apply to network policy only."),
+            "session help should describe the live update boundary: {help}"
+        );
+        assert!(
+            help.contains("Filesystem or process policy changes require relaunch."),
+            "session help should mention relaunch for fs/proc changes: {help}"
+        );
+    }
+
+    #[test]
+    fn test_launch_help_mentions_session_management_and_live_update_boundary() {
+        let mut cmd = Cli::command();
+        let launch = cmd.find_subcommand_mut("launch").unwrap();
+        let help = render_help(launch);
+
+        assert!(
+            help.contains("Use `strait session info|watch|reload-policy|replace-policy|stop`"),
+            "launch help should point operators at session commands: {help}"
+        );
+        assert!(
+            help.contains("Live updates apply to network policy only."),
+            "launch help should describe the live update boundary: {help}"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn spawn_session_info_server(
+        socket_path: &std::path::Path,
+        session: LaunchSessionMetadata,
+    ) -> tokio::task::JoinHandle<()> {
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        if socket_path.exists() {
+            std::fs::remove_file(socket_path).unwrap();
+        }
+        let listener = UnixListener::bind(socket_path).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut request = String::new();
+                let bytes = reader.read_line(&mut request).await.unwrap();
+                if bytes == 0 {
+                    continue;
+                }
+
+                let response = strait::launch::LaunchControlResponse {
+                    version: strait::launch::SESSION_CONTROL_PROTOCOL_VERSION,
+                    ok: true,
+                    result: Some(strait::launch::LaunchControlResult::SessionInfo {
+                        session: session.clone(),
+                    }),
+                    error: None,
+                };
+                let response_line = serde_json::to_string(&response).unwrap();
+                write_half
+                    .write_all(response_line.as_bytes())
+                    .await
+                    .unwrap();
+                write_half.write_all(b"\n").await.unwrap();
+                write_half.flush().await.unwrap();
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn default_session_resolution_skips_newer_stale_registry_entries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let live_socket = temp_dir.path().join("live.sock");
+        let stale_socket = temp_dir.path().join("stale.sock");
+
+        let live_session = LaunchSessionMetadata {
+            version: strait::launch::SESSION_CONTROL_PROTOCOL_VERSION,
+            session_id: "live-session".to_string(),
+            mode: "observe".to_string(),
+            control_socket_path: live_socket.clone(),
+            observation: strait::launch::ObservationHandle {
+                transport: "unix_socket".to_string(),
+                path: temp_dir.path().join("live-observe.sock"),
+            },
+            container_id: None,
+            container_name: None,
+        };
+
+        let server = spawn_session_info_server(&live_socket, live_session.clone()).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let stale_listener = UnixListener::bind(&stale_socket).unwrap();
+        drop(stale_listener);
+
+        let stale_session = LaunchSessionMetadata {
+            version: strait::launch::SESSION_CONTROL_PROTOCOL_VERSION,
+            session_id: "stale-session".to_string(),
+            mode: "observe".to_string(),
+            control_socket_path: stale_socket,
+            observation: strait::launch::ObservationHandle {
+                transport: "unix_socket".to_string(),
+                path: temp_dir.path().join("stale-observe.sock"),
+            },
+            container_id: None,
+            container_name: None,
+        };
+
+        let resolved = resolve_default_target_session(vec![live_session.clone(), stale_session])
+            .await
+            .unwrap();
+        assert_eq!(resolved.session_id, live_session.session_id);
+
+        server.abort();
+        let _ = tokio::fs::remove_file(&live_socket).await;
     }
 
     #[test]

@@ -142,18 +142,28 @@ Use `--warn` as an intermediate step: it loads the policy and logs violations wi
 strait launch --warn policy.cedar -- ./my-agent
 ```
 
-### Mock-TUI smoke flow (macOS-first)
+### Mock-TUI smoke flow (macOS-first, with gateway prerequisite)
 
-This repo ships a deterministic PTY fixture for local dogfooding. From the repo root:
+This repo ships a deterministic PTY fixture for local dogfooding. A repo-local `strait launch` also needs a Linux `strait-gateway` binary for the container architecture. On macOS, the host-native gateway binary is Mach-O and cannot run inside the Linux container, so build the Linux gateway first.
+
+Common targets:
+
+- Apple Silicon Docker/OrbStack defaulting to arm64 containers: `aarch64-unknown-linux-musl`
+- Intel Docker Desktop or amd64 containers: `x86_64-unknown-linux-musl`
+
+From the repo root:
 
 ```bash
 cargo build --bin strait --bin mock-tui-fixture
+cargo zigbuild --release --package strait-gateway --target <linux-target>
 target/debug/strait launch \
   --observe \
   --image ubuntu:24.04 \
   --output /tmp/mock-tui-observations.jsonl \
   -- "$(pwd)/target/debug/mock-tui-fixture"
 ```
+
+`strait launch` discovers the cross-built gateway from the normal Cargo target layout, so the `cargo zigbuild` artifact is the required prerequisite for this repo-local smoke flow.
 
 Then validate the interactive path manually:
 

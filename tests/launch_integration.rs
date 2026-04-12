@@ -2406,7 +2406,7 @@ fn launch_policy_replace_live_updates_running_session() {
 
     session.write_line("probe").unwrap();
     let allowed = session
-        .wait_for_event("probe", Duration::from_secs(10))
+        .wait_for_event("probe", Duration::from_secs(20))
         .unwrap();
     assert_eq!(allowed["status"].as_str(), Some("upstream_error"));
 

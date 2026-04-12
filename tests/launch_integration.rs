@@ -605,9 +605,13 @@ async fn session_cli_watch_exits_when_target_session_stops() {
         .await
         .expect("session.stop should succeed");
 
+    let exit_code = wait_for_launch_task_exit(launch_task).await;
+    assert_eq!(exit_code, 130, "session stop should terminate the session");
+    wait_for_launch_session_removed(&session.session_id).await;
+
     let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
         .await
-        .expect("session watch should exit after the session stops")
+        .expect("session watch should exit after the targeted session is removed")
         .expect("session watch process should remain waitable");
 
     let stderr = output_text(&stderr_task.await.expect("stderr task should finish"));
@@ -622,10 +626,6 @@ async fn session_cli_watch_exits_when_target_session_stops() {
         )),
         "session watch should stop reconnecting when the target session ends: {stderr}"
     );
-
-    let exit_code = wait_for_launch_task_exit(launch_task).await;
-    assert_eq!(exit_code, 130, "session stop should terminate the session");
-    wait_for_launch_session_removed(&session.session_id).await;
 }
 
 #[tokio::test]

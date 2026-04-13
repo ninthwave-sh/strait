@@ -8,7 +8,7 @@ version = "0.2.0"
 edition = "2021"
 description = "Policy platform for AI agents - Cedar policy over network, filesystem, and process access"
 license = "Apache-2.0"
-repository = "https://github.com/ninthwave-sh/strait"
+repository = "https://github.com/ninthwave-io/strait"
 readme = "README.md"
 
 [dependencies]

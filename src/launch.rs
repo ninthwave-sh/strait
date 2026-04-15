@@ -82,6 +82,12 @@ impl EnforcementMode {
     }
 }
 
+impl std::fmt::Display for EnforcementMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Default Docker image for the container sandbox.
 const DEFAULT_IMAGE: &str = "ubuntu:24.04";
 
@@ -870,14 +876,22 @@ impl LaunchSession {
         mode: EnforcementMode,
         proxy_ctx: Arc<ProxyContext>,
     ) -> anyhow::Result<(Self, watch::Receiver<bool>)> {
+        Self::create_with_mode_label(session_id, mode.as_str(), proxy_ctx).await
+    }
+
+    async fn create_with_mode_label(
+        session_id: &str,
+        mode_label: &str,
+        proxy_ctx: Arc<ProxyContext>,
+    ) -> anyhow::Result<(Self, watch::Receiver<bool>)> {
         let registry_dir = launch_session_registry_dir();
-        Self::create_in(&registry_dir, session_id, mode, proxy_ctx).await
+        Self::create_in(&registry_dir, session_id, mode_label, proxy_ctx).await
     }
 
     async fn create_in(
         root: &Path,
         session_id: &str,
-        mode: EnforcementMode,
+        mode_label: impl ToString,
         proxy_ctx: Arc<ProxyContext>,
     ) -> anyhow::Result<(Self, watch::Receiver<bool>)> {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -920,7 +934,7 @@ impl LaunchSession {
         let metadata = LaunchSessionMetadata {
             version: SESSION_CONTROL_PROTOCOL_VERSION,
             session_id: session_id.to_string(),
-            mode: mode.as_str().to_string(),
+            mode: mode_label.to_string(),
             control_socket_path: session_dir.join(SESSION_CONTROL_SOCKET_NAME),
             observation: ObservationHandle {
                 transport: "unix_socket".to_string(),
@@ -992,6 +1006,44 @@ impl LaunchSession {
 
     async fn observation_socket_path(&self) -> PathBuf {
         self.metadata.read().await.observation.path.clone()
+    }
+}
+
+/// Published runtime session for long-lived proxy-style runtimes.
+///
+/// Reuses the launch control protocol and observation socket model so external
+/// control planes can manage standalone proxy sessions without depending on the
+/// container-specific launch path.
+#[cfg(unix)]
+pub struct RuntimeSession {
+    inner: LaunchSession,
+    stop_rx: watch::Receiver<bool>,
+}
+
+#[cfg(unix)]
+impl RuntimeSession {
+    /// Create and publish a new runtime session with the supplied mode label.
+    pub async fn start(
+        mode_label: impl Into<String>,
+        proxy_ctx: Arc<ProxyContext>,
+        obs_stream: &ObservationStream,
+    ) -> anyhow::Result<Self> {
+        let mode_label = mode_label.into();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let (inner, stop_rx) =
+            LaunchSession::create_with_mode_label(&session_id, &mode_label, proxy_ctx).await?;
+        inner.publish(obs_stream).await?;
+        Ok(Self { inner, stop_rx })
+    }
+
+    /// Return metadata for the published runtime session.
+    pub async fn metadata(&self) -> LaunchSessionMetadata {
+        self.inner.metadata().await
+    }
+
+    /// Subscribe to runtime stop requests.
+    pub fn stop_receiver(&self) -> watch::Receiver<bool> {
+        self.stop_rx.clone()
     }
 }
 

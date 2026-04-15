@@ -97,11 +97,6 @@ impl PtySession {
             return Err(io::Error::last_os_error());
         }
 
-        let signal_rc = unsafe { libc::kill(self.child.id() as i32, libc::SIGWINCH) };
-        if signal_rc == -1 {
-            return Err(io::Error::last_os_error());
-        }
-
         Ok(())
     }
 

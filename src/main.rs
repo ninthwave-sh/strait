@@ -10,6 +10,7 @@ use tracing::{info, warn};
 use strait::config;
 use strait::credentials::CredentialStore;
 use strait::generate;
+use strait::observe::ObservationStream;
 use strait::templates;
 use strait::watch;
 
@@ -26,7 +27,7 @@ use strait::mitm::handle_connection;
 #[command(
     name = "strait",
     version,
-    about = "Policy platform for AI agents - Cedar policy over network, filesystem, and process access"
+    about = "Container-scoped MITM policy platform for AI agents"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -52,23 +53,23 @@ enum TemplateAction {
 
 #[derive(Subcommand)]
 enum SessionAction {
-    /// List active launch sessions discovered through the local registry.
+    /// List active strait runtime sessions discovered through the local registry.
     List,
 
-    /// Inspect a running launch session through the control API.
+    /// Inspect a running strait session through the control API.
     Info {
         /// Session ID to target.
         ///
-        /// If omitted, targets the newest active launch session.
+        /// If omitted, targets the newest active session.
         #[arg(long, value_name = "ID")]
         session: Option<String>,
     },
 
-    /// Watch the live observation stream for a running launch session.
+    /// Watch the live observation stream for a running strait session.
     Watch {
         /// Session ID to target.
         ///
-        /// If omitted, targets the newest active launch session.
+        /// If omitted, targets the newest active session.
         #[arg(long, value_name = "ID")]
         session: Option<String>,
     },
@@ -80,7 +81,7 @@ enum SessionAction {
     ReloadPolicy {
         /// Session ID to target.
         ///
-        /// If omitted, targets the newest active launch session.
+        /// If omitted, targets the newest active session.
         #[arg(long, value_name = "ID")]
         session: Option<String>,
     },
@@ -92,7 +93,7 @@ enum SessionAction {
     ReplacePolicy {
         /// Session ID to target.
         ///
-        /// If omitted, targets the newest active launch session.
+        /// If omitted, targets the newest active session.
         #[arg(long, value_name = "ID")]
         session: Option<String>,
 
@@ -101,11 +102,11 @@ enum SessionAction {
         policy: PathBuf,
     },
 
-    /// Stop a running launch session through the control API.
+    /// Stop a running strait session through the control API.
     Stop {
         /// Session ID to target.
         ///
-        /// If omitted, targets the newest active launch session.
+        /// If omitted, targets the newest active session.
         #[arg(long, value_name = "ID")]
         session: Option<String>,
     },
@@ -113,7 +114,7 @@ enum SessionAction {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the HTTPS proxy.
+    /// Start the HTTPS proxy for standalone integrations.
     #[command(after_help = "\
 TLS TRUST:
   strait generates a session-local CA certificate on each startup.
@@ -171,17 +172,17 @@ TLS TRUST:
         agent: Option<String>,
     },
 
-    /// Watch live observation events from a running strait session.
+    /// Watch live observation events from the newest running strait session.
     ///
     /// Compatibility alias for `strait session watch`.
-    /// Connects to the live stream for the newest published launch session
+    /// Connects to the live stream for the newest published session
     /// and renders a colored real-time stream of agent activity. Falls back
     /// to legacy socket discovery when no session is published. Auto-reconnects
     /// if the stream disconnects. Exits cleanly on Ctrl+C.
     Watch {
         /// Path to the observation Unix socket.
         ///
-        /// If omitted, auto-discovers the newest published launch session and
+        /// If omitted, auto-discovers the newest published session and
         /// falls back to legacy `/tmp/strait-*.sock` discovery.
         #[arg(short, long, value_name = "PATH")]
         socket: Option<PathBuf>,
@@ -207,7 +208,7 @@ TLS TRUST:
         action: TemplateAction,
     },
 
-    /// Manage running launch sessions over the local control API.
+    /// Manage running strait sessions over the local control API.
     #[command(after_help = "\
 LIVE POLICY UPDATES:
   Live updates apply to network policy only.
@@ -614,7 +615,9 @@ async fn resolve_default_target_session(
     sessions: Vec<LaunchSessionMetadata>,
 ) -> anyhow::Result<LaunchSessionMetadata> {
     if sessions.is_empty() {
-        anyhow::bail!("no active strait sessions found; start one with `strait launch ...`");
+        anyhow::bail!(
+            "no active strait sessions found; start one with `strait proxy --config ...` or `strait launch ...`"
+        );
     }
 
     for candidate in session_registry_candidates_newest_first(sessions) {
@@ -628,7 +631,9 @@ async fn resolve_default_target_session(
         }
     }
 
-    anyhow::bail!("no active strait sessions found; start one with `strait launch ...`");
+    anyhow::bail!(
+        "no active strait sessions found; start one with `strait proxy --config ...` or `strait launch ...`"
+    );
 }
 
 #[cfg(unix)]
@@ -678,27 +683,31 @@ fn format_session_list(sessions: &[LaunchSessionMetadata]) -> String {
 
 #[cfg(unix)]
 fn format_session_info(session: &LaunchSessionMetadata) -> String {
-    let container_id = session.container_id.as_deref().unwrap_or("-");
-    let container_name = session.container_name.as_deref().unwrap_or("-");
-
-    format!(
+    let mut output = format!(
         "\
 Session ID: {}
 Mode: {}
 Control socket: {}
 Observation socket: {}
-Container ID: {}
-Container name: {}
-Policy updates: {}
 ",
         session.session_id,
         session.mode,
         session.control_socket_path.display(),
         session.observation.path.display(),
-        container_id,
-        container_name,
-        LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE,
-    )
+    );
+
+    if let Some(container_id) = session.container_id.as_deref() {
+        output.push_str(&format!("Container ID: {}\n", container_id));
+    }
+    if let Some(container_name) = session.container_name.as_deref() {
+        output.push_str(&format!("Container name: {}\n", container_name));
+    }
+
+    output.push_str(&format!(
+        "Policy updates: {}\n",
+        LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE
+    ));
+    output
 }
 
 #[cfg(unix)]
@@ -755,8 +764,24 @@ async fn run_proxy(config_path: PathBuf) -> anyhow::Result<()> {
     let config = StraitConfig::load(&config_path)?;
     info!(path = %config_path.display(), "configuration loaded");
 
-    // Build shared proxy context
-    let ctx = Arc::new(ProxyContext::from_config(&config)?);
+    // Build shared proxy context with a live observation stream so external
+    // control surfaces can attach to standalone proxy sessions.
+    let mut ctx = ProxyContext::from_config(&config)?;
+    let obs_stream = ObservationStream::new();
+    ctx.observation_stream = Some(obs_stream.clone());
+    let ctx = Arc::new(ctx);
+
+    #[cfg(unix)]
+    let runtime_session = {
+        let mode_label = format!("proxy-{}", ctx.enforcement_mode);
+        let session =
+            strait::launch::RuntimeSession::start(mode_label, ctx.clone(), &obs_stream).await?;
+        let metadata = session.metadata().await;
+        eprintln!("Session ID={}", metadata.session_id);
+        eprintln!("CONTROL_SOCKET={}", metadata.control_socket_path.display());
+        eprintln!("OBSERVATION_SOCKET={}", metadata.observation.path.display());
+        session
+    };
 
     let listener = bind_proxy_listener(&config, &ctx).await?;
 
@@ -786,15 +811,48 @@ async fn run_proxy(config_path: PathBuf) -> anyhow::Result<()> {
         });
     }
 
+    #[cfg(unix)]
+    let mut stop_rx = runtime_session.stop_receiver();
+
     loop {
-        let (client, peer) = listener.accept().await?;
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(client, peer, &ctx).await {
-                warn!(error = %e, "connection error");
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    match changed {
+                        Ok(()) if *stop_rx.borrow() => {
+                            info!("proxy session stop requested over control API");
+                            break;
+                        }
+                        Ok(()) => continue,
+                        Err(_) => break,
+                    }
+                }
+                accepted = listener.accept() => {
+                    let (client, peer) = accepted?;
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(client, peer, &ctx).await {
+                            warn!(error = %e, "connection error");
+                        }
+                    });
+                }
             }
-        });
+        }
+
+        #[cfg(not(unix))]
+        {
+            let (client, peer) = listener.accept().await?;
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(client, peer, &ctx).await {
+                    warn!(error = %e, "connection error");
+                }
+            });
+        }
     }
+
+    Ok(())
 }
 
 /// Run the proxy in observation mode for a fixed duration, then generate policy.
@@ -964,6 +1022,26 @@ mod tests {
             }
             _ => panic!("expected Launch subcommand"),
         }
+    }
+
+    #[test]
+    fn test_format_session_info_handles_proxy_sessions_without_container_metadata() {
+        let info = format_session_info(&LaunchSessionMetadata {
+            version: 1,
+            session_id: "session-123".to_string(),
+            mode: "proxy-enforce".to_string(),
+            control_socket_path: PathBuf::from("/tmp/control.sock"),
+            observation: strait::launch::ObservationHandle {
+                transport: "unix_socket".to_string(),
+                path: PathBuf::from("/tmp/observe.sock"),
+            },
+            container_id: None,
+            container_name: None,
+        });
+
+        assert!(info.contains("Mode: proxy-enforce"));
+        assert!(!info.contains("Container ID:"));
+        assert!(!info.contains("Container name:"));
     }
 
     #[test]

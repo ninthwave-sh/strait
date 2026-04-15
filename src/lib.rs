@@ -1,5 +1,5 @@
-//! strait — HTTPS proxy with Cedar policy evaluation, credential injection,
-//! and audit logging.
+//! strait — container-scoped MITM proxy with Cedar policy over network,
+//! filesystem, and process access.
 //!
 //! This library crate re-exports the public modules used by the `strait`
 //! binary and by integration tests.

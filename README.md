@@ -55,7 +55,7 @@ Strait's trust boundary is **container-local**. No machine-wide CA install is re
 
 What happens at launch:
 
-1. A session-local CA is generated on the host (`~/.strait/ca.pem`) and bind-mounted read-only into the container at `/strait/ca.pem`. Nothing is added to the host's system trust store.
+1. A session-local CA is generated on the host and written to a private temporary file, then bind-mounted read-only into the container at `/strait/ca.pem`. Nothing is added to the host's system trust store.
 2. An entrypoint script inside the container concatenates the image's system CA bundle (Debian, Alpine, or RHEL layout -- whichever the image ships) with the session CA and writes the result to `/tmp/strait-ca-bundle.pem`. If the CA source is unreadable the entrypoint fails loudly instead of falling back to host-wide trust.
 3. The container's trust env vars (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`) are all pointed at the augmented bundle, so OpenSSL, Node, and Python-based agents pick up the session CA automatically.
 4. The container's proxy env vars (`HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy`) are all pointed at the in-container gateway at `http://127.0.0.1:3128`.

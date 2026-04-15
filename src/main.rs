@@ -710,9 +710,17 @@ Observation socket: {}
         LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE
     ));
 
-    for line in container_trust_diagnostic_lines() {
-        output.push_str(&line);
-        output.push('\n');
+    // The container trust boundary only applies to launched sessions that
+    // actually own a container. Standalone `strait proxy` sessions rely on
+    // whatever host trust the pointing client already has, and none of the
+    // diagnostic lines ("/strait/ca.pem", "--network=none", gateway socket)
+    // describe how they actually operate. Emitting the diagnostic for those
+    // sessions would be actively misleading.
+    if session.container_id.is_some() || session.container_name.is_some() {
+        for line in container_trust_diagnostic_lines() {
+            output.push_str(&line);
+            output.push('\n');
+        }
     }
 
     output
@@ -1050,6 +1058,22 @@ mod tests {
         assert!(info.contains("Mode: proxy-enforce"));
         assert!(!info.contains("Container ID:"));
         assert!(!info.contains("Container name:"));
+
+        // Proxy sessions do not inject CA into a container, do not use
+        // --network=none, and do not route through the gateway. Emitting the
+        // container trust diagnostic for them would be actively misleading.
+        assert!(
+            !info.contains("Trust boundary"),
+            "proxy session info must not advertise the container trust boundary: {info}"
+        );
+        assert!(
+            !info.contains("/strait/ca.pem"),
+            "proxy session info must not reference container-only paths: {info}"
+        );
+        assert!(
+            !info.contains("--network=none"),
+            "proxy session info must not reference container-only network config: {info}"
+        );
     }
 
     #[test]

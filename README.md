@@ -49,6 +49,24 @@ Cedar policies control three domains:
 
 Standalone proxy sessions still exist as a secondary mode for debugging and integrations, and they publish the same session control surfaces. They are useful infrastructure, but they are not the primary product wedge.
 
+## Trust boundary
+
+Strait's trust boundary is **container-local**. No machine-wide CA install is required for the primary `strait launch` runtime.
+
+What happens at launch:
+
+1. A session-local CA is generated on the host (`~/.strait/ca.pem`) and bind-mounted read-only into the container at `/strait/ca.pem`. Nothing is added to the host's system trust store.
+2. An entrypoint script inside the container concatenates the image's system CA bundle (Debian, Alpine, or RHEL layout -- whichever the image ships) with the session CA and writes the result to `/tmp/strait-ca-bundle.pem`. If the CA source is unreadable the entrypoint fails loudly instead of falling back to host-wide trust.
+3. The container's trust env vars (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`) are all pointed at the augmented bundle, so OpenSSL, Node, and Python-based agents pick up the session CA automatically.
+4. The container's proxy env vars (`HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy`) are all pointed at the in-container gateway at `http://127.0.0.1:3128`.
+5. The container runs with `--network=none`. The only network path off the container is through the bind-mounted Unix socket that the `strait-gateway` binary forwards to the host proxy. Direct TCP bypass is not possible.
+
+When the session ends, the bind-mounted CA and the container are removed. The host's system trust store is untouched, and there is no step in the supported launch flow that tells an operator to install the CA anywhere on the host.
+
+`strait launch` and `strait session info` both print this trust boundary diagnostic when a session starts or is inspected, so it is always visible when debugging a failed launch.
+
+Standalone proxy mode (`strait proxy`) does **not** share this container-local guarantee: that mode depends on the host's trust configuration for whichever client points at it. See [Standalone proxy mode](#standalone-proxy-mode) for the tradeoff.
+
 ## Quick start
 
 ### Launch an interactive session
@@ -286,9 +304,10 @@ strait watch                                       # compatibility alias for new
 
 ## Known limitations
 
-- **Network enforcement requires a container runtime** — containers run with `--network=none` (no network interfaces). Traffic reaches the proxy through a gateway binary that communicates over a bind-mounted Unix socket. Direct TCP bypass is not possible inside the container, but the enforcement only applies when running under `strait launch`.
-- **Filesystem and process enforcement rely on container isolation** — standard container security model.
-- **Live mutation stops at the network boundary** — `strait session reload-policy` and `strait session replace-policy` can update HTTP policy live, but filesystem mounts and available executables are fixed for the lifetime of the launched container.
+- **Network enforcement requires a container runtime** - containers run with `--network=none` (no network interfaces). Traffic reaches the proxy through a gateway binary that communicates over a bind-mounted Unix socket. Direct TCP bypass is not possible inside the container, but the enforcement only applies when running under `strait launch`.
+- **Trust is container-local, not host-wide** - the session CA is only injected inside the container. Standalone `strait proxy` sessions rely on whatever trust configuration the pointing client already has; only `strait launch` gives you the "no machine-wide CA install" guarantee.
+- **Filesystem and process enforcement rely on container isolation** - standard container security model.
+- **Live mutation stops at the network boundary** - `strait session reload-policy` and `strait session replace-policy` can update HTTP policy live, but filesystem mounts and available executables are fixed for the lifetime of the launched container.
 
 ## Install
 

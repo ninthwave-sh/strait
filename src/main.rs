@@ -18,6 +18,8 @@ use strait::watch;
 use strait::config::sighup_reload_task;
 use strait::config::{git_policy_poll_task, ProxyContext, StraitConfig};
 #[cfg(unix)]
+use strait::container::container_trust_diagnostic_lines;
+#[cfg(unix)]
 use strait::launch::{
     LaunchPolicyMutationResult, LaunchSessionMetadata, LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE,
 };
@@ -707,6 +709,12 @@ Observation socket: {}
         "Policy updates: {}\n",
         LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE
     ));
+
+    for line in container_trust_diagnostic_lines() {
+        output.push_str(&line);
+        output.push('\n');
+    }
+
     output
 }
 
@@ -1042,6 +1050,58 @@ mod tests {
         assert!(info.contains("Mode: proxy-enforce"));
         assert!(!info.contains("Container ID:"));
         assert!(!info.contains("Container name:"));
+    }
+
+    #[test]
+    fn test_format_session_info_includes_container_trust_boundary_diagnostic() {
+        let info = format_session_info(&LaunchSessionMetadata {
+            version: 1,
+            session_id: "session-456".to_string(),
+            mode: "launch-enforce".to_string(),
+            control_socket_path: PathBuf::from("/tmp/control.sock"),
+            observation: strait::launch::ObservationHandle {
+                transport: "unix_socket".to_string(),
+                path: PathBuf::from("/tmp/observe.sock"),
+            },
+            container_id: Some("abc123".to_string()),
+            container_name: Some("strait-session-456".to_string()),
+        });
+
+        // Core session fields remain.
+        assert!(info.contains("Session ID: session-456"));
+        assert!(info.contains("Container ID: abc123"));
+        assert!(info.contains("Container name: strait-session-456"));
+
+        // Trust boundary diagnostics must be visible to operators so they can
+        // debug a failed launch without reaching for host-wide workarounds.
+        assert!(
+            info.contains("Trust boundary"),
+            "expected trust boundary diagnostic, got: {info}"
+        );
+        assert!(
+            info.contains("container-local"),
+            "expected container-local framing, got: {info}"
+        );
+        assert!(
+            info.contains("no machine-wide CA install required"),
+            "expected the no-machine-wide disclaimer, got: {info}"
+        );
+        assert!(
+            info.contains("/tmp/strait-ca-bundle.pem"),
+            "expected augmented bundle path, got: {info}"
+        );
+        assert!(
+            info.contains("SSL_CERT_FILE"),
+            "expected SSL_CERT_FILE in trust env vars, got: {info}"
+        );
+        assert!(
+            info.contains("HTTPS_PROXY"),
+            "expected HTTPS_PROXY in proxy env vars, got: {info}"
+        );
+        assert!(
+            info.contains("--network=none"),
+            "expected --network=none in diagnostic, got: {info}"
+        );
     }
 
     #[test]

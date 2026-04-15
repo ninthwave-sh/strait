@@ -820,6 +820,110 @@ async fn launch_observe_contains_lifecycle_events() {
     assert!(!stops.is_empty(), "should have container_stop event");
 }
 
+/// The container trust contract must be observable from inside the running
+/// container: the augmented CA bundle must exist and must include the session
+/// CA, and the trust/proxy env vars must point at the expected paths. This
+/// locks in the "no machine-wide CA install" promise at runtime, not just at
+/// config-build time.
+#[tokio::test]
+async fn launch_observe_injects_augmented_ca_bundle_and_trust_env_vars() {
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let obs_path = temp_dir.path().join("observations.jsonl");
+    let trust_capture_dir = temp_dir.path().join("trust-capture");
+    std::fs::create_dir_all(&trust_capture_dir).unwrap();
+
+    // Script runs inside the container after the entrypoint has built
+    // /tmp/strait-ca-bundle.pem. We copy the bundle, snapshot the trust env
+    // vars, and record the CA source path that strait bind-mounts. The
+    // /test-out directory is a read-write bind mount so we can read the
+    // captured state back from the host.
+    let script = r#"
+set -e
+echo "SSL_CERT_FILE=${SSL_CERT_FILE:-unset}" > /test-out/env.txt
+echo "NODE_EXTRA_CA_CERTS=${NODE_EXTRA_CA_CERTS:-unset}" >> /test-out/env.txt
+echo "REQUESTS_CA_BUNDLE=${REQUESTS_CA_BUNDLE:-unset}" >> /test-out/env.txt
+echo "HTTPS_PROXY=${HTTPS_PROXY:-unset}" >> /test-out/env.txt
+echo "HTTP_PROXY=${HTTP_PROXY:-unset}" >> /test-out/env.txt
+echo "https_proxy=${https_proxy:-unset}" >> /test-out/env.txt
+echo "http_proxy=${http_proxy:-unset}" >> /test-out/env.txt
+cp /tmp/strait-ca-bundle.pem /test-out/augmented-bundle.pem
+cp /strait/ca.pem /test-out/source-ca.pem
+"#;
+
+    let exit_code = strait::launch::run_launch_observe(
+        vec!["bash".to_string(), "-lc".to_string(), script.to_string()],
+        Some(TEST_IMAGE),
+        Some(obs_path.clone()),
+        None,
+        Vec::new(),
+        vec![],
+        vec![strait::launch::ExtraMount {
+            host_path: trust_capture_dir.display().to_string(),
+            container_path: "/test-out".to_string(),
+            mode: "rw".to_string(),
+        }],
+        false,
+    )
+    .await
+    .expect("observe launch should succeed");
+
+    assert_eq!(exit_code, 0, "trust-capture script should exit cleanly");
+
+    let env_text = std::fs::read_to_string(trust_capture_dir.join("env.txt"))
+        .expect("container should record trust/proxy env state");
+
+    // Trust env vars must all point at the augmented bundle.
+    for var in strait::container::CONTAINER_TRUST_ENV_VARS {
+        let expected = format!("{var}={}", strait::container::CONTAINER_CA_BUNDLE_PATH);
+        assert!(
+            env_text.contains(&expected),
+            "trust env var {var} should be set to the augmented bundle. Got:\n{env_text}"
+        );
+    }
+
+    // Proxy env vars must all point at the gateway listener.
+    let expected_proxy = format!("http://{}", strait::container::GATEWAY_LISTEN_ADDR);
+    for var in strait::container::CONTAINER_PROXY_ENV_VARS {
+        let expected = format!("{var}={expected_proxy}");
+        assert!(
+            env_text.contains(&expected),
+            "proxy env var {var} should be set to the gateway listener. Got:\n{env_text}"
+        );
+    }
+
+    // Augmented bundle must exist and must contain the session CA bytes.
+    let source_ca = std::fs::read_to_string(trust_capture_dir.join("source-ca.pem"))
+        .expect("source CA should be bind-mounted into the container");
+    assert!(
+        source_ca.contains("BEGIN CERTIFICATE"),
+        "source CA should be a PEM-encoded certificate: {source_ca}"
+    );
+
+    let augmented = std::fs::read_to_string(trust_capture_dir.join("augmented-bundle.pem"))
+        .expect("augmented CA bundle should be built inside the container");
+    assert!(
+        augmented.contains("BEGIN CERTIFICATE"),
+        "augmented bundle should be PEM-encoded: {augmented}"
+    );
+    assert!(
+        augmented.contains(source_ca.trim()),
+        "augmented bundle should include the session CA from /strait/ca.pem"
+    );
+    // A real distro CA bundle is always much larger than the single session CA.
+    assert!(
+        augmented.len() > source_ca.len() + 1000,
+        "augmented bundle should also include the image's system CA bundle \
+         (augmented={} bytes, source={} bytes)",
+        augmented.len(),
+        source_ca.len()
+    );
+}
+
 /// TTY observe launches apply the initial terminal size to the container.
 #[tokio::test]
 async fn launch_observe_sets_initial_terminal_size() {

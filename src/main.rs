@@ -18,6 +18,8 @@ use strait::watch;
 use strait::config::sighup_reload_task;
 use strait::config::{git_policy_poll_task, ProxyContext, StraitConfig};
 #[cfg(unix)]
+use strait::container::container_trust_diagnostic_lines;
+#[cfg(unix)]
 use strait::launch::{
     LaunchPolicyMutationResult, LaunchSessionMetadata, LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE,
 };
@@ -707,6 +709,20 @@ Observation socket: {}
         "Policy updates: {}\n",
         LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE
     ));
+
+    // The container trust boundary only applies to launched sessions that
+    // actually own a container. Standalone `strait proxy` sessions rely on
+    // whatever host trust the pointing client already has, and none of the
+    // diagnostic lines ("/strait/ca.pem", "--network=none", gateway socket)
+    // describe how they actually operate. Emitting the diagnostic for those
+    // sessions would be actively misleading.
+    if session.container_id.is_some() || session.container_name.is_some() {
+        for line in container_trust_diagnostic_lines() {
+            output.push_str(&line);
+            output.push('\n');
+        }
+    }
+
     output
 }
 
@@ -1042,6 +1058,74 @@ mod tests {
         assert!(info.contains("Mode: proxy-enforce"));
         assert!(!info.contains("Container ID:"));
         assert!(!info.contains("Container name:"));
+
+        // Proxy sessions do not inject CA into a container, do not use
+        // --network=none, and do not route through the gateway. Emitting the
+        // container trust diagnostic for them would be actively misleading.
+        assert!(
+            !info.contains("Trust boundary"),
+            "proxy session info must not advertise the container trust boundary: {info}"
+        );
+        assert!(
+            !info.contains("/strait/ca.pem"),
+            "proxy session info must not reference container-only paths: {info}"
+        );
+        assert!(
+            !info.contains("--network=none"),
+            "proxy session info must not reference container-only network config: {info}"
+        );
+    }
+
+    #[test]
+    fn test_format_session_info_includes_container_trust_boundary_diagnostic() {
+        let info = format_session_info(&LaunchSessionMetadata {
+            version: 1,
+            session_id: "session-456".to_string(),
+            mode: "launch-enforce".to_string(),
+            control_socket_path: PathBuf::from("/tmp/control.sock"),
+            observation: strait::launch::ObservationHandle {
+                transport: "unix_socket".to_string(),
+                path: PathBuf::from("/tmp/observe.sock"),
+            },
+            container_id: Some("abc123".to_string()),
+            container_name: Some("strait-session-456".to_string()),
+        });
+
+        // Core session fields remain.
+        assert!(info.contains("Session ID: session-456"));
+        assert!(info.contains("Container ID: abc123"));
+        assert!(info.contains("Container name: strait-session-456"));
+
+        // Trust boundary diagnostics must be visible to operators so they can
+        // debug a failed launch without reaching for host-wide workarounds.
+        assert!(
+            info.contains("Trust boundary"),
+            "expected trust boundary diagnostic, got: {info}"
+        );
+        assert!(
+            info.contains("container-local"),
+            "expected container-local framing, got: {info}"
+        );
+        assert!(
+            info.contains("no machine-wide CA install required"),
+            "expected the no-machine-wide disclaimer, got: {info}"
+        );
+        assert!(
+            info.contains("/tmp/strait-ca-bundle.pem"),
+            "expected augmented bundle path, got: {info}"
+        );
+        assert!(
+            info.contains("SSL_CERT_FILE"),
+            "expected SSL_CERT_FILE in trust env vars, got: {info}"
+        );
+        assert!(
+            info.contains("HTTPS_PROXY"),
+            "expected HTTPS_PROXY in proxy env vars, got: {info}"
+        );
+        assert!(
+            info.contains("--network=none"),
+            "expected --network=none in diagnostic, got: {info}"
+        );
     }
 
     #[test]

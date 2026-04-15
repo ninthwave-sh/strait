@@ -54,7 +54,9 @@ use crate::config::{
     reload_policy, replace_policy, LivePolicyBounds, PolicyConfig, PolicyMutationOutcome,
     ProxyContext,
 };
-use crate::container::{ContainerManager, ContainerPermission, ContainerPolicy};
+use crate::container::{
+    container_trust_diagnostic_lines, ContainerManager, ContainerPermission, ContainerPolicy,
+};
 use crate::credentials::CredentialStore;
 use crate::mitm::handle_connection;
 use crate::observe::{EventKind, ObservationSessionContext, ObservationStream};
@@ -822,9 +824,26 @@ async fn start_launch_control_server(
     }))
 }
 
+/// Build the startup banner printed by `strait launch` once the session is
+/// live.
+///
+/// Invariant: this helper is only called after `LaunchSession::set_container`
+/// has been invoked, so `metadata.container_id` (and usually
+/// `metadata.container_name`) are always set. The trust diagnostic is
+/// appended unconditionally because it only makes sense for container-backed
+/// sessions. The debug assertion documents this invariant and crashes tests
+/// if a future caller ever tries to reuse this helper for a non-container
+/// session, where `format_session_info` in `main.rs` is the correct choice
+/// because it already gates the diagnostic on container presence.
 #[cfg(unix)]
 fn launch_session_output_lines(metadata: &LaunchSessionMetadata) -> Vec<String> {
-    vec![
+    debug_assert!(
+        metadata.container_id.is_some() || metadata.container_name.is_some(),
+        "launch_session_output_lines is container-only; proxy sessions must use \
+         format_session_info which gates the trust diagnostic on container presence"
+    );
+
+    let mut lines = vec![
         format!("Session ID: {}", metadata.session_id),
         format!("Control socket: {}", metadata.control_socket_path.display()),
         format!(
@@ -836,7 +855,9 @@ fn launch_session_output_lines(metadata: &LaunchSessionMetadata) -> Vec<String> 
             metadata.session_id
         ),
         format!("Policy updates: {LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE}"),
-    ]
+    ];
+    lines.extend(container_trust_diagnostic_lines());
+    lines
 }
 
 fn emit_policy_reload_event(
@@ -3469,6 +3490,56 @@ permit(
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn launch_session_output_lines_include_trust_boundary_diagnostic() {
+        let metadata = LaunchSessionMetadata {
+            version: SESSION_CONTROL_PROTOCOL_VERSION,
+            session_id: "trust-test".to_string(),
+            mode: "enforce".to_string(),
+            control_socket_path: PathBuf::from("/tmp/control.sock"),
+            observation: ObservationHandle {
+                transport: "unix_socket".to_string(),
+                path: PathBuf::from("/tmp/observe.sock"),
+            },
+            container_id: Some("abc123".to_string()),
+            container_name: Some("strait-test".to_string()),
+        };
+
+        let lines = launch_session_output_lines(&metadata);
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Trust boundary") && line.contains("container-local")),
+            "launch output should announce the container-local trust boundary: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("no machine-wide CA install required")),
+            "launch output should explicitly disclaim machine-wide CA install: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("/tmp/strait-ca-bundle.pem")),
+            "launch output should surface the augmented CA bundle path: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("SSL_CERT_FILE")),
+            "launch output should list the trust env vars: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("HTTPS_PROXY")),
+            "launch output should list the proxy env vars: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("--network=none")),
+            "launch output should mention --network=none: {lines:?}"
+        );
+    }
+
     #[test]
     fn launch_live_policy_bounds_include_workspace_alias() {
         let bounds = launch_live_policy_bounds(Path::new("/tmp/strait-project"));
@@ -4244,6 +4315,42 @@ forbid(principal, action, resource);
             msg.contains(&format!("strait-gateway-{target}")),
             "error should mention arch-qualified name: {msg}"
         );
+    }
+
+    /// The missing-gateway error must not tempt operators into host-wide
+    /// trust workarounds. The container trust boundary only holds if we
+    /// refuse to launch without the gateway instead of suggesting "install
+    /// the CA on the host" as an escape hatch.
+    #[test]
+    fn resolve_missing_binary_error_does_not_suggest_host_wide_trust_workarounds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "aarch64-unknown-linux-musl";
+
+        let err = resolve_gateway_binary_from(tmp.path(), target).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+
+        let banned = [
+            "install the ca on the host",
+            "install the ca on your host",
+            "add the ca to your system",
+            "add the ca to the system",
+            "system trust store",
+            "host-wide ca",
+            "host ca bundle",
+            "/etc/ssl/certs",
+            "/usr/local/share/ca-certificates",
+            "update-ca-certificates",
+            "security add-trusted-cert",
+            "export https_proxy",
+            "--network=host",
+            "--net=host",
+        ];
+        for phrase in banned {
+            assert!(
+                !msg.contains(phrase),
+                "missing-gateway error must not suggest host-wide workaround {phrase:?}: {msg}"
+            );
+        }
     }
 
     // -- parse_extra_mounts tests ---------------------------------------------

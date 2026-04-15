@@ -98,19 +98,74 @@ pub struct ContainerConfig {
 const DEFAULT_STOP_TIMEOUT_SECS: i64 = 10;
 
 /// Path where the CA PEM is bind-mounted inside the container.
-const CONTAINER_CA_PEM_PATH: &str = "/strait/ca.pem";
+pub const CONTAINER_CA_PEM_PATH: &str = "/strait/ca.pem";
 
 /// Path for the augmented CA bundle created at container startup.
-const CONTAINER_CA_BUNDLE_PATH: &str = "/tmp/strait-ca-bundle.pem";
+pub const CONTAINER_CA_BUNDLE_PATH: &str = "/tmp/strait-ca-bundle.pem";
 
 /// Path where the proxy Unix socket is bind-mounted inside the container.
-const CONTAINER_PROXY_SOCKET_PATH: &str = "/strait/proxy.sock";
+pub const CONTAINER_PROXY_SOCKET_PATH: &str = "/strait/proxy.sock";
 
 /// Path where the gateway binary is bind-mounted inside the container.
-const CONTAINER_GATEWAY_PATH: &str = "/strait/gateway/strait-gateway";
+pub const CONTAINER_GATEWAY_PATH: &str = "/strait/gateway/strait-gateway";
 
 /// Address the gateway listens on inside the container.
-const GATEWAY_LISTEN_ADDR: &str = "127.0.0.1:3128";
+pub const GATEWAY_LISTEN_ADDR: &str = "127.0.0.1:3128";
+
+/// Environment variables set inside the container so common HTTPS clients
+/// (libcurl, Python `requests`, Node.js, Go's `crypto/x509`) trust the
+/// session CA via the augmented bundle at [`CONTAINER_CA_BUNDLE_PATH`].
+///
+/// These are set only when the launch path provides a session CA. They
+/// are intentionally container-local: the bundle file lives inside the
+/// container's writable tmpfs and the host trust store is never touched.
+pub const CONTAINER_TRUST_ENV_VARS: &[&str] =
+    &["SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE"];
+
+/// Environment variables set inside the container so HTTP-aware tools
+/// route through the gateway at [`GATEWAY_LISTEN_ADDR`] instead of the
+/// missing host network. All four casings are set because different tools
+/// check different variants.
+pub const CONTAINER_PROXY_ENV_VARS: &[&str] =
+    &["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"];
+
+/// Build the container trust boundary diagnostic, suitable for printing at
+/// launch startup or returning from `strait session info`.
+///
+/// The output is a fixed list of facts about how the container reaches the
+/// proxy and how it trusts the session CA. None of it is host-specific or
+/// session-specific, so it can be generated synchronously without touching
+/// the running container.
+///
+/// Operators reading the diagnostic should be able to answer:
+///
+/// 1. Where is the augmented CA bundle inside the container?
+/// 2. Which env vars point clients at that bundle?
+/// 3. How does outbound HTTP traffic reach the host proxy?
+/// 4. Is host-wide CA trust required? (Answer: no, it is explicitly not.)
+pub fn container_trust_diagnostic_lines() -> Vec<String> {
+    let proxy_url = format!("http://{GATEWAY_LISTEN_ADDR}");
+    vec![
+        "Trust boundary: container-local (no machine-wide CA install required).".to_string(),
+        format!(
+            "  CA source mount: {CONTAINER_CA_PEM_PATH} (read-only, removed when the session ends)"
+        ),
+        format!(
+            "  Augmented CA bundle: {CONTAINER_CA_BUNDLE_PATH} (built by the entrypoint script at container start)"
+        ),
+        format!(
+            "  Trust env vars: {} (all point at the augmented bundle)",
+            CONTAINER_TRUST_ENV_VARS.join(", ")
+        ),
+        format!(
+            "  Proxy env vars: {} (all set to {proxy_url})",
+            CONTAINER_PROXY_ENV_VARS.join(", ")
+        ),
+        format!(
+            "  Network: --network=none with traffic forced through {CONTAINER_GATEWAY_PATH} -> {CONTAINER_PROXY_SOCKET_PATH}"
+        ),
+    ]
+}
 
 /// Generate the shell entrypoint script that injects the Strait session CA
 /// into the container's trust store at startup.
@@ -585,12 +640,10 @@ impl ContainerManager {
         // All four variants are set because different tools check different
         // casings (e.g. curl checks http_proxy, Python checks HTTP_PROXY).
         let proxy_url = format!("http://{GATEWAY_LISTEN_ADDR}");
-        let mut env = vec![
-            format!("HTTPS_PROXY={proxy_url}"),
-            format!("HTTP_PROXY={proxy_url}"),
-            format!("https_proxy={proxy_url}"),
-            format!("http_proxy={proxy_url}"),
-        ];
+        let mut env: Vec<String> = CONTAINER_PROXY_ENV_VARS
+            .iter()
+            .map(|var| format!("{var}={proxy_url}"))
+            .collect();
 
         // Add PATH with extra directories for proc:exec binaries
         if !extra_path_dirs.is_empty() {
@@ -606,9 +659,9 @@ impl ContainerManager {
                 CONTAINER_CA_PEM_PATH,
             ));
 
-            env.push(format!("SSL_CERT_FILE={CONTAINER_CA_BUNDLE_PATH}"));
-            env.push(format!("NODE_EXTRA_CA_CERTS={CONTAINER_CA_BUNDLE_PATH}"));
-            env.push(format!("REQUESTS_CA_BUNDLE={CONTAINER_CA_BUNDLE_PATH}"));
+            for var in CONTAINER_TRUST_ENV_VARS {
+                env.push(format!("{var}={CONTAINER_CA_BUNDLE_PATH}"));
+            }
 
             Some(generate_ca_entrypoint_script())
         } else {
@@ -1538,6 +1591,166 @@ mod tests {
             assert!(
                 config.env.contains(&format!("{var}={proxy_url}")),
                 "{var} should still be set with CA injection: {:?}",
+                config.env
+            );
+        }
+    }
+
+    // -- Unit tests: container trust boundary contract (H-CSM-1) --------------
+
+    #[test]
+    fn trust_diagnostic_lines_describe_container_local_boundary() {
+        let lines = container_trust_diagnostic_lines();
+
+        assert!(
+            lines.iter().any(|line| line.contains("container-local")
+                && line.contains("no machine-wide CA install required")),
+            "trust diagnostic should make the container-local boundary explicit: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(CONTAINER_CA_PEM_PATH)),
+            "trust diagnostic should reference the CA source mount: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(CONTAINER_CA_BUNDLE_PATH)),
+            "trust diagnostic should reference the augmented bundle path: {lines:?}"
+        );
+        for var in CONTAINER_TRUST_ENV_VARS {
+            assert!(
+                lines.iter().any(|line| line.contains(var)),
+                "trust diagnostic should list {var}: {lines:?}"
+            );
+        }
+        for var in CONTAINER_PROXY_ENV_VARS {
+            assert!(
+                lines.iter().any(|line| line.contains(var)),
+                "trust diagnostic should list {var}: {lines:?}"
+            );
+        }
+        assert!(
+            lines.iter().any(|line| line.contains(GATEWAY_LISTEN_ADDR)),
+            "trust diagnostic should reference the gateway listen address: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("--network=none")),
+            "trust diagnostic should reference --network=none: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn trust_diagnostic_does_not_suggest_host_wide_trust_workarounds() {
+        let lines = container_trust_diagnostic_lines();
+        let joined = lines.join("\n").to_lowercase();
+
+        // These substrings would only appear if the diagnostic were describing
+        // a host-wide trust workaround. None of them should appear in the
+        // container-local contract, under any disclaimer wording.
+        let banned = [
+            "install the ca on the host",
+            "install ca on the host",
+            "system trust store",
+            "machine trust store",
+            "/etc/ssl/certs",
+            "trust store on the host",
+            "add to system",
+            "host-wide ca",
+            "host wide ca",
+        ];
+        for needle in banned {
+            assert!(
+                !joined.contains(needle),
+                "trust diagnostic must not suggest a host trust workaround ({needle}): {joined}"
+            );
+        }
+
+        // The phrase "machine-wide" may appear in the diagnostic, but only
+        // inside an explicit negation ("no machine-wide CA install required",
+        // "avoids machine-wide trust", etc.). Every occurrence must be
+        // immediately preceded by a negating word, so future wording shifts
+        // like "avoids" or "without" still pass as long as they are
+        // explicitly negating. This catches the regression where the
+        // diagnostic drifts into "see machine-wide ..." or
+        // "requires machine-wide ..." framing.
+        let allowed_prefixes = ["no ", "not ", "avoids ", "without "];
+        for (idx, _) in joined.match_indices("machine-wide") {
+            let preceded_by_negation = allowed_prefixes
+                .iter()
+                .any(|prefix| idx >= prefix.len() && joined[..idx].ends_with(prefix));
+            assert!(
+                preceded_by_negation,
+                "trust diagnostic mentions 'machine-wide' without a negating prefix \
+                 ({allowed_prefixes:?}): {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn ca_entrypoint_script_uses_canonical_paths_and_fails_on_missing_ca() {
+        let script = generate_ca_entrypoint_script();
+
+        // The script must reference the container constants verbatim so the
+        // operator-facing trust diagnostic and the in-container behavior stay
+        // in sync.
+        assert!(
+            script.contains(CONTAINER_CA_PEM_PATH),
+            "entrypoint script should reference {CONTAINER_CA_PEM_PATH}: {script}"
+        );
+        assert!(
+            script.contains(CONTAINER_CA_BUNDLE_PATH),
+            "entrypoint script should reference {CONTAINER_CA_BUNDLE_PATH}: {script}"
+        );
+
+        // Missing CA pem must produce an actionable error and a non-zero exit,
+        // not silently fall back to host trust assumptions.
+        assert!(
+            script.contains("ERROR: CA certificate not found"),
+            "entrypoint script should fail loudly when the CA mount is missing: {script}"
+        );
+        assert!(
+            script.contains("exit 1"),
+            "entrypoint script should exit non-zero on missing CA: {script}"
+        );
+
+        // The script must not suggest installing the CA on the host as a
+        // recovery hint.
+        let lower = script.to_lowercase();
+        assert!(
+            !lower.contains("install the ca"),
+            "entrypoint script must not suggest installing the CA on the host: {script}"
+        );
+        assert!(
+            !lower.contains("/etc/ssl/certs/strait"),
+            "entrypoint script must not write Strait CA into the host trust store: {script}"
+        );
+    }
+
+    #[test]
+    fn build_config_with_ca_uses_canonical_trust_env_var_set() {
+        let policy = policy_with(vec![]);
+        let ca_path = Path::new("/tmp/test-ca.pem");
+        let config =
+            build_test_config(&policy, "node:20", &[], Some(ca_path), test_base_dir()).unwrap();
+
+        // Every variable advertised by CONTAINER_TRUST_ENV_VARS must actually
+        // be set, and they must all point at the augmented bundle. This is
+        // the contract the trust diagnostic and the README rely on.
+        for var in CONTAINER_TRUST_ENV_VARS {
+            let expected = format!("{var}={CONTAINER_CA_BUNDLE_PATH}");
+            assert!(
+                config.env.contains(&expected),
+                "build_config must set {expected} when CA is provided: {:?}",
+                config.env
+            );
+        }
+        for var in CONTAINER_PROXY_ENV_VARS {
+            let prefix = format!("{var}=");
+            assert!(
+                config.env.iter().any(|e| e.starts_with(&prefix)),
+                "build_config must set {var} when CA is provided: {:?}",
                 config.env
             );
         }

@@ -824,8 +824,25 @@ async fn start_launch_control_server(
     }))
 }
 
+/// Build the startup banner printed by `strait launch` once the session is
+/// live.
+///
+/// Invariant: this helper is only called after `LaunchSession::set_container`
+/// has been invoked, so `metadata.container_id` (and usually
+/// `metadata.container_name`) are always set. The trust diagnostic is
+/// appended unconditionally because it only makes sense for container-backed
+/// sessions. The debug assertion documents this invariant and crashes tests
+/// if a future caller ever tries to reuse this helper for a non-container
+/// session, where `format_session_info` in `main.rs` is the correct choice
+/// because it already gates the diagnostic on container presence.
 #[cfg(unix)]
 fn launch_session_output_lines(metadata: &LaunchSessionMetadata) -> Vec<String> {
+    debug_assert!(
+        metadata.container_id.is_some() || metadata.container_name.is_some(),
+        "launch_session_output_lines is container-only; proxy sessions must use \
+         format_session_info which gates the trust diagnostic on container presence"
+    );
+
     let mut lines = vec![
         format!("Session ID: {}", metadata.session_id),
         format!("Control socket: {}", metadata.control_socket_path.display()),

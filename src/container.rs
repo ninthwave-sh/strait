@@ -1646,8 +1646,9 @@ mod tests {
         let lines = container_trust_diagnostic_lines();
         let joined = lines.join("\n").to_lowercase();
 
-        // Common phrasings of "install the CA on the host" that the container
-        // trust contract is meant to make unnecessary.
+        // These substrings would only appear if the diagnostic were describing
+        // a host-wide trust workaround. None of them should appear in the
+        // container-local contract, under any disclaimer wording.
         let banned = [
             "install the ca on the host",
             "install ca on the host",
@@ -1658,23 +1659,31 @@ mod tests {
             "add to system",
             "host-wide ca",
             "host wide ca",
-            "machine-wide",
         ];
         for needle in banned {
-            // "machine-wide" appears once in the explicit "no machine-wide ..."
-            // disclaimer; allow that single occurrence by checking
-            // `no machine-wide` as a context wrap.
-            if needle == "machine-wide" {
-                let stripped = joined.replace("no machine-wide", "");
-                assert!(
-                    !stripped.contains("machine-wide"),
-                    "trust diagnostic must not suggest machine-wide trust: {joined}"
-                );
-                continue;
-            }
             assert!(
                 !joined.contains(needle),
                 "trust diagnostic must not suggest a host trust workaround ({needle}): {joined}"
+            );
+        }
+
+        // The phrase "machine-wide" may appear in the diagnostic, but only
+        // inside an explicit negation ("no machine-wide CA install required",
+        // "avoids machine-wide trust", etc.). Every occurrence must be
+        // immediately preceded by a negating word, so future wording shifts
+        // like "avoids" or "without" still pass as long as they are
+        // explicitly negating. This catches the regression where the
+        // diagnostic drifts into "see machine-wide ..." or
+        // "requires machine-wide ..." framing.
+        let allowed_prefixes = ["no ", "not ", "avoids ", "without "];
+        for (idx, _) in joined.match_indices("machine-wide") {
+            let preceded_by_negation = allowed_prefixes
+                .iter()
+                .any(|prefix| idx >= prefix.len() && joined[..idx].ends_with(prefix));
+            assert!(
+                preceded_by_negation,
+                "trust diagnostic mentions 'machine-wide' without a negating prefix \
+                 ({allowed_prefixes:?}): {joined}"
             );
         }
     }

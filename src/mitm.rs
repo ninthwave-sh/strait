@@ -118,6 +118,7 @@ where
                     decision: "passthrough".to_string(),
                     latency_us: 0,
                     enforcement_mode: ctx.enforcement_mode.clone(),
+                    blocked: None,
                 });
             }
 
@@ -406,6 +407,11 @@ where
         // --- Policy evaluation ---
         let mut denied = false;
         let mut warned = false;
+        // Structured blocked-request metadata, populated whenever the
+        // request is blocked (or would be blocked in warn mode) so both
+        // the PolicyViolation and NetworkRequest observation events can
+        // carry the same explanation and candidate exception.
+        let mut blocked_info: Option<crate::observe::BlockedRequest> = None;
 
         if let Some(ref engine) = policy_guard {
             let action = format!("http:{method}");
@@ -452,6 +458,19 @@ where
                     "DENY: request blocked by Cedar policy"
                 );
 
+                // Synthesize blocked-request metadata so the emitted
+                // NetworkRequest event can identify the request, explain
+                // why it was blocked, and provide a concrete candidate
+                // exception that could unblock it.
+                blocked_info = Some(crate::policy::synthesize_blocked_request(
+                    host,
+                    &method,
+                    &path,
+                    &decision.policy_names,
+                    &decision.policy_reasons,
+                    decision.blocked_by_forbid,
+                ));
+
                 // Return 403 with structured JSON body
                 let body_json =
                     crate::policy::deny_response_body(host, &method, &path, &decision.policy_names);
@@ -481,6 +500,18 @@ where
                     "WARN: request would be denied by Cedar policy (allowing in warn mode)"
                 );
 
+                // Synthesize blocked-request metadata so the warn-mode
+                // emission carries the same explanation and candidate
+                // exception as an enforce-mode denial.
+                blocked_info = Some(crate::policy::synthesize_blocked_request(
+                    host,
+                    &method,
+                    &path,
+                    &decision.policy_names,
+                    &decision.policy_reasons,
+                    decision.blocked_by_forbid,
+                ));
+
                 // Emit PolicyViolation observation event
                 if let Some(ref obs) = ctx.observation_stream {
                     obs.emit(crate::observe::EventKind::PolicyViolation {
@@ -489,6 +520,7 @@ where
                         resource: format!("{host}{path}"),
                         decision: "warn".to_string(),
                         reason: denial_reason,
+                        blocked: blocked_info.clone(),
                     });
                 }
 
@@ -601,6 +633,7 @@ where
                 decision: decision_str.to_string(),
                 latency_us: eval_start.elapsed().as_micros() as u64,
                 enforcement_mode: ctx.enforcement_mode.clone(),
+                blocked: blocked_info.take(),
             });
         }
 

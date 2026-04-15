@@ -22,9 +22,10 @@ use std::sync::Arc;
 use anyhow::Context as _;
 
 use crate::credentials::parse_aws_host;
+use crate::observe::{BlockedRequest, CandidateException, ExceptionDirective, ExceptionScope};
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid,
-    PolicySet, Request, RestrictedExpression, Schema, ValidationMode, Validator,
+    Authorizer, Context, Decision, Effect, Entities, Entity, EntityId, EntityTypeName, EntityUid,
+    PolicyId, PolicySet, Request, RestrictedExpression, Schema, ValidationMode, Validator,
 };
 
 /// Result of a Cedar policy evaluation.
@@ -35,6 +36,13 @@ pub struct PolicyDecision {
     pub policy_names: Vec<String>,
     /// `@reason` annotation values from matching policies (if any).
     pub policy_reasons: Vec<String>,
+    /// `true` when the denial was caused by a `forbid` policy. Cedar's
+    /// forbid-overrides-permit semantics mean no additional permit can
+    /// unblock such a request: the only remedy is to remove or narrow the
+    /// forbid policy itself. Used by blocked-request synthesis to mark the
+    /// request as "no candidate exception available" instead of inventing
+    /// a permit that would not actually work.
+    pub blocked_by_forbid: bool,
 }
 
 /// Holds the parsed Cedar policy set and authorizer, ready for per-request evaluation.
@@ -185,31 +193,58 @@ impl PolicyEngine {
             .authorizer
             .is_authorized(&request, &self.policy_set, &entities);
 
-        // Resolve policy IDs: prefer @id annotation value over auto-generated name.
-        // Also collect @reason annotations for human-readable denial messages.
+        let (policy_names, policy_reasons, blocked_by_forbid) =
+            self.collect_decision_metadata(response.diagnostics().reason());
+
+        Ok(PolicyDecision {
+            allowed: response.decision() == Decision::Allow,
+            policy_names,
+            policy_reasons,
+            blocked_by_forbid,
+        })
+    }
+
+    /// Collect per-decision metadata (policy names, `@reason`
+    /// annotations, and whether any matching policy has `Effect::Forbid`)
+    /// from the Cedar diagnostics.
+    ///
+    /// Shared between `evaluate`, `evaluate_fs`, and `evaluate_proc` so
+    /// a future change to the metadata collection rules only has to be
+    /// made in one place.
+    ///
+    /// When a `forbid` policy contributes to the decision, Cedar's
+    /// forbid-overrides-permit semantics mean no added permit can
+    /// unblock the request, so the downstream blocked-request synthesis
+    /// uses the returned `blocked_by_forbid` flag to emit the
+    /// no-candidate-exception variant.
+    fn collect_decision_metadata<'a, I>(&self, pids: I) -> (Vec<String>, Vec<String>, bool)
+    where
+        I: IntoIterator<Item = &'a PolicyId>,
+    {
         let mut policy_names = Vec::new();
         let mut policy_reasons = Vec::new();
-
-        for pid in response.diagnostics().reason() {
+        let mut blocked_by_forbid = false;
+        for pid in pids {
+            // Resolve policy ID: prefer @id annotation value over
+            // auto-generated name.
             let name = self
                 .policy_set
                 .annotation(pid, "id")
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| pid.to_string());
             policy_names.push(name);
-
-            // Collect @reason annotation if present (strait convention for
-            // human-readable denial messages in audit logs).
+            // Collect @reason annotation if present (strait convention
+            // for human-readable denial messages in audit logs).
             if let Some(reason) = self.policy_set.annotation(pid, "reason") {
                 policy_reasons.push(reason.to_string());
             }
+            if let Some(policy) = self.policy_set.policy(pid) {
+                if policy.effect() == Effect::Forbid {
+                    blocked_by_forbid = true;
+                }
+            }
         }
-
-        Ok(PolicyDecision {
-            allowed: response.decision() == Decision::Allow,
-            policy_names,
-            policy_reasons,
-        })
+        (policy_names, policy_reasons, blocked_by_forbid)
     }
 
     /// Evaluate a filesystem action against the loaded policy set.
@@ -258,24 +293,14 @@ impl PolicyEngine {
             .authorizer
             .is_authorized(&request, &self.policy_set, &entities);
 
-        let mut policy_names = Vec::new();
-        let mut policy_reasons = Vec::new();
-        for pid in response.diagnostics().reason() {
-            let name = self
-                .policy_set
-                .annotation(pid, "id")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| pid.to_string());
-            policy_names.push(name);
-            if let Some(reason) = self.policy_set.annotation(pid, "reason") {
-                policy_reasons.push(reason.to_string());
-            }
-        }
+        let (policy_names, policy_reasons, blocked_by_forbid) =
+            self.collect_decision_metadata(response.diagnostics().reason());
 
         Ok(PolicyDecision {
             allowed: response.decision() == Decision::Allow,
             policy_names,
             policy_reasons,
+            blocked_by_forbid,
         })
     }
 
@@ -316,24 +341,14 @@ impl PolicyEngine {
             .authorizer
             .is_authorized(&request, &self.policy_set, &entities);
 
-        let mut policy_names = Vec::new();
-        let mut policy_reasons = Vec::new();
-        for pid in response.diagnostics().reason() {
-            let name = self
-                .policy_set
-                .annotation(pid, "id")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| pid.to_string());
-            policy_names.push(name);
-            if let Some(reason) = self.policy_set.annotation(pid, "reason") {
-                policy_reasons.push(reason.to_string());
-            }
-        }
+        let (policy_names, policy_reasons, blocked_by_forbid) =
+            self.collect_decision_metadata(response.diagnostics().reason());
 
         Ok(PolicyDecision {
             allowed: response.decision() == Decision::Allow,
             policy_names,
             policy_reasons,
+            blocked_by_forbid,
         })
     }
 
@@ -867,6 +882,224 @@ pub fn deny_response_body(
             "No permit policy allows {method} {path} on {host}. Check your .cedar policy file."
         )
     })
+}
+
+// ---------------------------------------------------------------------------
+// Blocked-request synthesis
+// ---------------------------------------------------------------------------
+
+/// Build the normalized match key for a blocked HTTP request.
+///
+/// Format is `http:{METHOD} {host}{path}`. The key mirrors how `strait
+/// watch` renders requests and how `build_resource_id` names Cedar
+/// resources, so the blocked-request payload, the watch UI, and the
+/// Cedar policy entity model all agree on how to refer to "this
+/// request".
+///
+/// The path is preserved verbatim (including any leading `/`) so callers
+/// can round-trip the match key back to the original request.
+pub fn build_match_key(host: &str, method: &str, path: &str) -> String {
+    format!("http:{method} {host}{path}")
+}
+
+/// Build the human-readable explanation string for a blocked request.
+///
+/// Prefers any `@reason("...")` annotations attached to matching Cedar
+/// policies (joined with `"; "`). Falls back to a generic
+/// `"denied by policy '{name}': {method} {path} on {host}"` message when
+/// the matching policy has no `@reason` annotation, and to
+/// `"denied by default-deny"` when no policy matched at all (Cedar's
+/// native no-permit-matches path).
+pub fn build_denial_explanation(
+    host: &str,
+    method: &str,
+    path: &str,
+    policy_names: &[String],
+    policy_reasons: &[String],
+) -> String {
+    if !policy_reasons.is_empty() {
+        return policy_reasons.join("; ");
+    }
+    if policy_names.is_empty() {
+        return format!("denied by default-deny: {method} {path} on {host}");
+    }
+    format!(
+        "denied by policy '{}': {method} {path} on {host}",
+        policy_names.join(", ")
+    )
+}
+
+/// Synthesize structured blocked-request metadata for a denied HTTP
+/// request.
+///
+/// Produces a stable blocked-request ID, a normalized match key, a
+/// human-readable explanation, and either:
+///
+/// * the smallest candidate exception (in `once`, `session`, and
+///   `persist` forms) that could unblock equivalent requests, for
+///   denials caused by a missing permit, or
+/// * `None` with a `no_exception_reason` when the denial was caused by
+///   a Cedar `forbid` policy (since no added permit can override a
+///   forbid).
+///
+/// Callers should supply `blocked_by_forbid: true` when any matching
+/// Cedar policy had `Effect::Forbid`. The evaluator sets this on
+/// `PolicyDecision::blocked_by_forbid`.
+pub fn synthesize_blocked_request(
+    host: &str,
+    method: &str,
+    path: &str,
+    policy_names: &[String],
+    policy_reasons: &[String],
+    blocked_by_forbid: bool,
+) -> BlockedRequest {
+    let blocked_id = uuid::Uuid::new_v4().to_string();
+    let match_key = build_match_key(host, method, path);
+    let explanation = build_denial_explanation(host, method, path, policy_names, policy_reasons);
+
+    if blocked_by_forbid {
+        return BlockedRequest {
+            blocked_id,
+            match_key,
+            explanation,
+            candidate_exception: None,
+            no_exception_reason: Some(
+                "denied by forbid policy; no permit can override a Cedar forbid effect".to_string(),
+            ),
+        };
+    }
+
+    let candidate = synthesize_candidate_exception(host, method, path);
+    BlockedRequest {
+        blocked_id,
+        match_key,
+        explanation,
+        candidate_exception: Some(candidate),
+        no_exception_reason: None,
+    }
+}
+
+/// Synthesize the smallest candidate exception that could unblock the
+/// given request.
+///
+/// Scope selection:
+///
+/// * `PathScoped` — path has at least two non-empty segments. The
+///   exception permits the exact method on the full path prefix.
+/// * `MethodHost` — path has one or zero non-empty segments, or is
+///   empty. The exception permits the exact method on the whole host.
+///   Marked `ambiguous` when the path has exactly one segment, since
+///   `PathScoped` at depth 1 is also a plausible "smallest" choice.
+/// * `HostOnly` — reserved for future use when the caller cannot
+///   confidently identify a single method; the current synthesizer
+///   always has a method, so it does not emit `HostOnly`.
+fn synthesize_candidate_exception(host: &str, method: &str, path: &str) -> CandidateException {
+    let segments: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let depth = segments.len();
+
+    if depth >= 2 {
+        CandidateException {
+            scope: ExceptionScope::PathScoped,
+            ambiguous: false,
+            once: path_scoped_directive(host, method, path, "once"),
+            session: path_scoped_directive(host, method, path, "session"),
+            persist: path_scoped_directive(host, method, path, "persist"),
+        }
+    } else if depth == 1 {
+        // Depth-1 path: path-scoped and method-host are both plausible
+        // "smallest" choices. Pick method-host (broader, more likely to
+        // match equivalent requests) but flag the suggestion as
+        // ambiguous so the consumer surfaces the alternative.
+        CandidateException {
+            scope: ExceptionScope::MethodHost,
+            ambiguous: true,
+            once: method_host_directive(host, method, "once"),
+            session: method_host_directive(host, method, "session"),
+            persist: method_host_directive(host, method, "persist"),
+        }
+    } else {
+        // Empty path or no segments: method-host is unambiguously the
+        // smallest meaningful scope.
+        CandidateException {
+            scope: ExceptionScope::MethodHost,
+            ambiguous: false,
+            once: method_host_directive(host, method, "once"),
+            session: method_host_directive(host, method, "session"),
+            persist: method_host_directive(host, method, "persist"),
+        }
+    }
+}
+
+/// Normalize a string into an identifier suitable for embedding in a
+/// Cedar `@id("...")` annotation without risking collisions.
+///
+/// Replaces any character that is not alphanumeric or `_` with `_`, and
+/// collapses consecutive underscores. This is a best-effort sanitizer,
+/// not a canonical form -- two distinct inputs can still normalize to
+/// the same identifier (for example `foo.bar` and `foo_bar`). The goal
+/// is to produce human-readable IDs that incorporate the host and path
+/// so separate blocked requests do not all share the same `@id`, which
+/// would make Cedar reject the resulting policy set or silently collide.
+fn sanitize_id_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_underscore = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_was_underscore = false;
+        } else if !last_was_underscore {
+            out.push('_');
+            last_was_underscore = true;
+        }
+    }
+    // Trim leading/trailing underscores so an input like "/foo" does not
+    // render as "_foo_" in the final ID.
+    out.trim_matches('_').to_string()
+}
+
+/// Build a `PathScoped` exception directive for the given lifetime form.
+fn path_scoped_directive(host: &str, method: &str, path: &str, form: &str) -> ExceptionDirective {
+    let resource_id = build_resource_id(host, path);
+    let summary = format!("allow http:{method} {host}{path}");
+    // Include host and path in the ID so two distinct blocked requests
+    // synthesized in the same session do not collide on a shared `@id`.
+    let host_slug = sanitize_id_segment(host);
+    let path_slug = sanitize_id_segment(path);
+    let id = format!(
+        "allow_http_{}_path_{host_slug}_{path_slug}_{form}",
+        method.to_lowercase()
+    );
+    let cedar_snippet = format!(
+        "@id(\"{id}\")\n@reason(\"strait-synthesized {form} exception for {method} {path} on {host}\")\npermit(\n    principal,\n    action == Action::\"http:{method}\",\n    resource == Resource::\"{resource}\"\n);",
+        resource = resource_id,
+    );
+    ExceptionDirective {
+        summary,
+        cedar_snippet,
+    }
+}
+
+/// Build a `MethodHost` exception directive for the given lifetime form.
+fn method_host_directive(host: &str, method: &str, form: &str) -> ExceptionDirective {
+    let summary = format!("allow http:{method} {host}");
+    // Include host in the ID for the same collision-avoidance reason as
+    // `path_scoped_directive`.
+    let host_slug = sanitize_id_segment(host);
+    let id = format!(
+        "allow_http_{}_host_{host_slug}_{form}",
+        method.to_lowercase()
+    );
+    let cedar_snippet = format!(
+        "@id(\"{id}\")\n@reason(\"strait-synthesized {form} exception for {method} on {host}\")\npermit(\n    principal,\n    action == Action::\"http:{method}\",\n    resource in Resource::\"{host}\"\n);",
+    );
+    ExceptionDirective {
+        summary,
+        cedar_snippet,
+    }
 }
 
 #[cfg(test)]
@@ -2794,5 +3027,216 @@ permit(
             "should not have proc:signal entity, got: {:?}",
             entity_ids
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Blocked-request synthesis tests
+    //
+    // These cover the three scope cases listed in the H-CSM-2 test plan:
+    // host-only (empty path), method-plus-host (depth-1 path, ambiguous),
+    // and path-scoped (depth>=2). Also cover the forbid-effect no-
+    // suggestion path and the stability of `build_match_key`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn build_match_key_mirrors_watch_ui_format() {
+        let key = build_match_key("api.github.com", "GET", "/repos/org/repo");
+        assert_eq!(key, "http:GET api.github.com/repos/org/repo");
+
+        // Root path: host with no trailing slash in the request maps to
+        // "http:GET api.github.com/" — path is preserved verbatim.
+        let key_root = build_match_key("api.example.com", "POST", "/");
+        assert_eq!(key_root, "http:POST api.example.com/");
+    }
+
+    #[test]
+    fn denial_explanation_prefers_reason_annotations() {
+        // With @reason annotations present, those are used verbatim.
+        let explanation = build_denial_explanation(
+            "api.github.com",
+            "POST",
+            "/git/refs/heads/main",
+            &["deny-push-main".to_string()],
+            &["Direct pushes to main are not allowed; use a pull request".to_string()],
+        );
+        assert_eq!(
+            explanation,
+            "Direct pushes to main are not allowed; use a pull request"
+        );
+    }
+
+    #[test]
+    fn denial_explanation_falls_back_to_policy_name() {
+        let explanation = build_denial_explanation(
+            "api.example.com",
+            "GET",
+            "/data",
+            &["some-policy".to_string()],
+            &[],
+        );
+        assert_eq!(
+            explanation,
+            "denied by policy 'some-policy': GET /data on api.example.com"
+        );
+    }
+
+    #[test]
+    fn denial_explanation_falls_back_to_default_deny() {
+        let explanation = build_denial_explanation("api.example.com", "GET", "/data", &[], &[]);
+        assert_eq!(
+            explanation,
+            "denied by default-deny: GET /data on api.example.com"
+        );
+    }
+
+    #[test]
+    fn candidate_exception_path_scoped_for_deep_paths() {
+        let blocked = synthesize_blocked_request(
+            "api.github.com",
+            "GET",
+            "/repos/org/repo",
+            &["read-repos".to_string()],
+            &[],
+            false,
+        );
+
+        // Stable ID is populated and parseable as a UUID.
+        assert!(uuid::Uuid::parse_str(&blocked.blocked_id).is_ok());
+        assert_eq!(blocked.match_key, "http:GET api.github.com/repos/org/repo");
+        assert!(blocked.explanation.contains("read-repos"));
+
+        let ex = blocked
+            .candidate_exception
+            .expect("path-scoped request should have a candidate exception");
+        assert_eq!(ex.scope, ExceptionScope::PathScoped);
+        assert!(!ex.ambiguous);
+        assert_eq!(
+            ex.once.summary,
+            "allow http:GET api.github.com/repos/org/repo"
+        );
+        assert_eq!(
+            ex.session.summary,
+            "allow http:GET api.github.com/repos/org/repo"
+        );
+        // The persist snippet must contain the exact Cedar resource ID
+        // format used by the evaluator.
+        assert!(ex
+            .persist
+            .cedar_snippet
+            .contains("resource == Resource::\"api.github.com/repos/org/repo\""));
+        assert!(ex
+            .persist
+            .cedar_snippet
+            .contains("action == Action::\"http:GET\""));
+    }
+
+    #[test]
+    fn candidate_exception_method_host_for_depth_one_path_is_ambiguous() {
+        let blocked =
+            synthesize_blocked_request("api.example.com", "POST", "/data", &[], &[], false);
+
+        let ex = blocked
+            .candidate_exception
+            .expect("depth-1 request should have a candidate exception");
+        assert_eq!(ex.scope, ExceptionScope::MethodHost);
+        // Depth-1: both PathScoped and MethodHost are plausible, so the
+        // suggestion is flagged as ambiguous.
+        assert!(ex.ambiguous);
+        assert_eq!(ex.once.summary, "allow http:POST api.example.com");
+        assert!(ex
+            .persist
+            .cedar_snippet
+            .contains("resource in Resource::\"api.example.com\""));
+    }
+
+    #[test]
+    fn candidate_exception_method_host_for_empty_path_is_not_ambiguous() {
+        let blocked = synthesize_blocked_request("api.example.com", "GET", "/", &[], &[], false);
+
+        let ex = blocked
+            .candidate_exception
+            .expect("empty-path request should have a candidate exception");
+        assert_eq!(ex.scope, ExceptionScope::MethodHost);
+        assert!(!ex.ambiguous);
+        assert_eq!(ex.once.summary, "allow http:GET api.example.com");
+    }
+
+    #[test]
+    fn forbid_denial_has_no_candidate_exception() {
+        let blocked = synthesize_blocked_request(
+            "api.github.com",
+            "POST",
+            "/git/refs/heads/main",
+            &["deny-push-main".to_string()],
+            &["Direct pushes to main are not allowed".to_string()],
+            true,
+        );
+
+        assert!(blocked.candidate_exception.is_none());
+        let reason = blocked
+            .no_exception_reason
+            .expect("forbid denial should record a no-exception reason");
+        assert!(reason.contains("forbid"));
+        // Explanation should still come through.
+        assert_eq!(blocked.explanation, "Direct pushes to main are not allowed");
+    }
+
+    #[test]
+    fn forbid_effect_is_detected_in_evaluation() {
+        // End-to-end: loading GITHUB_POLICY and evaluating a request
+        // blocked by the forbid policy should surface
+        // blocked_by_forbid: true so the synthesizer can emit the
+        // no-suggestion variant.
+        let f = write_policy(GITHUB_POLICY);
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let decision = engine
+            .evaluate(
+                "api.github.com",
+                "http:POST",
+                "/repos/our-org/myrepo/git/refs/heads/main",
+                &[],
+                "worker",
+            )
+            .unwrap();
+
+        assert!(!decision.allowed);
+        assert!(
+            decision.blocked_by_forbid,
+            "forbid policy should flag decision as blocked_by_forbid, got policies: {:?}",
+            decision.policy_names
+        );
+    }
+
+    #[test]
+    fn permit_denial_by_missing_permit_is_not_blocked_by_forbid() {
+        // Default-deny (no permit matches, no forbid matches) should
+        // NOT set blocked_by_forbid — the synthesizer needs this so it
+        // can still offer a candidate permit.
+        let f = write_policy(GITHUB_POLICY);
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+
+        let decision = engine
+            .evaluate("api.openai.com", "http:GET", "/v1/models", &[], "worker")
+            .unwrap();
+
+        assert!(!decision.allowed);
+        assert!(
+            !decision.blocked_by_forbid,
+            "default-deny should NOT set blocked_by_forbid"
+        );
+
+        // And the synthesized blocked-request should include a
+        // candidate exception, not a no-suggestion marker.
+        let blocked = synthesize_blocked_request(
+            "api.openai.com",
+            "GET",
+            "/v1/models",
+            &decision.policy_names,
+            &decision.policy_reasons,
+            decision.blocked_by_forbid,
+        );
+        assert!(blocked.candidate_exception.is_some());
+        assert!(blocked.no_exception_reason.is_none());
     }
 }

@@ -1822,6 +1822,7 @@ async fn run_launch_with_policy_with_terminal_mode(
             },
             reason: "Cedar policy does not permit filesystem access to working directory"
                 .to_string(),
+            blocked: None,
         });
     }
 

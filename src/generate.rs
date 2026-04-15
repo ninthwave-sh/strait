@@ -464,6 +464,7 @@ mod tests {
                 decision: "allow".to_string(),
                 latency_us: 100,
                 enforcement_mode: String::new(),
+                blocked: None,
             },
         }
     }
@@ -890,6 +891,7 @@ mod tests {
                 decision: decision.to_string(),
                 latency_us: 100,
                 enforcement_mode: String::new(),
+                blocked: None,
             },
         }
     }

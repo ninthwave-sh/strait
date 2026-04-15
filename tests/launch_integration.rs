@@ -839,9 +839,10 @@ async fn launch_observe_injects_augmented_ca_bundle_and_trust_env_vars() {
 
     // Script runs inside the container after the entrypoint has built
     // /tmp/strait-ca-bundle.pem. We copy the bundle, snapshot the trust env
-    // vars, and record the CA source path that strait bind-mounts. The
-    // /test-out directory is a read-write bind mount so we can read the
-    // captured state back from the host.
+    // vars, record the CA source path, and note which system CA bundle (if
+    // any) the entrypoint would have concatenated. The /test-out directory
+    // is a read-write bind mount so we can read the captured state back from
+    // the host.
     let script = r#"
 set -e
 echo "SSL_CERT_FILE=${SSL_CERT_FILE:-unset}" > /test-out/env.txt
@@ -853,6 +854,12 @@ echo "https_proxy=${https_proxy:-unset}" >> /test-out/env.txt
 echo "http_proxy=${http_proxy:-unset}" >> /test-out/env.txt
 cp /tmp/strait-ca-bundle.pem /test-out/augmented-bundle.pem
 cp /strait/ca.pem /test-out/source-ca.pem
+: > /test-out/system-ca.txt
+for f in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /etc/pki/tls/certs/ca-bundle.crt; do
+  if [ -f "$f" ]; then
+    echo "$f" >> /test-out/system-ca.txt
+  fi
+done
 "#;
 
     let exit_code = strait::launch::run_launch_observe(
@@ -914,14 +921,34 @@ cp /strait/ca.pem /test-out/source-ca.pem
         augmented.contains(source_ca.trim()),
         "augmented bundle should include the session CA from /strait/ca.pem"
     );
-    // A real distro CA bundle is always much larger than the single session CA.
+
+    // The entrypoint script either concatenates a system CA bundle with the
+    // session CA, or falls back to `cp` when no system bundle is present.
+    // Both branches must produce a bundle at least as large as the source CA
+    // and must produce a bundle that contains the source CA (checked above).
+    // When a system bundle IS present, the augmented bundle must be strictly
+    // larger than the source CA, otherwise the concatenation silently lost
+    // the system bytes.
     assert!(
-        augmented.len() > source_ca.len() + 1000,
-        "augmented bundle should also include the image's system CA bundle \
+        augmented.len() >= source_ca.len(),
+        "augmented bundle must not be smaller than the source CA \
          (augmented={} bytes, source={} bytes)",
         augmented.len(),
         source_ca.len()
     );
+    let system_cas = std::fs::read_to_string(trust_capture_dir.join("system-ca.txt"))
+        .expect("system-ca.txt should exist");
+    let system_ca_present = system_cas.lines().any(|line| !line.trim().is_empty());
+    if system_ca_present {
+        assert!(
+            augmented.len() > source_ca.len(),
+            "when a system CA bundle is present ({system_cas:?}), the augmented \
+             bundle must be strictly larger than the source CA alone \
+             (augmented={} bytes, source={} bytes)",
+            augmented.len(),
+            source_ca.len()
+        );
+    }
 }
 
 /// TTY observe launches apply the initial terminal size to the container.

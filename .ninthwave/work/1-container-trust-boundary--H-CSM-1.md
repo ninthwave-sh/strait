@@ -1,4 +1,4 @@
-# Refactor: Lock the container trust boundary and launch contract (H-CSM-1)
+# Refactor: Lock the container trust boundary and runtime contract (H-CSM-1)
 
 **Priority:** High
 **Source:** Refocus plan 2026-04-15 (`.opencode/plans/1776234011325-kind-engine.md`)
@@ -14,6 +14,6 @@ Turn the current container-scoped CA injection and `--network=none` gateway path
 - Verify `src/launch.rs` and `src/main.rs` surface the session metadata and trust diagnostics needed to debug a failed launch
 - Cover failure cases for missing gateway binary, unreadable CA bundle, and launch paths that would otherwise suggest host-wide trust workarounds
 
-Acceptance: `strait launch` has a documented and tested container-only trust boundary, emits actionable diagnostics, and does not require a machine-wide CA installation for the supported flow.
+Acceptance: The primary `strait` runtime has a documented and tested container-only trust boundary, emits actionable diagnostics, and does not require a machine-wide CA installation for the supported flow.
 
 Key files: `src/container.rs`, `src/launch.rs`, `src/main.rs`, `README.md`, `tests/launch_integration.rs`

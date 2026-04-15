@@ -6,7 +6,7 @@
 **Domain:** session-control-service
 **Lineage:** aeb200ea-314d-49c6-b942-d51bbefe3626
 
-Add a backgroundable local control service that owns `strait launch` sessions and exposes a stable IPC surface for future desktop clients instead of requiring users to keep one foreground terminal alive forever. Reuse the existing session registry, control socket, and observation stream model so the service is an orchestration layer on top of the current runtime, not a second backend.
+Add a backgroundable local control service that owns primary `strait` sessions and exposes a stable IPC surface for future desktop clients instead of requiring users to keep one foreground terminal alive forever. Reuse the existing session registry, control socket, and observation stream model so the service is an orchestration layer on top of the current runtime, not a second backend.
 
 **Test plan:**
 - Add CLI tests in `src/main.rs` for service start, status, and stop parsing and help text

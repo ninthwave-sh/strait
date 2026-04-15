@@ -258,7 +258,7 @@ strait proxy --config strait.toml
 
 Features in proxy mode today: MITM with Cedar policy evaluation, credential injection (bearer + AWS SigV4), live session control sockets, observation streaming, structured JSON audit logging, health check endpoint, SIGHUP policy hot-reload, and git-hosted policies with automatic polling.
 
-This mode shares the same session publication and watch surfaces as `strait launch`, but it is not the primary enforcement story because host trust and subprocess coverage vary by client.
+This mode shares the same session publication and watch surfaces as the primary `strait` runtime, but it is not the primary enforcement story because host trust and subprocess coverage vary by client.
 
 ## Policy tooling
 

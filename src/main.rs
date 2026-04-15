@@ -27,7 +27,7 @@ use strait::mitm::handle_connection;
 #[command(
     name = "strait",
     version,
-    about = "MITM proxy and live network policy control plane for agent traffic"
+    about = "Container-scoped MITM policy platform for AI agents"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -114,7 +114,7 @@ enum SessionAction {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the standalone HTTPS MITM proxy.
+    /// Start the HTTPS proxy for standalone integrations.
     #[command(after_help = "\
 TLS TRUST:
   strait generates a session-local CA certificate on each startup.
@@ -218,7 +218,7 @@ LIVE POLICY UPDATES:
         action: SessionAction,
     },
 
-    /// Legacy: launch a command in a sandboxed container with Cedar policy enforcement.
+    /// Launch a command in a sandboxed container with Cedar policy enforcement.
     ///
     /// Runs the specified command inside a container with filesystem and network
     /// access controlled by Cedar policies. Three modes:

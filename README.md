@@ -2,48 +2,62 @@
 
 > **Early development.** Strait is pre-v1, under active development, and not yet distributed or stable. APIs, config formats, and CLI flags will change. Not recommended for production use.
 
-MITM proxy and live network policy control plane for agent traffic.
+Policy platform for AI agents. Strait uses a container-scoped MITM proxy plus Cedar policy over network, filesystem, and process access. That owned runtime boundary is deliberate: request-level visibility without machine-wide CA trust needs a boundary we control.
 
 ## The problem
 
-The hard part is not intercepting HTTP traffic. Existing tools already do that well.
+Security teams need to answer one question: *what should this agent be allowed to do?* But today's tools split that answer across separate network proxies, filesystem sandboxes, and process monitors, each with its own policy format and its own blind spots.
 
-The hard part is turning agent traffic into a usable permission workflow:
+Strait unifies all three under Cedar. Observe what an agent actually does, auto-generate a policy from that behavior, then enforce it.
 
-- what just got blocked?
-- what is the smallest rule that would unblock it?
-- can I allow it once, for this session, or persist it without restarting everything?
-- can I make that decision outside the agent terminal?
-
-Strait focuses on that narrow problem: request-aware network policy, live observation, live policy updates, and a control plane that can sit behind a future desktop UI.
+We explored a host-scoped pivot after looking closely at `nono`. The learning was useful, but it reinforced the original architecture: if you want MITM-level request control across everything the agent does, without mandating machine-wide CA trust, you need a runtime boundary you own. For Strait, that boundary is still the container.
 
 ## How it works
 
 ```
-  ┌──────────────┐     ┌────────────────────────┐     ┌──────────────┐
-  │ Agent / Tool │────▶│ Strait Proxy (MITM)    │────▶│ Upstream API │
-  │ or sandbox   │     │ policy + observations  │     │ or service   │
-  └──────┬───────┘     └──────────┬─────────────┘     └──────────────┘
-         │                        │
-         │                        │ live events + control API
-         │                        ▼
-         │              ┌──────────────────────────────┐
-         └─────────────▶│ session watch / future UI    │
-                        │ allow once / session / save  │
-                        └──────────────────────────────┘
+  ┌──────────────────────────────────────────────────────┐
+  │          Container (Docker/Podman/OrbStack)          │
+  │                                                      │
+  │  ┌──────────────┐     ┌──────────────────────┐       │
+  │  │ AI Agent     │────▶│ Strait Proxy (MITM)  │──▶ API│
+  │  │ (your cmd)   │     │ Cedar eval + creds   │       │
+  │  │ [full TTY]   │     └──────────────────────┘       │
+  │  └──────────────┘                                    │
+  │                                                      │
+  │  Filesystem from Cedar policy:                       │
+  │    fs:read  /project/src  -> read-only mount         │
+  │    fs:write /project/out  -> read-write mount        │
+  │    (no policy = not mounted = invisible)             │
+  └──────────────────────┬───────────────────────────────┘
+                         │ observations
+  ┌──────────────────────▼───────────────────────────────┐
+  │  Strait Host Process                                 │
+  │   - Container lifecycle management                   │
+  │   - Local control API (session.info/watch.attach)    │
+  │   - Observation stream (Unix socket + JSONL)         │
+  │   - strait session watch - colored live event viewer │
+  │   - strait generate - Cedar policy from observations │
+  │   - strait test --replay - policy verification       │
+  └──────────────────────────────────────────────────────┘
 ```
 
-Today the primary runtime is the standalone proxy session. Container sandboxing and unified `fs:` / `proc:` policy are legacy surfaces that remain in the codebase but are no longer the main product direction.
+Cedar policies control three domains:
+
+- **Network** - HTTPS MITM proxy with request-level policy (`http:GET`, `http:POST`, `http:DELETE`). Credential injection on allow. The agent never sees real API tokens.
+- **Filesystem** - Cedar `fs:read` / `fs:write` rules translate to container bind-mounts. No rule = not mounted = invisible to the agent.
+- **Process** - Cedar `proc:exec` rules control which binaries are available in the container.
+
+Standalone proxy sessions still exist as a secondary mode for debugging and integrations, and they publish the same session control surfaces. They are useful infrastructure, but they are not the primary product wedge.
 
 ## Quick start
 
-### Start a standalone proxy session
+### Launch an interactive session
 
 ```bash
-strait proxy --config strait.toml
+strait launch --observe -- ./my-agent
 ```
 
-`strait proxy` starts the MITM proxy, prints a stable session ID, and publishes two local Unix sockets:
+`strait launch` starts the agent in a container, prints a stable session ID, and publishes two local Unix sockets:
 
 - a control socket used by `strait session info|reload-policy|replace-policy|stop`
 - an observation socket used by `strait session watch`
@@ -56,9 +70,9 @@ strait session info --session <SESSION_ID>
 strait session watch --session <SESSION_ID>
 ```
 
-`strait session info` reports the session ID, mode, control socket, observation socket, and container identity when present. `strait session watch` renders the live event stream for that session, including live control-plane events such as `policy:reload`.
+`strait session info` reports the session ID, mode, control socket, observation socket, and container identity when present. `strait session watch` renders the live event stream for that session, including lifecycle events such as `container:start`, live control-plane events such as `policy:reload`, and PTY resize events such as `tty:resize`.
 
-The older `strait watch` command remains as a compatibility alias, but session-targeted commands are the primary interface for live runtime management.
+The older `strait watch` command remains as a compatibility alias, but session-targeted commands are the primary interface for live launch management.
 
 ### Understand the live-update boundary
 
@@ -83,13 +97,13 @@ Restart-bound loop:
 2. Relaunch with `strait launch --warn ...` or `strait launch --policy ...`.
 3. Do not expect `reload-policy` or `replace-policy` to mutate mounts or available binaries in place.
 
-### Observe what traffic actually happens
+### Observe what an agent does
 
 ```bash
-HTTPS_PROXY=http://127.0.0.1:<PORT> your-agent-or-tool
+strait launch --observe -- ./my-agent
 ```
 
-Use the proxy session plus `strait session watch` to inspect live decisions, then persist policy changes when you understand the required traffic.
+Observe mode allows everything, records activity to `observations.jsonl`, and still publishes the same session control surfaces for inspection and watch.
 
 ### Generate a policy from observations
 
@@ -126,7 +140,7 @@ Same agent, same container, now with enforcement. Known actions succeed. Novel a
      │                       │  block) │
 ```
 
-Use `--warn` as an intermediate step in the legacy container path: it loads the policy and logs violations without blocking.
+Use `--warn` as an intermediate step: it loads the policy and logs violations without blocking.
 
 ```bash
 strait launch --warn policy.cedar -- ./my-agent
@@ -212,11 +226,7 @@ forbid(
 
 Default disposition is **deny**. Only actions with a matching `permit` are allowed. `forbid` policies override `permit` for hard guardrails.
 
-## Legacy credential injection
-
-Credential injection still exists in the current codebase, but it is not the primary v1 product direction. The current focus is request-aware MITM policy and live control surfaces, not secret mediation.
-
-The existing proxy can still inject credentials when configured:
+## Credential injection
 
 Credentials live in `strait.toml`, not in the agent's environment. The proxy injects them into allowed requests only.
 
@@ -240,20 +250,22 @@ The agent never sees real secrets. If a request is denied by policy, credentials
 
 ## Standalone proxy mode
 
-This is now the primary runtime path:
+Strait also runs as a standalone HTTPS proxy without containers, for debugging, local integrations, or experimentation with the policy and observation surfaces:
 
 ```bash
 strait proxy --config strait.toml
 ```
 
-Features in proxy mode today: MITM with Cedar policy evaluation, live session control sockets, observation streaming, structured JSON audit logging, health check endpoint, SIGHUP policy hot-reload, and git-hosted policies with automatic polling.
+Features in proxy mode today: MITM with Cedar policy evaluation, credential injection (bearer + AWS SigV4), live session control sockets, observation streaming, structured JSON audit logging, health check endpoint, SIGHUP policy hot-reload, and git-hosted policies with automatic polling.
+
+This mode shares the same session publication and watch surfaces as `strait launch`, but it is not the primary enforcement story because host trust and subprocess coverage vary by client.
 
 ## Policy tooling
 
 ```bash
 strait template list                              # list built-in starter policies
 strait template apply github-org-readonly          # apply a template
-strait session list                                # list active launch sessions
+strait session list                                # list active Strait sessions
 strait session info --session <id>                 # inspect one running session
 strait session watch --session <id>                # stream live events for one session
 strait session reload-policy --session <id>        # reload network policy in place
@@ -267,10 +279,10 @@ strait watch                                       # compatibility alias for new
 
 ## Use cases
 
-- **Agent traffic control** — route agent HTTP(S) traffic through a request-aware policy layer
-- **Observe then enforce** — learn what traffic is required before turning on blocking
-- **Live policy mutation** — update network policy for a running session without restarting it
-- **Future control plane** — drive a desktop or tray UI from the existing session watch + control API surfaces
+- **Agent sandboxing** - run AI agents with least-privilege access to APIs, files, and tools
+- **CI/CD pipelines** - govern what builds can fetch and write, with auditable records
+- **Compliance** - immutable audit trail of every API call and file access
+- **Credential isolation** - policy-governed API access without sharing secrets
 
 ## Known limitations
 

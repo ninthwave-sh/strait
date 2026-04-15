@@ -2011,6 +2011,8 @@ fn pty_helper_delivers_input_to_mock_tui() {
 #[cfg(unix)]
 #[test]
 fn pty_helper_triggers_resize_redraw() {
+    use std::thread;
+
     let mut session = PtySession::spawn(
         mock_tui_fixture(),
         &[] as &[&str],
@@ -2047,10 +2049,31 @@ fn pty_helper_triggers_resize_redraw() {
     assert_eq!(redraw["cols"].as_u64(), Some(100));
     assert_eq!(redraw["rows"].as_u64(), Some(40));
 
+    // `TIOCSWINSZ` already notifies the foreground process group. If the PTY
+    // helper also sends SIGWINCH manually, the fixture emits a duplicate
+    // redraw and CI sees two resize observations for one logical resize.
+    thread::sleep(Duration::from_millis(100));
+
     session.write_line("exit").unwrap();
-    session
-        .wait_for_event("exit", Duration::from_secs(3))
-        .unwrap();
+    let mut resize_draws = 1;
+    loop {
+        let event = session
+            .wait_for_json(|_| true, Duration::from_secs(3))
+            .unwrap();
+        if event.get("event").and_then(serde_json::Value::as_str) == Some("draw")
+            && event.get("reason").and_then(serde_json::Value::as_str) == Some("resize")
+        {
+            resize_draws += 1;
+            continue;
+        }
+
+        assert_eq!(
+            event.get("event").and_then(serde_json::Value::as_str),
+            Some("exit")
+        );
+        break;
+    }
+    assert_eq!(resize_draws, 1, "resize should trigger exactly one redraw");
     assert!(session
         .wait_for_exit(Duration::from_secs(3))
         .unwrap()

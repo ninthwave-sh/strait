@@ -30,7 +30,7 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 4096;
 ///
 /// Bumped when the event format changes. Consumers can use this to handle
 /// backward/forward compatibility across strait versions.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Default capacity for the recent-events ring buffer used for watch catch-up.
 const DEFAULT_RING_BUFFER_CAPACITY: usize = 256;
@@ -55,6 +55,102 @@ pub struct ObservationSessionContext {
     pub session_id: String,
     /// Active enforcement mode for the session.
     pub mode: String,
+}
+
+/// Structured metadata for a blocked network request.
+///
+/// Attached to `EventKind::NetworkRequest` events when the policy engine
+/// denied (or would deny, in warn mode) the request. Downstream consumers
+/// (watch UI, desktop client, session control service) use this to identify
+/// the request, explain why it was blocked, and present a concrete candidate
+/// exception that could unblock it.
+///
+/// The payload is backward compatible: older consumers that do not know
+/// about the `blocked` field see a denied request the same way they did
+/// before and simply ignore the extra data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockedRequest {
+    /// Stable opaque identifier for this specific blocked-request event.
+    ///
+    /// Distinct per emission so a caller can reference an exact blocked
+    /// request when applying an exception.
+    pub blocked_id: String,
+    /// Normalized key used to group equivalent blocked requests.
+    ///
+    /// Format is `http:{METHOD} {host}{path}`, mirroring how requests are
+    /// rendered in the watch UI and how Cedar resource IDs are built in
+    /// `policy::build_resource_id`.
+    pub match_key: String,
+    /// Human-readable explanation of why the request was blocked.
+    ///
+    /// Built from any `@reason` annotations on the matching Cedar policy;
+    /// falls back to a generic "denied by policy …" or default-deny
+    /// message when the matching policy has no reason annotation.
+    pub explanation: String,
+    /// Smallest candidate exception that could unblock this request, or
+    /// `None` when no permit can unblock it (for example when the denial
+    /// is caused by a `forbid` policy, since Cedar's forbid overrides all
+    /// permits).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_exception: Option<CandidateException>,
+    /// Explanation of why no candidate exception is available, when
+    /// `candidate_exception` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_exception_reason: Option<String>,
+}
+
+/// Smallest candidate exception that would unblock a blocked request.
+///
+/// Provides the exception in three lifetime forms so the consumer (for
+/// example the future session control service) can offer the user a
+/// concrete choice between a one-shot allow, a session-scoped allow, and
+/// a persisted Cedar policy change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CandidateException {
+    /// The narrowest scope at which the exception was synthesized.
+    pub scope: ExceptionScope,
+    /// `true` when more than one scope would be a reasonable "smallest"
+    /// choice for this request (for example a depth-1 path where both
+    /// `PathScoped` and `MethodHost` are plausible). Consumers should
+    /// surface the alternatives rather than applying the suggestion
+    /// blindly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ambiguous: bool,
+    /// Unblock only this exact request once. Narrowest possible form.
+    pub once: ExceptionDirective,
+    /// Unblock equivalent requests for the duration of the running launch
+    /// session.
+    pub session: ExceptionDirective,
+    /// Cedar policy snippet suitable for pasting into the policy file on
+    /// disk to permanently unblock equivalent requests.
+    pub persist: ExceptionDirective,
+}
+
+/// Scope at which a candidate exception is defined.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExceptionScope {
+    /// Allow any HTTP method on the blocked host. Broadest scope.
+    HostOnly,
+    /// Allow one specific HTTP method on the blocked host, but no path
+    /// narrowing. Middle scope.
+    MethodHost,
+    /// Allow one specific HTTP method on a path prefix under the blocked
+    /// host. Narrowest meaningful scope.
+    PathScoped,
+}
+
+/// A single lifetime form of a candidate exception.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExceptionDirective {
+    /// Short human-readable summary, for example
+    /// `"allow http:GET api.github.com/repos/org/repo"`.
+    pub summary: String,
+    /// Cedar policy snippet that implements the directive. For the
+    /// `persist` form this is ready to paste into a `.cedar` file; the
+    /// `once` and `session` forms use the same Cedar syntax and are meant
+    /// to be loaded into a running session's policy store.
+    pub cedar_snippet: String,
 }
 
 /// A single observation event with a timestamp and typed payload.
@@ -92,6 +188,16 @@ pub enum EventKind {
         /// Enforcement mode: "observe", "warn", or "enforce".
         #[serde(default, skip_serializing_if = "String::is_empty")]
         enforcement_mode: String,
+        /// Structured blocked-request metadata.
+        ///
+        /// Populated for `decision == "deny"` or `decision == "warn"`
+        /// emissions with the stable blocked-request ID, a normalized
+        /// match key, a human-readable explanation, and the smallest
+        /// candidate exception that could unblock the request. `None`
+        /// for allowed or passthrough requests, and for denials emitted
+        /// by older strait runtimes that predate the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocked: Option<BlockedRequest>,
     },
     /// Container started.
     ContainerStart { container_id: String, image: String },
@@ -123,6 +229,14 @@ pub enum EventKind {
         decision: String,
         /// Human-readable reason for the violation.
         reason: String,
+        /// Structured blocked-request metadata.
+        ///
+        /// Populated when the violation corresponds to an HTTP request
+        /// that strait could synthesize a candidate exception for. `None`
+        /// for non-HTTP violations (for example, fs-mount denials emitted
+        /// by `launch`) and for violations from older strait runtimes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocked: Option<BlockedRequest>,
     },
     /// Live policy state changed through the launch control plane.
     PolicyReloaded {
@@ -726,6 +840,7 @@ mod tests {
                 decision: "allow".to_string(),
                 latency_us: 150,
                 enforcement_mode: String::new(),
+                blocked: None,
             },
         };
 
@@ -859,12 +974,238 @@ mod tests {
                 decision: "deny".to_string(),
                 latency_us: 500,
                 enforcement_mode: String::new(),
+                blocked: None,
             },
         };
 
         let json_str = serde_json::to_string(&original).unwrap();
         let deserialized: ObservationEvent = serde_json::from_str(&json_str).unwrap();
         assert_eq!(original, deserialized);
+    }
+
+    // -- Blocked-request payload tests ----------------------------------------
+    //
+    // These cover:
+    // * Serialization of a denied NetworkRequest carrying a rich
+    //   BlockedRequest payload (stable ID, match key, explanation, and
+    //   candidate exception in all three lifetime forms).
+    // * Round-tripping the rich payload through JSON without loss.
+    // * Backwards-compatible decoding of older JSONL records that predate
+    //   the `blocked` field, so a desktop client reading an older
+    //   observation log still parses cleanly.
+    // * Serialization of the no-suggestion (forbid-effect) variant.
+
+    fn sample_blocked_request() -> BlockedRequest {
+        BlockedRequest {
+            blocked_id: "b1c59a11-0000-0000-0000-000000000001".to_string(),
+            match_key: "http:GET api.github.com/repos/org/repo".to_string(),
+            explanation: "denied by policy 'read-repos': GET /repos/org/repo on api.github.com"
+                .to_string(),
+            candidate_exception: Some(CandidateException {
+                scope: ExceptionScope::PathScoped,
+                ambiguous: false,
+                once: ExceptionDirective {
+                    summary: "allow http:GET api.github.com/repos/org/repo".to_string(),
+                    cedar_snippet: "permit(principal, action == Action::\"http:GET\", resource == Resource::\"api.github.com/repos/org/repo\");"
+                        .to_string(),
+                },
+                session: ExceptionDirective {
+                    summary: "allow http:GET api.github.com/repos/org/repo".to_string(),
+                    cedar_snippet: "permit(principal, action == Action::\"http:GET\", resource == Resource::\"api.github.com/repos/org/repo\");"
+                        .to_string(),
+                },
+                persist: ExceptionDirective {
+                    summary: "allow http:GET api.github.com/repos/org/repo".to_string(),
+                    cedar_snippet: "permit(principal, action == Action::\"http:GET\", resource == Resource::\"api.github.com/repos/org/repo\");"
+                        .to_string(),
+                },
+            }),
+            no_exception_reason: None,
+        }
+    }
+
+    #[test]
+    fn blocked_network_request_serializes_full_payload() {
+        let event = ObservationEvent {
+            version: SCHEMA_VERSION,
+            timestamp: "2026-04-15T00:00:00.000Z".to_string(),
+            session: None,
+            event: EventKind::NetworkRequest {
+                method: "GET".to_string(),
+                host: "api.github.com".to_string(),
+                path: "/repos/org/repo".to_string(),
+                decision: "deny".to_string(),
+                latency_us: 250,
+                enforcement_mode: "enforce".to_string(),
+                blocked: Some(sample_blocked_request()),
+            },
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "network_request");
+        assert_eq!(json["decision"], "deny");
+
+        let blocked = &json["blocked"];
+        assert!(blocked.is_object(), "blocked field must be present");
+        assert_eq!(
+            blocked["blocked_id"],
+            "b1c59a11-0000-0000-0000-000000000001"
+        );
+        assert_eq!(
+            blocked["match_key"],
+            "http:GET api.github.com/repos/org/repo"
+        );
+        assert!(blocked["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("read-repos"));
+
+        let ex = &blocked["candidate_exception"];
+        assert_eq!(ex["scope"], "path_scoped");
+        assert!(ex["once"].is_object());
+        assert!(ex["session"].is_object());
+        assert!(ex["persist"].is_object());
+        assert_eq!(
+            ex["session"]["summary"],
+            "allow http:GET api.github.com/repos/org/repo"
+        );
+
+        // ambiguous is false by default and should be omitted from the
+        // wire format so older consumers see the same bytes.
+        assert!(
+            ex.get("ambiguous").is_none() || ex["ambiguous"] == false,
+            "ambiguous=false should be skipped or explicitly false"
+        );
+    }
+
+    #[test]
+    fn blocked_network_request_roundtrips_through_json() {
+        let original = ObservationEvent {
+            version: SCHEMA_VERSION,
+            timestamp: "2026-04-15T00:00:00.000Z".to_string(),
+            session: None,
+            event: EventKind::NetworkRequest {
+                method: "POST".to_string(),
+                host: "api.example.com".to_string(),
+                path: "/data".to_string(),
+                decision: "deny".to_string(),
+                latency_us: 512,
+                enforcement_mode: "warn".to_string(),
+                blocked: Some(BlockedRequest {
+                    blocked_id: "b1c59a11-0000-0000-0000-00000000002".to_string(),
+                    match_key: "http:POST api.example.com/data".to_string(),
+                    explanation: "denied by default-deny".to_string(),
+                    candidate_exception: Some(CandidateException {
+                        scope: ExceptionScope::MethodHost,
+                        ambiguous: true,
+                        once: ExceptionDirective {
+                            summary: "allow http:POST api.example.com".to_string(),
+                            cedar_snippet: "permit(principal, action == Action::\"http:POST\", resource in Resource::\"api.example.com\");"
+                                .to_string(),
+                        },
+                        session: ExceptionDirective {
+                            summary: "allow http:POST api.example.com".to_string(),
+                            cedar_snippet: "permit(principal, action == Action::\"http:POST\", resource in Resource::\"api.example.com\");"
+                                .to_string(),
+                        },
+                        persist: ExceptionDirective {
+                            summary: "allow http:POST api.example.com".to_string(),
+                            cedar_snippet: "permit(principal, action == Action::\"http:POST\", resource in Resource::\"api.example.com\");"
+                                .to_string(),
+                        },
+                    }),
+                    no_exception_reason: None,
+                }),
+            },
+        };
+
+        let json_str = serde_json::to_string(&original).unwrap();
+        let round: ObservationEvent = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(original, round);
+    }
+
+    #[test]
+    fn blocked_network_request_no_suggestion_variant_serializes() {
+        let event = ObservationEvent {
+            version: SCHEMA_VERSION,
+            timestamp: "2026-04-15T00:00:00.000Z".to_string(),
+            session: None,
+            event: EventKind::NetworkRequest {
+                method: "POST".to_string(),
+                host: "api.github.com".to_string(),
+                path: "/git/refs/heads/main".to_string(),
+                decision: "deny".to_string(),
+                latency_us: 180,
+                enforcement_mode: "enforce".to_string(),
+                blocked: Some(BlockedRequest {
+                    blocked_id: "b1c59a11-0000-0000-0000-00000000003".to_string(),
+                    match_key: "http:POST api.github.com/git/refs/heads/main".to_string(),
+                    explanation: "Direct pushes to main are not allowed".to_string(),
+                    candidate_exception: None,
+                    no_exception_reason: Some(
+                        "denied by forbid policy; no permit can override a Cedar forbid effect"
+                            .to_string(),
+                    ),
+                }),
+            },
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        let blocked = &json["blocked"];
+        // candidate_exception is None and should be omitted from the
+        // wire format.
+        assert!(blocked.get("candidate_exception").is_none());
+        assert_eq!(
+            blocked["no_exception_reason"],
+            "denied by forbid policy; no permit can override a Cedar forbid effect"
+        );
+
+        // Round-trip must preserve the no-suggestion variant.
+        let round: ObservationEvent =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        match round.event {
+            EventKind::NetworkRequest { blocked, .. } => {
+                let info = blocked.expect("blocked payload should round-trip");
+                assert!(info.candidate_exception.is_none());
+                assert_eq!(
+                    info.no_exception_reason.as_deref(),
+                    Some("denied by forbid policy; no permit can override a Cedar forbid effect")
+                );
+            }
+            other => panic!("expected NetworkRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn network_request_decodes_without_blocked_field_for_backwards_compatibility() {
+        // Older strait runtimes (pre-H-CSM-2) emit JSONL records that
+        // never include the `blocked` field. The rich schema must
+        // decode those cleanly so desktop clients can replay older
+        // observation logs without fatal errors.
+        let legacy = r#"{
+            "version": 2,
+            "timestamp": "2026-03-01T00:00:00.000Z",
+            "type": "network_request",
+            "method": "GET",
+            "host": "api.github.com",
+            "path": "/repos/org/repo",
+            "decision": "deny",
+            "latency_us": 100
+        }"#;
+
+        let event: ObservationEvent = serde_json::from_str(legacy).unwrap();
+        match event.event {
+            EventKind::NetworkRequest {
+                blocked, decision, ..
+            } => {
+                assert_eq!(decision, "deny");
+                assert!(
+                    blocked.is_none(),
+                    "legacy record should deserialize with blocked: None"
+                );
+            }
+            other => panic!("expected NetworkRequest, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1012,6 +1353,7 @@ mod tests {
             decision: "allow".to_string(),
             latency_us: 100,
             enforcement_mode: String::new(),
+            blocked: None,
         });
 
         stream.emit(EventKind::Mount {
@@ -1451,6 +1793,7 @@ mod tests {
                     decision: "allow".to_string(),
                     latency_us: 100,
                     enforcement_mode: String::new(),
+                    blocked: None,
                 },
             },
             ObservationEvent {
@@ -1595,6 +1938,7 @@ mod tests {
                     decision: "allow".to_string(),
                     latency_us: 100,
                     enforcement_mode: String::new(),
+                    blocked: None,
                 },
             };
             writeln!(file, "{}", serde_json::to_string(&event).unwrap()).unwrap();

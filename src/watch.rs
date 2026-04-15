@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::launch::{list_launch_sessions, request_launch_watch_attach, LaunchSessionMetadata};
-use crate::observe::{EventKind, ObservationEvent};
+use crate::observe::{BlockedRequest, EventKind, ObservationEvent};
 
 // ---------------------------------------------------------------------------
 // ANSI color codes
@@ -130,6 +130,42 @@ pub fn terminal_width() -> usize {
         .unwrap_or(DEFAULT_TERMINAL_WIDTH)
 }
 
+/// Build the "blocked-request detail" suffix appended to the event detail
+/// string when an event carries structured `BlockedRequest` metadata.
+///
+/// Covers three render states:
+///
+/// * Normal case: one clearly-smallest exception is available. The suffix
+///   shows the explanation and the smallest candidate exception's summary.
+/// * Ambiguous case: more than one scope is a reasonable "smallest" choice.
+///   The suffix marks the suggestion as ambiguous so the consumer knows to
+///   surface the alternatives rather than apply the suggestion blindly.
+/// * No-suggestion case: no permit can unblock the request (for example a
+///   Cedar `forbid` policy). The suffix shows the explanation and the
+///   recorded reason why no exception is available.
+pub fn format_blocked_suffix(info: &BlockedRequest) -> String {
+    match &info.candidate_exception {
+        Some(exception) => {
+            let label = if exception.ambiguous {
+                " try (ambiguous)"
+            } else {
+                " try"
+            };
+            format!(
+                " [{}]{}: {}",
+                info.explanation, label, exception.session.summary
+            )
+        }
+        None => {
+            let reason = info
+                .no_exception_reason
+                .as_deref()
+                .unwrap_or("no candidate exception available");
+            format!(" [{}] no-suggestion: {}", info.explanation, reason)
+        }
+    }
+}
+
 /// Extract action label, resource string, and detail suffix from an event.
 fn format_event_parts(event: &EventKind) -> (String, String, String) {
     match event {
@@ -140,6 +176,7 @@ fn format_event_parts(event: &EventKind) -> (String, String, String) {
             decision,
             latency_us,
             enforcement_mode: _,
+            blocked,
         } => {
             let action = format!("http:{method}");
             let resource = format!("{host}{path}");
@@ -148,12 +185,15 @@ fn format_event_parts(event: &EventKind) -> (String, String, String) {
             } else {
                 decision.clone()
             };
-            let detail = if *latency_us > 0 {
+            let mut detail = if *latency_us > 0 {
                 let ms = *latency_us as f64 / 1000.0;
                 format!("{decision_display} ({ms:.1}ms)")
             } else {
                 decision_display
             };
+            if let Some(info) = blocked {
+                detail.push_str(&format_blocked_suffix(info));
+            }
             (action, resource, detail)
         }
         EventKind::ContainerStart {
@@ -190,9 +230,13 @@ fn format_event_parts(event: &EventKind) -> (String, String, String) {
             resource,
             decision,
             reason,
+            blocked,
             ..
         } => {
-            let detail = format!("{decision}: {reason}");
+            let mut detail = format!("{decision}: {reason}");
+            if let Some(info) = blocked {
+                detail.push_str(&format_blocked_suffix(info));
+            }
             (format!("policy:{action}"), resource.clone(), detail)
         }
         EventKind::PolicyReloaded {
@@ -519,7 +563,7 @@ async fn connect_and_stream(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observe::EventKind;
+    use crate::observe::{CandidateException, EventKind, ExceptionDirective, ExceptionScope};
 
     fn make_event(event: EventKind) -> ObservationEvent {
         ObservationEvent {
@@ -559,6 +603,7 @@ mod tests {
             decision: "allow".into(),
             latency_us: 300,
             enforcement_mode: String::new(),
+            blocked: None,
         };
         assert_eq!(classify_event(&event), EventColor::Allow);
         assert_eq!(EventColor::Allow.ansi_prefix(), GREEN);
@@ -573,6 +618,7 @@ mod tests {
             decision: "deny".into(),
             latency_us: 100,
             enforcement_mode: String::new(),
+            blocked: None,
         };
         assert_eq!(classify_event(&event), EventColor::Deny);
         assert_eq!(EventColor::Deny.ansi_prefix(), RED);
@@ -587,6 +633,7 @@ mod tests {
             decision: "warn".into(),
             latency_us: 200,
             enforcement_mode: String::new(),
+            blocked: None,
         };
         assert_eq!(classify_event(&event), EventColor::Warn);
         assert_eq!(EventColor::Warn.ansi_prefix(), YELLOW);
@@ -601,6 +648,7 @@ mod tests {
             decision: "passthrough".into(),
             latency_us: 0,
             enforcement_mode: String::new(),
+            blocked: None,
         };
         assert_eq!(classify_event(&event), EventColor::Passthrough);
         assert_eq!(EventColor::Passthrough.ansi_prefix(), DIM);
@@ -615,6 +663,7 @@ mod tests {
             decision: "unknown_value".into(),
             latency_us: 0,
             enforcement_mode: String::new(),
+            blocked: None,
         };
         assert_eq!(classify_event(&event), EventColor::Passthrough);
     }
@@ -730,6 +779,7 @@ mod tests {
             decision: "allow".into(),
             latency_us: 300,
             enforcement_mode: String::new(),
+            blocked: None,
         });
         let output = format_event(&event, 120);
         assert!(output.contains(GREEN), "should contain green ANSI code");
@@ -751,6 +801,7 @@ mod tests {
             decision: "deny".into(),
             latency_us: 100,
             enforcement_mode: String::new(),
+            blocked: None,
         });
         let output = format_event(&event, 120);
         assert!(output.contains(BOLD), "deny should be bold");
@@ -769,6 +820,7 @@ mod tests {
             decision: "warn".into(),
             latency_us: 200,
             enforcement_mode: String::new(),
+            blocked: None,
         });
         let output = format_event(&event, 120);
         assert!(output.contains(YELLOW));
@@ -851,6 +903,7 @@ mod tests {
             decision: "passthrough".into(),
             latency_us: 0,
             enforcement_mode: String::new(),
+            blocked: None,
         });
         let output = format_event(&event, 120);
         assert!(output.contains(DIM));
@@ -892,6 +945,7 @@ mod tests {
             decision: "allow".into(),
             latency_us: 100,
             enforcement_mode: String::new(),
+            blocked: None,
         });
         let output = format_event(&event, 80);
         let width = visible_width(&output);
@@ -911,10 +965,118 @@ mod tests {
             decision: "allow".into(),
             latency_us: 300,
             enforcement_mode: String::new(),
+            blocked: None,
         });
         // Even at absurdly narrow width, it should not panic.
         let output = format_event(&event, 20);
         assert!(!output.is_empty());
+    }
+
+    // -- Blocked-request rendering --------------------------------------------
+    //
+    // Covers three render states: a normal (non-ambiguous) candidate
+    // exception, an ambiguous candidate exception, and the no-suggestion
+    // variant emitted for forbid-effect denials. The suffix helper is
+    // exercised directly to keep tests independent of terminal width
+    // truncation.
+
+    fn sample_exception(scope: ExceptionScope, ambiguous: bool) -> CandidateException {
+        CandidateException {
+            scope,
+            ambiguous,
+            once: ExceptionDirective {
+                summary: "allow http:GET api.github.com/repos/org/repo".to_string(),
+                cedar_snippet: String::new(),
+            },
+            session: ExceptionDirective {
+                summary: "allow http:GET api.github.com/repos/org/repo".to_string(),
+                cedar_snippet: String::new(),
+            },
+            persist: ExceptionDirective {
+                summary: "allow http:GET api.github.com/repos/org/repo".to_string(),
+                cedar_snippet: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn blocked_suffix_renders_candidate_exception() {
+        let info = BlockedRequest {
+            blocked_id: "b-1".into(),
+            match_key: "http:GET api.github.com/repos/org/repo".into(),
+            explanation: "denied by policy 'read-repos'".into(),
+            candidate_exception: Some(sample_exception(ExceptionScope::PathScoped, false)),
+            no_exception_reason: None,
+        };
+        let suffix = format_blocked_suffix(&info);
+        assert!(suffix.contains("denied by policy 'read-repos'"));
+        assert!(
+            suffix.contains(" try:"),
+            "non-ambiguous suffix should use ' try:' label, got {suffix:?}"
+        );
+        assert!(suffix.contains("allow http:GET api.github.com/repos/org/repo"));
+    }
+
+    #[test]
+    fn blocked_suffix_renders_ambiguous_candidate_exception() {
+        let info = BlockedRequest {
+            blocked_id: "b-2".into(),
+            match_key: "http:POST api.example.com/data".into(),
+            explanation: "denied by default-deny".into(),
+            candidate_exception: Some(sample_exception(ExceptionScope::MethodHost, true)),
+            no_exception_reason: None,
+        };
+        let suffix = format_blocked_suffix(&info);
+        assert!(
+            suffix.contains("(ambiguous)"),
+            "ambiguous suffix should include '(ambiguous)', got {suffix:?}"
+        );
+        assert!(suffix.contains("denied by default-deny"));
+    }
+
+    #[test]
+    fn blocked_suffix_renders_no_suggestion_variant() {
+        let info = BlockedRequest {
+            blocked_id: "b-3".into(),
+            match_key: "http:POST api.github.com/git/refs/heads/main".into(),
+            explanation: "Direct pushes to main are not allowed".into(),
+            candidate_exception: None,
+            no_exception_reason: Some(
+                "denied by forbid policy; no permit can override a Cedar forbid effect".to_string(),
+            ),
+        };
+        let suffix = format_blocked_suffix(&info);
+        assert!(suffix.contains("Direct pushes to main are not allowed"));
+        assert!(
+            suffix.contains("no-suggestion"),
+            "forbid suffix should mark no-suggestion, got {suffix:?}"
+        );
+        assert!(suffix.contains("forbid policy"));
+    }
+
+    #[test]
+    fn format_network_deny_renders_blocked_suffix_in_output() {
+        let event = make_event(EventKind::NetworkRequest {
+            method: "DELETE".into(),
+            host: "api.github.com".into(),
+            path: "/repos/org/repo".into(),
+            decision: "deny".into(),
+            latency_us: 150,
+            enforcement_mode: "enforce".into(),
+            blocked: Some(BlockedRequest {
+                blocked_id: "b-end-to-end".into(),
+                match_key: "http:DELETE api.github.com/repos/org/repo".into(),
+                explanation: "denied by policy 'block-deletes'".into(),
+                candidate_exception: Some(sample_exception(ExceptionScope::PathScoped, false)),
+                no_exception_reason: None,
+            }),
+        });
+        let output = format_event(&event, 500);
+        assert!(output.contains("DENY"), "deny decision should uppercase");
+        assert!(
+            output.contains("denied by policy 'block-deletes'"),
+            "output should include explanation: {output:?}"
+        );
     }
 
     // -- Socket discovery -----------------------------------------------------
@@ -1112,6 +1274,7 @@ mod tests {
             decision: "allow".into(),
             latency_us: 150,
             enforcement_mode: String::new(),
+            blocked: None,
         });
 
         use tokio::io::AsyncBufReadExt;

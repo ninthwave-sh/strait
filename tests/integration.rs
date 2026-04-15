@@ -1605,6 +1605,7 @@ async fn observe_mode_generates_policy_covering_observed_requests() {
             decision: "allow".to_string(),
             latency_us: 100,
             enforcement_mode: String::new(),
+            blocked: None,
         });
     }
 
@@ -1681,6 +1682,7 @@ async fn observe_mode_path_normalization() {
         decision: "allow".to_string(),
         latency_us: 100,
         enforcement_mode: String::new(),
+        blocked: None,
     });
     obs.emit(EventKind::NetworkRequest {
         method: "GET".to_string(),
@@ -1689,6 +1691,7 @@ async fn observe_mode_path_normalization() {
         decision: "allow".to_string(),
         latency_us: 100,
         enforcement_mode: String::new(),
+        blocked: None,
     });
     obs.emit(EventKind::NetworkRequest {
         method: "GET".to_string(),
@@ -1697,6 +1700,7 @@ async fn observe_mode_path_normalization() {
         decision: "allow".to_string(),
         latency_us: 100,
         enforcement_mode: String::new(),
+        blocked: None,
     });
     obs.emit(EventKind::NetworkRequest {
         method: "GET".to_string(),
@@ -1705,6 +1709,7 @@ async fn observe_mode_path_normalization() {
         decision: "allow".to_string(),
         latency_us: 100,
         enforcement_mode: String::new(),
+        blocked: None,
     });
 
     drop(obs);
@@ -1787,6 +1792,7 @@ async fn observe_mode_with_echo_server_records_and_generates() {
             decision: "allow".to_string(),
             latency_us: 50,
             enforcement_mode: String::new(),
+            blocked: None,
         });
     }
 
@@ -1911,6 +1917,7 @@ fn e2e_roundtrip_observe_generate_replay() {
         decision: "allow".to_string(),
         latency_us: 50,
         enforcement_mode: String::new(),
+        blocked: None,
     });
 
     // Filesystem activity: test agent reads a file
@@ -2067,6 +2074,7 @@ fn e2e_enforce_denies_unauthorized_actions() {
         decision: "allow".to_string(),
         latency_us: 50,
         enforcement_mode: String::new(),
+        blocked: None,
     });
     obs.emit(EventKind::Mount {
         path: "/workspace".to_string(),
@@ -2099,6 +2107,7 @@ fn e2e_enforce_denies_unauthorized_actions() {
         decision: "allow".to_string(),
         latency_us: 50,
         enforcement_mode: String::new(),
+        blocked: None,
     });
 
     // Unauthorized: GET to a different host entirely
@@ -2109,6 +2118,7 @@ fn e2e_enforce_denies_unauthorized_actions() {
         decision: "allow".to_string(),
         latency_us: 50,
         enforcement_mode: String::new(),
+        blocked: None,
     });
 
     // Unauthorized: write to a path (only read was in the policy)
@@ -2243,6 +2253,7 @@ fn e2e_roundtrip_network_only() {
         decision: "allow".to_string(),
         latency_us: 100,
         enforcement_mode: String::new(),
+        blocked: None,
     });
     obs.emit(EventKind::NetworkRequest {
         method: "POST".to_string(),
@@ -2251,6 +2262,7 @@ fn e2e_roundtrip_network_only() {
         decision: "allow".to_string(),
         latency_us: 200,
         enforcement_mode: String::new(),
+        blocked: None,
     });
 
     drop(obs);
@@ -2312,6 +2324,7 @@ fn e2e_wildcard_collapsing_produces_valid_annotated_policy() {
         decision: "allow".to_string(),
         latency_us: 50,
         enforcement_mode: String::new(),
+        blocked: None,
     });
 
     // Different UUID in same path pattern
@@ -2322,6 +2335,7 @@ fn e2e_wildcard_collapsing_produces_valid_annotated_policy() {
         decision: "allow".to_string(),
         latency_us: 50,
         enforcement_mode: String::new(),
+        blocked: None,
     });
 
     // Long numeric ID in path
@@ -2332,6 +2346,7 @@ fn e2e_wildcard_collapsing_produces_valid_annotated_policy() {
         decision: "allow".to_string(),
         latency_us: 50,
         enforcement_mode: String::new(),
+        blocked: None,
     });
 
     // SHA hash in path
@@ -2342,6 +2357,7 @@ fn e2e_wildcard_collapsing_produces_valid_annotated_policy() {
         decision: "allow".to_string(),
         latency_us: 50,
         enforcement_mode: String::new(),
+        blocked: None,
     });
 
     drop(obs);
@@ -2443,6 +2459,7 @@ fn e2e_roundtrip_full_lifecycle_mixed_events() {
         decision: "allow".to_string(),
         latency_us: 30,
         enforcement_mode: String::new(),
+        blocked: None,
     });
     obs.emit(EventKind::FsAccess {
         path: "/workspace/output.txt".to_string(),
@@ -2498,6 +2515,7 @@ fn e2e_roundtrip_full_lifecycle_mixed_events() {
         decision: "allow".to_string(),
         latency_us: 50,
         enforcement_mode: String::new(),
+        blocked: None,
     });
 
     drop(bad_obs);

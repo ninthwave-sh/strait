@@ -70,10 +70,18 @@ pub struct ObservationSessionContext {
 /// before and simply ignore the extra data.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlockedRequest {
-    /// Stable opaque identifier for this specific blocked-request event.
+    /// Stable opaque identifier for this specific blocked-request
+    /// occurrence.
     ///
-    /// Distinct per emission so a caller can reference an exact blocked
-    /// request when applying an exception.
+    /// The ID identifies a single occurrence of a blocked request, not
+    /// a single observation event. When a warn-mode request produces
+    /// both a `PolicyViolation` and a `NetworkRequest` observation
+    /// event, the two events deliberately share the same `blocked_id`
+    /// so consumers can correlate them as describing the same
+    /// underlying occurrence.
+    ///
+    /// Consumers that want to deduplicate equivalent blocked requests
+    /// across multiple occurrences should use `match_key` instead.
     pub blocked_id: String,
     /// Normalized key used to group equivalent blocked requests.
     ///

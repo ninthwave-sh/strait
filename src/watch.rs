@@ -130,20 +130,34 @@ pub fn terminal_width() -> usize {
         .unwrap_or(DEFAULT_TERMINAL_WIDTH)
 }
 
-/// Build the "blocked-request detail" suffix appended to the event detail
-/// string when an event carries structured `BlockedRequest` metadata.
+/// Build the "blocked-request detail" suffix appended to the event
+/// detail string when an event carries structured `BlockedRequest`
+/// metadata.
 ///
 /// Covers three render states:
 ///
-/// * Normal case: one clearly-smallest exception is available. The suffix
-///   shows the explanation and the smallest candidate exception's summary.
-/// * Ambiguous case: more than one scope is a reasonable "smallest" choice.
-///   The suffix marks the suggestion as ambiguous so the consumer knows to
-///   surface the alternatives rather than apply the suggestion blindly.
-/// * No-suggestion case: no permit can unblock the request (for example a
-///   Cedar `forbid` policy). The suffix shows the explanation and the
-///   recorded reason why no exception is available.
-pub fn format_blocked_suffix(info: &BlockedRequest) -> String {
+/// * Normal case: one clearly-smallest exception is available. The
+///   suffix shows the explanation and the smallest candidate
+///   exception's summary.
+/// * Ambiguous case: more than one scope is a reasonable "smallest"
+///   choice. The suffix marks the suggestion as ambiguous so the
+///   consumer knows to surface the alternatives rather than apply the
+///   suggestion blindly.
+/// * No-suggestion case: no permit can unblock the request (for
+///   example a Cedar `forbid` policy). The suffix shows the
+///   explanation and the recorded reason why no exception is
+///   available.
+///
+/// Callers that have already rendered the explanation elsewhere in the
+/// event line (for example `PolicyViolation` events, whose `reason`
+/// field is already the explanation) should pass
+/// `include_explanation: false` to avoid repeating it.
+pub fn format_blocked_suffix(info: &BlockedRequest, include_explanation: bool) -> String {
+    let explanation_prefix = if include_explanation {
+        format!(" [{}]", info.explanation)
+    } else {
+        String::new()
+    };
     match &info.candidate_exception {
         Some(exception) => {
             let label = if exception.ambiguous {
@@ -151,17 +165,14 @@ pub fn format_blocked_suffix(info: &BlockedRequest) -> String {
             } else {
                 " try"
             };
-            format!(
-                " [{}]{}: {}",
-                info.explanation, label, exception.session.summary
-            )
+            format!("{explanation_prefix}{label}: {}", exception.session.summary)
         }
         None => {
             let reason = info
                 .no_exception_reason
                 .as_deref()
                 .unwrap_or("no candidate exception available");
-            format!(" [{}] no-suggestion: {}", info.explanation, reason)
+            format!("{explanation_prefix} no-suggestion: {reason}")
         }
     }
 }
@@ -192,7 +203,10 @@ fn format_event_parts(event: &EventKind) -> (String, String, String) {
                 decision_display
             };
             if let Some(info) = blocked {
-                detail.push_str(&format_blocked_suffix(info));
+                // NetworkRequest does not render a separate explanation
+                // field in its detail string, so include it in the
+                // suffix.
+                detail.push_str(&format_blocked_suffix(info, true));
             }
             (action, resource, detail)
         }
@@ -235,7 +249,12 @@ fn format_event_parts(event: &EventKind) -> (String, String, String) {
         } => {
             let mut detail = format!("{decision}: {reason}");
             if let Some(info) = blocked {
-                detail.push_str(&format_blocked_suffix(info));
+                // `reason` already renders the same text as
+                // `info.explanation` (both resolve to the joined
+                // `@reason` annotations when they exist), so skip the
+                // explanation prefix in the suffix to avoid repeating
+                // the denial reason on the same line.
+                detail.push_str(&format_blocked_suffix(info, false));
             }
             (format!("policy:{action}"), resource.clone(), detail)
         }
@@ -1008,7 +1027,7 @@ mod tests {
             candidate_exception: Some(sample_exception(ExceptionScope::PathScoped, false)),
             no_exception_reason: None,
         };
-        let suffix = format_blocked_suffix(&info);
+        let suffix = format_blocked_suffix(&info, true);
         assert!(suffix.contains("denied by policy 'read-repos'"));
         assert!(
             suffix.contains(" try:"),
@@ -1026,7 +1045,7 @@ mod tests {
             candidate_exception: Some(sample_exception(ExceptionScope::MethodHost, true)),
             no_exception_reason: None,
         };
-        let suffix = format_blocked_suffix(&info);
+        let suffix = format_blocked_suffix(&info, true);
         assert!(
             suffix.contains("(ambiguous)"),
             "ambiguous suffix should include '(ambiguous)', got {suffix:?}"
@@ -1045,13 +1064,69 @@ mod tests {
                 "denied by forbid policy; no permit can override a Cedar forbid effect".to_string(),
             ),
         };
-        let suffix = format_blocked_suffix(&info);
+        let suffix = format_blocked_suffix(&info, true);
         assert!(suffix.contains("Direct pushes to main are not allowed"));
         assert!(
             suffix.contains("no-suggestion"),
             "forbid suffix should mark no-suggestion, got {suffix:?}"
         );
         assert!(suffix.contains("forbid policy"));
+    }
+
+    #[test]
+    fn blocked_suffix_omits_explanation_when_requested() {
+        // When rendering a `PolicyViolation` event, the caller already
+        // emits the denial reason via the event's `reason` field, so
+        // the suffix should not repeat it. Passing `include_explanation
+        // = false` should drop the `[explanation]` prefix while still
+        // rendering the candidate-exception hint.
+        let info = BlockedRequest {
+            blocked_id: "b-4".into(),
+            match_key: "http:GET api.github.com/repos/org/repo".into(),
+            explanation: "denied by policy 'read-repos'".into(),
+            candidate_exception: Some(sample_exception(ExceptionScope::PathScoped, false)),
+            no_exception_reason: None,
+        };
+        let suffix = format_blocked_suffix(&info, false);
+        assert!(
+            !suffix.contains("denied by policy 'read-repos'"),
+            "suffix must not duplicate the explanation when include_explanation=false, got {suffix:?}"
+        );
+        assert!(
+            suffix.contains(" try:"),
+            "candidate exception should still render, got {suffix:?}"
+        );
+        assert!(suffix.contains("allow http:GET api.github.com/repos/org/repo"));
+    }
+
+    #[test]
+    fn policy_violation_render_does_not_duplicate_reason() {
+        // End-to-end regression: when a `PolicyViolation` carries a
+        // `blocked` payload whose `explanation` matches the event's
+        // `reason` (which is the normal case once `@reason`
+        // annotations are populated), the rendered detail string must
+        // contain the reason text exactly once.
+        let reason = "denied by policy 'block-deletes'";
+        let event = make_event(EventKind::PolicyViolation {
+            enforcement_mode: "enforce".into(),
+            action: "http:DELETE".into(),
+            resource: "api.github.com/repos/org/repo".into(),
+            decision: "deny".into(),
+            reason: reason.to_string(),
+            blocked: Some(BlockedRequest {
+                blocked_id: "b-dupe".into(),
+                match_key: "http:DELETE api.github.com/repos/org/repo".into(),
+                explanation: reason.to_string(),
+                candidate_exception: Some(sample_exception(ExceptionScope::PathScoped, false)),
+                no_exception_reason: None,
+            }),
+        });
+        let output = format_event(&event, 500);
+        let occurrences = output.matches(reason).count();
+        assert_eq!(
+            occurrences, 1,
+            "denial reason should appear exactly once in rendered PolicyViolation line, got {occurrences} in {output:?}"
+        );
     }
 
     #[test]

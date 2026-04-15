@@ -25,7 +25,7 @@ use crate::credentials::parse_aws_host;
 use crate::observe::{BlockedRequest, CandidateException, ExceptionDirective, ExceptionScope};
 use cedar_policy::{
     Authorizer, Context, Decision, Effect, Entities, Entity, EntityId, EntityTypeName, EntityUid,
-    PolicySet, Request, RestrictedExpression, Schema, ValidationMode, Validator,
+    PolicyId, PolicySet, Request, RestrictedExpression, Schema, ValidationMode, Validator,
 };
 
 /// Result of a Cedar policy evaluation.
@@ -193,37 +193,8 @@ impl PolicyEngine {
             .authorizer
             .is_authorized(&request, &self.policy_set, &entities);
 
-        // Resolve policy IDs: prefer @id annotation value over auto-generated name.
-        // Also collect @reason annotations for human-readable denial messages.
-        let mut policy_names = Vec::new();
-        let mut policy_reasons = Vec::new();
-        let mut blocked_by_forbid = false;
-
-        for pid in response.diagnostics().reason() {
-            let name = self
-                .policy_set
-                .annotation(pid, "id")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| pid.to_string());
-            policy_names.push(name);
-
-            // Collect @reason annotation if present (strait convention for
-            // human-readable denial messages in audit logs).
-            if let Some(reason) = self.policy_set.annotation(pid, "reason") {
-                policy_reasons.push(reason.to_string());
-            }
-
-            // Inspect the matching policy's effect. When a `forbid` policy
-            // contributes to the decision, Cedar's forbid-overrides-permit
-            // semantics mean no added permit can unblock the request, so
-            // the downstream blocked-request synthesis must mark the
-            // request as "no candidate exception available".
-            if let Some(policy) = self.policy_set.policy(pid) {
-                if policy.effect() == Effect::Forbid {
-                    blocked_by_forbid = true;
-                }
-            }
-        }
+        let (policy_names, policy_reasons, blocked_by_forbid) =
+            self.collect_decision_metadata(response.diagnostics().reason());
 
         Ok(PolicyDecision {
             allowed: response.decision() == Decision::Allow,
@@ -231,6 +202,49 @@ impl PolicyEngine {
             policy_reasons,
             blocked_by_forbid,
         })
+    }
+
+    /// Collect per-decision metadata (policy names, `@reason`
+    /// annotations, and whether any matching policy has `Effect::Forbid`)
+    /// from the Cedar diagnostics.
+    ///
+    /// Shared between `evaluate`, `evaluate_fs`, and `evaluate_proc` so
+    /// a future change to the metadata collection rules only has to be
+    /// made in one place.
+    ///
+    /// When a `forbid` policy contributes to the decision, Cedar's
+    /// forbid-overrides-permit semantics mean no added permit can
+    /// unblock the request, so the downstream blocked-request synthesis
+    /// uses the returned `blocked_by_forbid` flag to emit the
+    /// no-candidate-exception variant.
+    fn collect_decision_metadata<'a, I>(&self, pids: I) -> (Vec<String>, Vec<String>, bool)
+    where
+        I: IntoIterator<Item = &'a PolicyId>,
+    {
+        let mut policy_names = Vec::new();
+        let mut policy_reasons = Vec::new();
+        let mut blocked_by_forbid = false;
+        for pid in pids {
+            // Resolve policy ID: prefer @id annotation value over
+            // auto-generated name.
+            let name = self
+                .policy_set
+                .annotation(pid, "id")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| pid.to_string());
+            policy_names.push(name);
+            // Collect @reason annotation if present (strait convention
+            // for human-readable denial messages in audit logs).
+            if let Some(reason) = self.policy_set.annotation(pid, "reason") {
+                policy_reasons.push(reason.to_string());
+            }
+            if let Some(policy) = self.policy_set.policy(pid) {
+                if policy.effect() == Effect::Forbid {
+                    blocked_by_forbid = true;
+                }
+            }
+        }
+        (policy_names, policy_reasons, blocked_by_forbid)
     }
 
     /// Evaluate a filesystem action against the loaded policy set.
@@ -279,25 +293,8 @@ impl PolicyEngine {
             .authorizer
             .is_authorized(&request, &self.policy_set, &entities);
 
-        let mut policy_names = Vec::new();
-        let mut policy_reasons = Vec::new();
-        let mut blocked_by_forbid = false;
-        for pid in response.diagnostics().reason() {
-            let name = self
-                .policy_set
-                .annotation(pid, "id")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| pid.to_string());
-            policy_names.push(name);
-            if let Some(reason) = self.policy_set.annotation(pid, "reason") {
-                policy_reasons.push(reason.to_string());
-            }
-            if let Some(policy) = self.policy_set.policy(pid) {
-                if policy.effect() == Effect::Forbid {
-                    blocked_by_forbid = true;
-                }
-            }
-        }
+        let (policy_names, policy_reasons, blocked_by_forbid) =
+            self.collect_decision_metadata(response.diagnostics().reason());
 
         Ok(PolicyDecision {
             allowed: response.decision() == Decision::Allow,
@@ -344,25 +341,8 @@ impl PolicyEngine {
             .authorizer
             .is_authorized(&request, &self.policy_set, &entities);
 
-        let mut policy_names = Vec::new();
-        let mut policy_reasons = Vec::new();
-        let mut blocked_by_forbid = false;
-        for pid in response.diagnostics().reason() {
-            let name = self
-                .policy_set
-                .annotation(pid, "id")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| pid.to_string());
-            policy_names.push(name);
-            if let Some(reason) = self.policy_set.annotation(pid, "reason") {
-                policy_reasons.push(reason.to_string());
-            }
-            if let Some(policy) = self.policy_set.policy(pid) {
-                if policy.effect() == Effect::Forbid {
-                    blocked_by_forbid = true;
-                }
-            }
-        }
+        let (policy_names, policy_reasons, blocked_by_forbid) =
+            self.collect_decision_metadata(response.diagnostics().reason());
 
         Ok(PolicyDecision {
             allowed: response.decision() == Decision::Allow,
@@ -1054,11 +1034,45 @@ fn synthesize_candidate_exception(host: &str, method: &str, path: &str) -> Candi
     }
 }
 
+/// Normalize a string into an identifier suitable for embedding in a
+/// Cedar `@id("...")` annotation without risking collisions.
+///
+/// Replaces any character that is not alphanumeric or `_` with `_`, and
+/// collapses consecutive underscores. This is a best-effort sanitizer,
+/// not a canonical form -- two distinct inputs can still normalize to
+/// the same identifier (for example `foo.bar` and `foo_bar`). The goal
+/// is to produce human-readable IDs that incorporate the host and path
+/// so separate blocked requests do not all share the same `@id`, which
+/// would make Cedar reject the resulting policy set or silently collide.
+fn sanitize_id_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_underscore = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_was_underscore = false;
+        } else if !last_was_underscore {
+            out.push('_');
+            last_was_underscore = true;
+        }
+    }
+    // Trim leading/trailing underscores so an input like "/foo" does not
+    // render as "_foo_" in the final ID.
+    out.trim_matches('_').to_string()
+}
+
 /// Build a `PathScoped` exception directive for the given lifetime form.
 fn path_scoped_directive(host: &str, method: &str, path: &str, form: &str) -> ExceptionDirective {
     let resource_id = build_resource_id(host, path);
     let summary = format!("allow http:{method} {host}{path}");
-    let id = format!("allow_http_{}_path_{form}", method.to_lowercase());
+    // Include host and path in the ID so two distinct blocked requests
+    // synthesized in the same session do not collide on a shared `@id`.
+    let host_slug = sanitize_id_segment(host);
+    let path_slug = sanitize_id_segment(path);
+    let id = format!(
+        "allow_http_{}_path_{host_slug}_{path_slug}_{form}",
+        method.to_lowercase()
+    );
     let cedar_snippet = format!(
         "@id(\"{id}\")\n@reason(\"strait-synthesized {form} exception for {method} {path} on {host}\")\npermit(\n    principal,\n    action == Action::\"http:{method}\",\n    resource == Resource::\"{resource}\"\n);",
         resource = resource_id,
@@ -1072,7 +1086,13 @@ fn path_scoped_directive(host: &str, method: &str, path: &str, form: &str) -> Ex
 /// Build a `MethodHost` exception directive for the given lifetime form.
 fn method_host_directive(host: &str, method: &str, form: &str) -> ExceptionDirective {
     let summary = format!("allow http:{method} {host}");
-    let id = format!("allow_http_{}_host_{form}", method.to_lowercase());
+    // Include host in the ID for the same collision-avoidance reason as
+    // `path_scoped_directive`.
+    let host_slug = sanitize_id_segment(host);
+    let id = format!(
+        "allow_http_{}_host_{host_slug}_{form}",
+        method.to_lowercase()
+    );
     let cedar_snippet = format!(
         "@id(\"{id}\")\n@reason(\"strait-synthesized {form} exception for {method} on {host}\")\npermit(\n    principal,\n    action == Action::\"http:{method}\",\n    resource in Resource::\"{host}\"\n);",
     );

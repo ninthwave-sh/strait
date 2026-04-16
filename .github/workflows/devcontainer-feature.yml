@@ -110,7 +110,7 @@ jobs:
 
               # Run the install script (it will fail to download, but the
               # gateway binary is already bind-mounted).
-              chmod +x /feature/install.sh
+              # install.sh is already +x in the repo; the volume is read-only.
               VERSION=latest /feature/install.sh 2>&1 || true
 
               # Verify entrypoint was installed.
@@ -155,7 +155,6 @@ jobs:
             --entrypoint /bin/sh \
             ubuntu:24.04 -c '
               set -e
-              chmod +x /feature/install.sh
               VERSION=latest /feature/install.sh 2>&1 || true
 
               # Run the entrypoint with a test command.
@@ -195,7 +194,6 @@ jobs:
             --entrypoint /bin/sh \
             ubuntu:24.04 -c '
               set -e
-              chmod +x /feature/install.sh
               VERSION=latest /feature/install.sh 2>&1 || true
 
               # Verify CA bundle was created by the entrypoint.

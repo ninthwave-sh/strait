@@ -1,5 +1,5 @@
 // VALIDATED: 2026-04-06 strait template for Claude Code
-// claude-code — Full-stack policy for Claude Code agent sessions.
+// claude-code — Network policy for Claude Code agent sessions.
 //
 // Designed for Claude Code with OAuth auth (Claude Max / Team / Enterprise).
 // With OAuth, Anthropic API traffic is passthrough (not proxied through strait),
@@ -14,17 +14,7 @@
 //   Denies: Push to main/release branches via Git Data API
 //   Denies: Repository deletion
 //
-// Filesystem:
-//   Allows: fs:read and fs:write to /project (workspace directory)
-//   Allows: fs:read to system paths (libraries, tools)
-//   Denies: fs:write outside the workspace
-//
-// Process:
-//   Allows: proc:exec for claude, git, node, and common dev tools
-//   Denies: proc:exec for destructive commands (rm -rf, chmod 777)
-//
-// To use: replace "your-org" with your GitHub organization name,
-// and adjust filesystem paths for your workspace layout.
+// To use: replace "your-org" with your GitHub organization name.
 
 // ---------------------------------------------------------------------------
 // NETWORK — Anthropic API (API key users only)
@@ -127,114 +117,3 @@ forbid(
     action in [Action::"http:POST", Action::"http:DELETE"],
     resource in Resource::"api.github.com/repos"
 ) unless { resource in Resource::"api.github.com/repos/your-org" };
-
-// ---------------------------------------------------------------------------
-// FILESYSTEM — workspace read/write, system read-only
-// ---------------------------------------------------------------------------
-
-// Full read/write access to the project workspace.
-@id("workspace-readwrite")
-permit(
-    principal,
-    action in [Action::"fs:read", Action::"fs:write"],
-    resource in Resource::"fs::/project"
-);
-
-// Read-only access to system libraries, tools, and configuration.
-@id("system-readonly")
-permit(
-    principal,
-    action == Action::"fs:read",
-    resource in Resource::"fs::/"
-);
-
-// Deny writes outside the workspace.
-@id("deny-system-write")
-@reason("Write access is restricted to the /project workspace directory")
-forbid(
-    principal,
-    action == Action::"fs:write",
-    resource in Resource::"fs::/"
-) unless { resource in Resource::"fs::/project" };
-
-// ---------------------------------------------------------------------------
-// PROCESS — allowed dev tools
-// ---------------------------------------------------------------------------
-
-// Allow claude CLI.
-@id("allow-claude")
-permit(
-    principal,
-    action == Action::"proc:exec",
-    resource
-) when { context.command like "claude*" };
-
-// Allow git commands.
-@id("allow-git")
-permit(
-    principal,
-    action == Action::"proc:exec",
-    resource
-) when { context.command like "git*" };
-
-// Allow node and npm commands.
-@id("allow-node")
-permit(
-    principal,
-    action == Action::"proc:exec",
-    resource
-) when { context.command like "node*" || context.command like "npm*" || context.command like "npx*" };
-
-// Allow common dev tools: cargo, python, pip, make, sh, bash, cat, ls, grep, find.
-@id("allow-dev-tools")
-permit(
-    principal,
-    action == Action::"proc:exec",
-    resource
-) when {
-    context.command like "cargo*" ||
-    context.command like "python*" ||
-    context.command like "pip*" ||
-    context.command like "make*" ||
-    context.command like "sh*" ||
-    context.command like "bash*" ||
-    context.command like "cat*" ||
-    context.command like "ls*" ||
-    context.command like "grep*" ||
-    context.command like "find*" ||
-    context.command like "sed*" ||
-    context.command like "awk*" ||
-    context.command like "curl*" ||
-    context.command like "jq*"
-};
-
-// ---------------------------------------------------------------------------
-// PROCESS — deny destructive commands
-// ---------------------------------------------------------------------------
-
-// Deny rm -rf (recursive force delete).
-@id("deny-rm-rf")
-@reason("Recursive force-delete is too destructive for agent access")
-forbid(
-    principal,
-    action == Action::"proc:exec",
-    resource
-) when { context.command like "rm -rf *" };
-
-// Deny chmod 777 (world-writable permissions).
-@id("deny-chmod-777")
-@reason("Setting world-writable permissions is a security risk")
-forbid(
-    principal,
-    action == Action::"proc:exec",
-    resource
-) when { context.command like "chmod 777*" };
-
-// Deny git push --force to any branch (use --force-with-lease instead).
-@id("deny-force-push")
-@reason("Force-push is prohibited; use --force-with-lease for safer rebases")
-forbid(
-    principal,
-    action == Action::"proc:exec",
-    resource
-) when { context.command like "git push --force*" || context.command like "git push -f *" };

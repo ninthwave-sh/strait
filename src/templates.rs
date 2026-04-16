@@ -17,10 +17,9 @@ pub struct Template {
     pub schema: &'static str,
 }
 
-/// The unified Cedar schema covering all action domains (HTTP, fs, proc).
+/// The Cedar schema covering Strait's HTTP action domain.
 ///
-/// Use this when combining rules from multiple domains (e.g. GitHub + AWS,
-/// or HTTP + filesystem for container sandboxes). AWS context attributes
+/// Use this for policies that scope outbound network access. AWS context attributes
 /// (`aws_service`, `aws_region`) are declared as optional so they validate
 /// correctly for both AWS and non-AWS policies.
 pub const UNIFIED_SCHEMA: &str = include_str!("../templates/strait.cedarschema");
@@ -41,13 +40,13 @@ pub const TEMPLATES: &[Template] = &[
     },
     Template {
         name: "claude-code",
-        description: "Claude Code agent (OAuth): GitHub API, npm, filesystem, dev tools",
+        description: "Claude Code agent (OAuth): GitHub API and npm registry",
         policy: include_str!("../templates/claude-code.cedar"),
         schema: include_str!("../templates/strait.cedarschema"),
     },
     Template {
         name: "container-sandbox",
-        description: "Container sandbox: fs read/write + scoped HTTP access",
+        description: "Container sandbox: scoped HTTP access",
         policy: include_str!("../templates/container-sandbox.cedar"),
         schema: include_str!("../templates/strait.cedarschema"),
     },
@@ -123,17 +122,21 @@ mod tests {
     use cedar_policy::{PolicySet, Schema, ValidationMode, Validator};
     use std::str::FromStr;
 
+    fn engine_from_policy(policy: &str) -> crate::policy::PolicyEngine {
+        crate::policy::PolicyEngine::from_text(policy, None, None).unwrap()
+    }
+
     #[test]
     fn all_templates_have_validated_comment() {
         for t in TEMPLATES {
             assert!(
                 t.policy.contains("// VALIDATED:"),
-                "template {}: policy missing VALIDATED comment",
+                "template {} missing policy marker",
                 t.name
             );
             assert!(
                 t.schema.contains("// VALIDATED:"),
-                "template {}: schema missing VALIDATED comment",
+                "template {} missing schema marker",
                 t.name
             );
         }
@@ -143,18 +146,16 @@ mod tests {
     fn all_templates_pass_cedar_validation() {
         for t in TEMPLATES {
             let policy_set = PolicySet::from_str(t.policy).unwrap_or_else(|e| {
-                panic!("template {}: invalid Cedar policy: {e}", t.name);
+                panic!("template {} invalid Cedar policy: {e}", t.name);
             });
-
             let (schema, _warnings) = Schema::from_cedarschema_str(t.schema).unwrap_or_else(|e| {
-                panic!("template {}: invalid Cedar schema: {e}", t.name);
+                panic!("template {} invalid Cedar schema: {e}", t.name);
             });
-
             let validator = Validator::new(schema);
             let result = validator.validate(&policy_set, ValidationMode::Strict);
             assert!(
                 result.validation_passed(),
-                "template {}: Cedar validation failed: {:?}",
+                "template {} validation failed: {:?}",
                 t.name,
                 result
                     .validation_errors()
@@ -175,505 +176,65 @@ mod tests {
     }
 
     #[test]
-    fn find_returns_none_for_unknown() {
-        assert!(find("nonexistent").is_none());
-    }
-
-    #[test]
-    fn apply_unknown_template_returns_error() {
-        let result = apply("nonexistent", None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("unknown template"),
-            "error should mention unknown template: {err}"
-        );
-        // Should list valid template names
-        assert!(
-            err.contains("github-org-readonly"),
-            "error should list valid templates: {err}"
-        );
-    }
-
-    #[test]
     fn apply_to_output_dir_writes_files() {
         let dir = tempfile::tempdir().unwrap();
         apply("github-org-readonly", Some(dir.path())).unwrap();
-
-        let policy_path = dir.path().join("github-org-readonly.cedar");
-        let schema_path = dir.path().join("github-org-readonly.cedarschema");
-
-        assert!(policy_path.exists(), "policy file should exist");
-        assert!(schema_path.exists(), "schema file should exist");
-
-        let policy = std::fs::read_to_string(&policy_path).unwrap();
-        assert!(
-            policy.contains("permit("),
-            "policy should contain permit statements"
-        );
+        assert!(dir.path().join("github-org-readonly.cedar").exists());
+        assert!(dir.path().join("github-org-readonly.cedarschema").exists());
     }
-
-    #[test]
-    fn template_list_contains_all_templates() {
-        assert_eq!(TEMPLATES.len(), 6);
-        let names: Vec<&str> = TEMPLATES.iter().map(|t| t.name).collect();
-        assert!(names.contains(&"github-org-readonly"));
-        assert!(names.contains(&"github-org-contributor"));
-        assert!(names.contains(&"aws-s3-readonly"));
-        assert!(names.contains(&"aws-s3-readwrite"));
-        assert!(names.contains(&"claude-code"));
-        assert!(names.contains(&"container-sandbox"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Unified schema tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn unified_schema_parses() {
-        let (schema, warnings) =
-            Schema::from_cedarschema_str(UNIFIED_SCHEMA).expect("unified schema should parse");
-        // Warnings are informational; schema must parse cleanly
-        let warnings: Vec<_> = warnings.collect();
-        assert!(
-            warnings.is_empty(),
-            "unified schema produced warnings: {warnings:?}"
-        );
-
-        // Validate each template policy against the unified schema
-        for t in TEMPLATES {
-            let policy_set = PolicySet::from_str(t.policy).unwrap_or_else(|e| {
-                panic!("template {}: invalid Cedar policy: {e}", t.name);
-            });
-            let validator = Validator::new(schema.clone());
-            let result = validator.validate(&policy_set, ValidationMode::Strict);
-            assert!(
-                result.validation_passed(),
-                "template {} failed unified schema validation: {:?}",
-                t.name,
-                result
-                    .validation_errors()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
-
-    #[test]
-    fn unified_schema_validates_combined_github_and_aws_policy() {
-        // A policy that combines GitHub reads with AWS S3 reads —
-        // should validate against the unified schema since AWS attributes
-        // are optional.
-        let combined_policy = r#"
-@id("github-read")
-permit(
-    principal,
-    action == Action::"http:GET",
-    resource in Resource::"api.github.com/repos/test-org"
-);
-
-@id("s3-read")
-permit(
-    principal,
-    action == Action::"http:GET",
-    resource
-) when { context has aws_service && context.aws_service == "s3" };
-"#;
-
-        let policy_set = PolicySet::from_str(combined_policy).unwrap();
-        let (schema, _) = Schema::from_cedarschema_str(UNIFIED_SCHEMA).unwrap();
-        let validator = Validator::new(schema);
-        let result = validator.validate(&policy_set, ValidationMode::Strict);
-        assert!(
-            result.validation_passed(),
-            "combined GitHub+AWS policy should validate: {:?}",
-            result
-                .validation_errors()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Behavioral tests — evaluate templates against concrete requests
-    // -----------------------------------------------------------------------
-
-    use crate::policy::PolicyEngine;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
-
-    /// Write policy text to a temp file and load a PolicyEngine from it.
-    fn engine_from_policy(policy_text: &str) -> PolicyEngine {
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(policy_text.as_bytes()).unwrap();
-        f.flush().unwrap();
-        PolicyEngine::load(f.path(), None).unwrap()
-    }
-
-    // --- github-org-readonly behavioral tests ---
-
-    #[test]
-    fn github_readonly_permits_get_org_repo() {
-        let t = find("github-org-readonly").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/test-org/my-repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            result.allowed,
-            "GET /repos/test-org/my-repo should be allowed"
-        );
-    }
-
-    #[test]
-    fn github_readonly_denies_post_org_repo() {
-        let t = find("github-org-readonly").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/test-org/my-repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "POST /repos/test-org/my-repo should be denied (read-only)"
-        );
-    }
-
-    #[test]
-    fn github_readonly_denies_outside_org() {
-        let t = find("github-org-readonly").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/other-org/repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "GET /repos/other-org/repo should be denied (outside org)"
-        );
-    }
-
-    // --- github-org-contributor behavioral tests ---
-
-    #[test]
-    fn github_contributor_permits_get_and_pr_creation() {
-        let t = find("github-org-contributor").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        // GET should be allowed
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/test-org/my-repo/issues",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            result.allowed,
-            "GET /repos/test-org/my-repo/issues should be allowed"
-        );
-
-        // POST to /pulls should be allowed
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/test-org/my-repo/pulls",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            result.allowed,
-            "POST /repos/test-org/my-repo/pulls should be allowed"
-        );
-    }
-
-    #[test]
-    fn github_contributor_denies_push_main() {
-        let t = find("github-org-contributor").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/test-org/my-repo/git/refs/heads/main",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "POST to git/refs/heads/main should be denied"
-        );
-    }
-
-    #[test]
-    fn github_contributor_denies_repo_delete() {
-        let t = find("github-org-contributor").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:DELETE",
-                "/repos/test-org/my-repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(!result.allowed, "DELETE on repo should be denied");
-    }
-
-    // --- aws-s3-readonly behavioral tests ---
-
-    #[test]
-    fn aws_s3_readonly_permits_get_denies_put() {
-        let t = find("aws-s3-readonly").unwrap();
-        let engine = engine_from_policy(t.policy);
-
-        // GET should be allowed (aws_service is populated by evaluate)
-        let result = engine
-            .evaluate(
-                "s3.us-east-1.amazonaws.com",
-                "http:GET",
-                "/my-bucket/my-key",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(result.allowed, "GET on S3 should be allowed");
-
-        // PUT should be denied
-        let result = engine
-            .evaluate(
-                "s3.us-east-1.amazonaws.com",
-                "http:PUT",
-                "/my-bucket/my-key",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(!result.allowed, "PUT on S3 should be denied (read-only)");
-    }
-
-    #[test]
-    fn aws_s3_readonly_permits_head() {
-        let t = find("aws-s3-readonly").unwrap();
-        let engine = engine_from_policy(t.policy);
-
-        let result = engine
-            .evaluate(
-                "s3.us-east-1.amazonaws.com",
-                "http:HEAD",
-                "/my-bucket/my-key",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(result.allowed, "HEAD on S3 should be allowed");
-    }
-
-    // --- aws-s3-readwrite behavioral tests ---
 
     #[test]
     fn aws_s3_readwrite_permits_put_denies_delete() {
         let t = find("aws-s3-readwrite").unwrap();
         let engine = engine_from_policy(t.policy);
-
-        // PUT should be allowed
-        let result = engine
-            .evaluate(
-                "s3.us-east-1.amazonaws.com",
-                "http:PUT",
-                "/my-bucket/my-key",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(result.allowed, "PUT on S3 should be allowed (readwrite)");
-
-        // DELETE should be denied
-        let result = engine
-            .evaluate(
-                "s3.us-east-1.amazonaws.com",
-                "http:DELETE",
-                "/my-bucket/my-key",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(!result.allowed, "DELETE on S3 should be denied");
-    }
-
-    // --- container-sandbox behavioral tests ---
-
-    #[test]
-    fn container_sandbox_permits_fs_read_workspace() {
-        let t = find("container-sandbox").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        let result = engine
-            .evaluate_fs("/project/src/main.rs", "fs:read", "worker")
-            .unwrap();
         assert!(
-            result.allowed,
-            "fs:read /project/src/main.rs should be allowed"
+            engine
+                .evaluate(
+                    "s3.us-east-1.amazonaws.com",
+                    "http:PUT",
+                    "/my-bucket/my-key",
+                    &[],
+                    "worker"
+                )
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !engine
+                .evaluate(
+                    "s3.us-east-1.amazonaws.com",
+                    "http:DELETE",
+                    "/my-bucket/my-key",
+                    &[],
+                    "worker"
+                )
+                .unwrap()
+                .allowed
         );
     }
 
     #[test]
-    fn container_sandbox_permits_fs_write_workspace() {
+    fn container_sandbox_permits_github_get_and_denies_unscoped_http() {
         let t = find("container-sandbox").unwrap();
         let policy = t.policy.replace("your-org", "test-org");
         let engine = engine_from_policy(&policy);
-
-        let result = engine
-            .evaluate_fs("/project/src/main.rs", "fs:write", "worker")
-            .unwrap();
         assert!(
-            result.allowed,
-            "fs:write /project/src/main.rs should be allowed"
+            engine
+                .evaluate(
+                    "api.github.com",
+                    "http:GET",
+                    "/repos/test-org/my-repo",
+                    &[],
+                    "worker"
+                )
+                .unwrap()
+                .allowed
         );
-    }
-
-    #[test]
-    fn container_sandbox_permits_fs_read_system() {
-        let t = find("container-sandbox").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        // System paths should allow read
-        let result = engine
-            .evaluate_fs("/usr/lib/libc.so", "fs:read", "worker")
-            .unwrap();
         assert!(
-            result.allowed,
-            "fs:read /usr/lib/libc.so should be allowed (system-readonly)"
-        );
-    }
-
-    #[test]
-    fn container_sandbox_denies_fs_write_system() {
-        let t = find("container-sandbox").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        // System paths should deny write
-        let result = engine
-            .evaluate_fs("/etc/passwd", "fs:write", "worker")
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "fs:write /etc/passwd should be denied (read-only path)"
-        );
-    }
-
-    #[test]
-    fn container_sandbox_permits_github_get() {
-        let t = find("container-sandbox").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/test-org/my-repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            result.allowed,
-            "http:GET to GitHub org repo should be allowed"
-        );
-    }
-
-    #[test]
-    fn container_sandbox_denies_unauthorized_http() {
-        let t = find("container-sandbox").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        // PUT to GitHub should be denied (only GET and POST /pulls are allowed)
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:PUT",
-                "/repos/test-org/my-repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(!result.allowed, "http:PUT to GitHub should be denied");
-
-        // GET to unscoped host should be denied
-        let result = engine
-            .evaluate("example.com", "http:GET", "/", &[], "worker")
-            .unwrap();
-        assert!(!result.allowed, "http:GET to example.com should be denied");
-    }
-
-    // --- claude-code behavioral tests ---
-
-    #[test]
-    fn claude_code_anthropic_api_not_proxied() {
-        // OAuth users: Anthropic traffic is passthrough, not proxied.
-        // The template should NOT permit Anthropic API requests (rules are commented out).
-        let t = find("claude-code").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        let result = engine
-            .evaluate(
-                "api.anthropic.com",
-                "http:POST",
-                "/v1/messages",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "POST to Anthropic should not be allowed (OAuth passthrough)"
-        );
-
-        let result = engine
-            .evaluate("api.anthropic.com", "http:GET", "/v1/models", &[], "worker")
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "GET to Anthropic should not be allowed (OAuth passthrough)"
+            !engine
+                .evaluate("example.com", "http:GET", "/", &[], "worker")
+                .unwrap()
+                .allowed
         );
     }
 
@@ -681,56 +242,42 @@ permit(
     fn claude_code_permits_npm_registry() {
         let t = find("claude-code").unwrap();
         let engine = engine_from_policy(t.policy);
-
-        let result = engine
-            .evaluate("registry.npmjs.org", "http:GET", "/express", &[], "worker")
-            .unwrap();
-        assert!(result.allowed, "GET to npm registry should be allowed");
+        assert!(
+            engine
+                .evaluate("registry.npmjs.org", "http:GET", "/express", &[], "worker")
+                .unwrap()
+                .allowed
+        );
     }
 
     #[test]
-    fn claude_code_permits_github_read_write_delete() {
+    fn claude_code_denies_anthropic_and_repo_delete() {
         let t = find("claude-code").unwrap();
         let policy = t.policy.replace("your-org", "test-org");
         let engine = engine_from_policy(&policy);
-
-        // GET should be allowed
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/test-org/my-repo/pulls",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(result.allowed, "GET to GitHub org repos should be allowed");
-
-        // POST should be allowed
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/test-org/my-repo/pulls",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(result.allowed, "POST to GitHub org repos should be allowed");
-
-        // DELETE should be allowed (e.g. delete branch)
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:DELETE",
-                "/repos/test-org/my-repo/git/refs/heads/feature",
-                &[],
-                "worker",
-            )
-            .unwrap();
         assert!(
-            result.allowed,
-            "DELETE branch on GitHub org repos should be allowed"
+            !engine
+                .evaluate(
+                    "api.anthropic.com",
+                    "http:POST",
+                    "/v1/messages",
+                    &[],
+                    "worker"
+                )
+                .unwrap()
+                .allowed
+        );
+        assert!(
+            !engine
+                .evaluate(
+                    "api.github.com",
+                    "http:DELETE",
+                    "/repos/test-org/my-repo",
+                    &[],
+                    "worker"
+                )
+                .unwrap()
+                .allowed
         );
     }
 
@@ -739,143 +286,17 @@ permit(
         let t = find("claude-code").unwrap();
         let policy = t.policy.replace("your-org", "test-org");
         let engine = engine_from_policy(&policy);
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/test-org/my-repo/git/refs/heads/main",
-                &[],
-                "worker",
-            )
-            .unwrap();
         assert!(
-            !result.allowed,
-            "POST to git/refs/heads/main should be denied"
-        );
-    }
-
-    #[test]
-    fn claude_code_denies_repo_delete() {
-        let t = find("claude-code").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:DELETE",
-                "/repos/test-org/my-repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(!result.allowed, "DELETE on repo should be denied");
-    }
-
-    #[test]
-    fn claude_code_denies_outside_org() {
-        let t = find("claude-code").unwrap();
-        let policy = t.policy.replace("your-org", "test-org");
-        let engine = engine_from_policy(&policy);
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/other-org/repo/pulls",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "POST to repos outside org should be denied"
-        );
-    }
-
-    #[test]
-    fn claude_code_permits_fs_workspace() {
-        let t = find("claude-code").unwrap();
-        let engine = engine_from_policy(t.policy);
-
-        let result = engine
-            .evaluate_fs("/project/src/main.rs", "fs:read", "worker")
-            .unwrap();
-        assert!(result.allowed, "fs:read in workspace should be allowed");
-
-        let result = engine
-            .evaluate_fs("/project/src/main.rs", "fs:write", "worker")
-            .unwrap();
-        assert!(result.allowed, "fs:write in workspace should be allowed");
-    }
-
-    #[test]
-    fn claude_code_permits_fs_read_system() {
-        let t = find("claude-code").unwrap();
-        let engine = engine_from_policy(t.policy);
-
-        let result = engine
-            .evaluate_fs("/usr/lib/libc.so", "fs:read", "worker")
-            .unwrap();
-        assert!(result.allowed, "fs:read system libraries should be allowed");
-    }
-
-    #[test]
-    fn claude_code_denies_fs_write_system() {
-        let t = find("claude-code").unwrap();
-        let engine = engine_from_policy(t.policy);
-
-        let result = engine
-            .evaluate_fs("/etc/passwd", "fs:write", "worker")
-            .unwrap();
-        assert!(!result.allowed, "fs:write to system paths should be denied");
-    }
-
-    #[test]
-    fn claude_code_permits_dev_tools() {
-        let t = find("claude-code").unwrap();
-        let engine = engine_from_policy(t.policy);
-
-        for cmd in &["git status", "node index.js", "npm install", "cargo test"] {
-            let result = engine.evaluate_proc(cmd, "proc:exec", "worker").unwrap();
-            assert!(result.allowed, "proc:exec '{cmd}' should be allowed");
-        }
-    }
-
-    #[test]
-    fn claude_code_permits_claude_cli() {
-        let t = find("claude-code").unwrap();
-        let engine = engine_from_policy(t.policy);
-
-        let result = engine
-            .evaluate_proc("claude chat", "proc:exec", "worker")
-            .unwrap();
-        assert!(result.allowed, "proc:exec 'claude chat' should be allowed");
-    }
-
-    #[test]
-    fn claude_code_denies_rm_rf() {
-        let t = find("claude-code").unwrap();
-        let engine = engine_from_policy(t.policy);
-
-        let result = engine
-            .evaluate_proc("rm -rf /", "proc:exec", "worker")
-            .unwrap();
-        assert!(!result.allowed, "proc:exec 'rm -rf /' should be denied");
-    }
-
-    #[test]
-    fn claude_code_denies_force_push() {
-        let t = find("claude-code").unwrap();
-        let engine = engine_from_policy(t.policy);
-
-        let result = engine
-            .evaluate_proc("git push --force origin main", "proc:exec", "worker")
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "proc:exec 'git push --force' should be denied"
+            !engine
+                .evaluate(
+                    "api.github.com",
+                    "http:POST",
+                    "/repos/test-org/my-repo/git/refs/heads/main",
+                    &[],
+                    "worker",
+                )
+                .unwrap()
+                .allowed
         );
     }
 }

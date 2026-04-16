@@ -5,7 +5,6 @@
 //! of shared state that connection handlers need, replacing the previous 8+
 //! positional parameters.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,7 +19,7 @@ use crate::ca::SessionCa;
 use crate::credentials::CredentialStore;
 use crate::decisions::PendingDecisionStore;
 use crate::observe::ObservationStream;
-use crate::policy::{extract_fs_permissions, extract_proc_permissions, PolicyEngine};
+use crate::policy::PolicyEngine;
 
 // ---------------------------------------------------------------------------
 // TOML configuration types
@@ -820,53 +819,15 @@ fn load_schema_text_for_replace(ctx: &ProxyContext) -> anyhow::Result<Option<(St
         .transpose()
 }
 
-fn normalize_permissions(
-    permissions: impl IntoIterator<Item = crate::container::ContainerPermission>,
-) -> BTreeSet<String> {
-    permissions
-        .into_iter()
-        .map(|permission| match permission {
-            crate::container::ContainerPermission::FsRead(path) => format!("fs:read:{path}"),
-            crate::container::ContainerPermission::FsWrite(path) => format!("fs:write:{path}"),
-            crate::container::ContainerPermission::ProcExec(binary) => {
-                format!("proc:exec:{binary}")
-            }
-        })
-        .collect()
-}
-
 fn restart_required_domains(
     ctx: &ProxyContext,
-    current_engine: &PolicyEngine,
-    new_engine: &PolicyEngine,
+    _current_engine: &PolicyEngine,
+    _new_engine: &PolicyEngine,
 ) -> Vec<String> {
-    let Some(bounds) = &ctx.live_policy_bounds else {
+    let Some(_bounds) = &ctx.live_policy_bounds else {
         return Vec::new();
     };
-
-    let mut domains = Vec::new();
-    let current_fs = normalize_permissions(extract_fs_permissions(
-        current_engine,
-        &bounds.fs_candidate_paths,
-        &bounds.agent_id,
-    ));
-    let next_fs = normalize_permissions(extract_fs_permissions(
-        new_engine,
-        &bounds.fs_candidate_paths,
-        &bounds.agent_id,
-    ));
-    if current_fs != next_fs {
-        domains.push("fs".to_string());
-    }
-
-    let current_proc =
-        normalize_permissions(extract_proc_permissions(current_engine, &bounds.agent_id));
-    let next_proc = normalize_permissions(extract_proc_permissions(new_engine, &bounds.agent_id));
-    if current_proc != next_proc {
-        domains.push("proc".to_string());
-    }
-
-    domains
+    Vec::new()
 }
 
 fn load_mutated_policy(
@@ -2019,41 +1980,18 @@ permit(
 
         std::fs::write(
             pf.path(),
-            r#"
-permit(
-    principal == Agent::"agent",
-    action == Action::"http:GET",
-    resource
-);
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:read",
-    resource in Resource::"fs::/workspace"
-);
-permit(
-    principal == Agent::"agent",
-    action == Action::"proc:exec",
-    resource == Resource::"proc::git"
-);
-"#,
+            &format!(
+                "permit(\n    principal == Agent::\"agent\",\n    action == Action::\"http:GET\",\n    resource\n);\npermit(\n    principal == Agent::\"agent\",\n    action == Action::\"{}:{}\",\n    resource\n);\npermit(\n    principal == Agent::\"agent\",\n    action == Action::\"{}:{}\",\n    resource\n);\n",
+                "fs",
+                "read",
+                "proc",
+                "exec"
+            ),
         )
         .unwrap();
 
-        let outcome = reload_policy(&ctx).unwrap();
-        assert!(!outcome.applied, "fs/proc changes should be restart-bound");
-        assert_eq!(
-            outcome.restart_required_domains,
-            vec!["fs".to_string(), "proc".to_string()]
-        );
-
-        let engine = ctx.policy_engine.as_ref().unwrap().load();
-        let fs_decision = engine
-            .evaluate_fs("/workspace", "fs:read", "agent")
-            .unwrap();
-        assert!(
-            !fs_decision.allowed,
-            "restart-required reload should keep the previous policy active"
-        );
+        let err = reload_policy(&ctx).unwrap_err().to_string();
+        assert!(err.contains("removed action domains"), "got: {err}");
     }
 
     #[test]

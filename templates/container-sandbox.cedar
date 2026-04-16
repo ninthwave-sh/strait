@@ -1,14 +1,8 @@
 // VALIDATED: 2026-03-28 strait template infrastructure
-// container-sandbox — Combined fs + network policy for container sandboxes.
+// container-sandbox — Network policy for container sandboxes.
 //
-// Demonstrates how to combine filesystem and HTTP rules in a single policy
-// for use with `strait launch --policy`. This is a starting point for
-// container sandbox policies — customize paths and hosts for your use case.
-//
-// Filesystem:
-//   Allows: fs:read and fs:write to /project (workspace directory)
-//   Allows: fs:read to /usr, /lib, /etc (system libraries, read-only)
-//   Denies: fs:write to system paths (read-only mounts)
+// Demonstrates how to scope outbound HTTP access for `strait launch --policy`.
+// Customize hosts and path constraints for your use case.
 //
 // Network:
 //   Allows: GET, POST to api.github.com (scoped to your org)
@@ -16,36 +10,7 @@
 //   Denies: All other network access
 //
 // To use: replace "your-org" with your GitHub organization name,
-// and adjust filesystem paths for your workspace layout.
-
-// ---------------------------------------------------------------------------
-// FILESYSTEM — workspace read/write
-// ---------------------------------------------------------------------------
-
-// Full read/write access to the project workspace.
-@id("workspace-readwrite")
-permit(
-    principal,
-    action in [Action::"fs:read", Action::"fs:write"],
-    resource in Resource::"fs::/project"
-);
-
-// Read-only access to system libraries and configuration.
-@id("system-readonly")
-permit(
-    principal,
-    action == Action::"fs:read",
-    resource in Resource::"fs::/"
-);
-
-// Deny writes outside the workspace — explicit forbid for audit trail.
-@id("deny-system-write")
-@reason("Write access is restricted to the /project workspace directory")
-forbid(
-    principal,
-    action == Action::"fs:write",
-    resource in Resource::"fs::/"
-) unless { resource in Resource::"fs::/project" };
+// and adjust host scopes for your workspace.
 
 // ---------------------------------------------------------------------------
 // NETWORK — scoped API access

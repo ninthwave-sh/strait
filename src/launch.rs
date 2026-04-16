@@ -1874,7 +1874,22 @@ async fn resolve_launch_image(
 }
 
 fn dockerfile_path_in_context(context: &Path, dockerfile: &Path) -> anyhow::Result<String> {
-    let relative = dockerfile.strip_prefix(context).with_context(|| {
+    // Canonicalize both paths so that ".." components are resolved before
+    // comparing prefixes (e.g. context=".devcontainer/.." and
+    // dockerfile=".devcontainer/Dockerfile").
+    let context = std::fs::canonicalize(context).with_context(|| {
+        format!(
+            "failed to canonicalize devcontainer build context: {}",
+            context.display()
+        )
+    })?;
+    let dockerfile = std::fs::canonicalize(dockerfile).with_context(|| {
+        format!(
+            "failed to canonicalize devcontainer Dockerfile path: {}",
+            dockerfile.display()
+        )
+    })?;
+    let relative = dockerfile.strip_prefix(&context).with_context(|| {
         format!(
             "devcontainer Dockerfile must be inside the build context when using the runtime API: {} is not under {}",
             dockerfile.display(),

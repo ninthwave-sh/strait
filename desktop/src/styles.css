@@ -1,0 +1,176 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.header,
+.status-strip,
+.panel-header,
+.actions-row,
+.ttl-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.header,
+.status-strip,
+.content-grid {
+  margin-bottom: 16px;
+}
+
+.header {
+  justify-content: space-between;
+}
+
+.subhead,
+.socket-path,
+.ttl-hint,
+.explanation {
+  color: #94a3b8;
+}
+
+.status-strip {
+  flex-wrap: wrap;
+}
+
+.status-pill {
+  border-radius: 999px;
+  padding: 6px 10px;
+  background: #1e293b;
+}
+
+.status-pill.good {
+  background: #14532d;
+}
+
+.status-pill.bad {
+  background: #7f1d1d;
+}
+
+.panel {
+  background: #111827;
+  border: 1px solid #1f2937;
+  border-radius: 16px;
+  padding: 16px;
+}
+
+.content-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: 280px 1fr 360px;
+}
+
+.session-list,
+.detail-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.session-list li,
+.detail-list li,
+.alert-card {
+  border: 1px solid #1f2937;
+  border-radius: 12px;
+  padding: 12px;
+  background: #0b1220;
+}
+
+.alert-list {
+  display: grid;
+  gap: 12px;
+}
+
+.alert-card.selected {
+  border-color: #38bdf8;
+}
+
+.card-button {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  display: flex;
+  justify-content: space-between;
+  text-align: left;
+  padding: 0;
+  cursor: pointer;
+}
+
+.countdown {
+  font-weight: 700;
+  color: #fbbf24;
+}
+
+.actions-row,
+.ttl-row {
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+button,
+input {
+  border-radius: 10px;
+  border: 1px solid #334155;
+  background: #1e293b;
+  color: inherit;
+  padding: 8px 10px;
+}
+
+button.secondary {
+  background: #111827;
+}
+
+button:disabled {
+  opacity: 0.6;
+}
+
+input {
+  width: 96px;
+}
+
+.error-banner,
+.warning-banner,
+.pending-text {
+  margin-bottom: 12px;
+}
+
+.error-banner {
+  color: #fecaca;
+}
+
+.warning-banner {
+  color: #fde68a;
+}
+
+pre,
+code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: #cbd5e1;
+}
+
+@media (max-width: 1200px) {
+  .content-grid {
+    grid-template-columns: 1fr;
+  }
+}

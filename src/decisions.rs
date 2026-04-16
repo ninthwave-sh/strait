@@ -102,6 +102,7 @@ struct Inner {
     blocks: HashMap<String, BlockRecord>,
     pending: HashMap<String, oneshot::Sender<Decision>>,
     session_allows: HashSet<String>,
+    timed_allows: HashMap<String, Instant>,
 }
 
 /// Shared live-decision coordinator for a launch session.
@@ -137,6 +138,41 @@ impl PendingDecisionStore {
     pub fn is_session_allowed(&self, match_key: &str) -> bool {
         let inner = self.inner.lock().expect("pending decision store poisoned");
         inner.session_allows.contains(match_key)
+    }
+
+    /// Return whether the request is currently allowed by either a
+    /// session-scoped or time-limited live decision.
+    pub fn is_allowed(&self, match_key: &str) -> bool {
+        self.decision_scope(match_key) != "once"
+    }
+
+    /// Return whether the request is currently allowed by a time-limited live
+    /// decision.
+    pub fn is_ttl_allowed(&self, match_key: &str) -> bool {
+        let mut inner = self.inner.lock().expect("pending decision store poisoned");
+        Self::evict_expired(&mut inner, Instant::now(), self.ttl);
+        inner
+            .timed_allows
+            .get(match_key)
+            .is_some_and(|expires_at| *expires_at > Instant::now())
+    }
+
+    /// Describe the currently active allow scope for a match key.
+    pub fn decision_scope(&self, match_key: &str) -> &'static str {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().expect("pending decision store poisoned");
+        Self::evict_expired(&mut inner, now, self.ttl);
+        if inner.session_allows.contains(match_key) {
+            "session"
+        } else if inner
+            .timed_allows
+            .get(match_key)
+            .is_some_and(|expires_at| *expires_at > now)
+        {
+            "ttl"
+        } else {
+            "once"
+        }
     }
 
     /// Register a blocked request and return the receiver the MITM handler
@@ -199,6 +235,16 @@ impl PendingDecisionStore {
     /// lifetime of the session.
     pub fn resolve_allow_session(&self, blocked_id: &str) -> Result<String, DecisionError> {
         self.resolve(blocked_id, Decision::AllowSession, Instant::now())
+    }
+
+    /// Resolve the blocked request and allow future equivalent requests for a
+    /// bounded TTL.
+    pub fn resolve_allow_ttl(
+        &self,
+        blocked_id: &str,
+        ttl: Duration,
+    ) -> Result<String, DecisionError> {
+        self.resolve_allow_ttl_at(blocked_id, ttl, Instant::now())
     }
 
     /// Resolve the blocked request by denying it.
@@ -299,6 +345,57 @@ impl PendingDecisionStore {
         Ok(match_key)
     }
 
+    fn resolve_allow_ttl_at(
+        &self,
+        blocked_id: &str,
+        ttl: Duration,
+        now: Instant,
+    ) -> Result<String, DecisionError> {
+        let mut inner = self.inner.lock().expect("pending decision store poisoned");
+        Self::evict_expired(&mut inner, now, self.ttl);
+
+        let match_key = {
+            let Some(record) = inner.blocks.get_mut(blocked_id) else {
+                return Err(DecisionError::UnknownBlockedId);
+            };
+            if now.duration_since(record.observed_at) > self.ttl {
+                record.state = BlockState::Expired;
+                inner.pending.remove(blocked_id);
+                return Err(DecisionError::Expired);
+            }
+            match record.state {
+                BlockState::Pending => record.match_key.clone(),
+                BlockState::Resolved => return Err(DecisionError::UnknownBlockedId),
+                BlockState::Expired => return Err(DecisionError::Expired),
+            }
+        };
+
+        let expires_at = now + ttl;
+        inner.timed_allows.insert(match_key.clone(), expires_at);
+
+        let Some(sender) = inner.pending.remove(blocked_id) else {
+            inner.timed_allows.remove(&match_key);
+            if let Some(record) = inner.blocks.get_mut(blocked_id) {
+                record.state = BlockState::Expired;
+            }
+            return Err(DecisionError::Expired);
+        };
+
+        if sender.send(Decision::AllowOnce).is_err() {
+            inner.timed_allows.remove(&match_key);
+            if let Some(record) = inner.blocks.get_mut(blocked_id) {
+                record.state = BlockState::Expired;
+            }
+            return Err(DecisionError::Expired);
+        }
+
+        if let Some(record) = inner.blocks.get_mut(blocked_id) {
+            record.state = BlockState::Resolved;
+        }
+
+        Ok(match_key)
+    }
+
     /// Mark a blocked request as expired after the hold timeout fires.
     pub fn expire(&self, blocked_id: &str) {
         self.expire_at(blocked_id, Instant::now());
@@ -324,6 +421,7 @@ impl PendingDecisionStore {
     }
 
     fn evict_expired(inner: &mut Inner, now: Instant, ttl: Duration) {
+        inner.timed_allows.retain(|_, expires_at| *expires_at > now);
         while let Some(front) = inner.order.front() {
             let remove = match inner.blocks.get(front) {
                 Some(record) => now.duration_since(record.observed_at) > ttl,
@@ -375,6 +473,37 @@ mod tests {
         let match_key = store.resolve_allow_session("id-2").unwrap();
         assert_eq!(rx.await.unwrap(), Decision::AllowSession);
         assert!(store.is_session_allowed(&match_key));
+    }
+
+    #[tokio::test]
+    async fn allow_ttl_resolves_current_request_and_caches_match_temporarily() {
+        let store = PendingDecisionStore::with_capacity_and_ttl(16, Duration::from_secs(60));
+        let origin = Instant::now();
+        let rx =
+            store.register_pending_at("id-ttl", "http:GET api.example.com/repos", None, origin);
+
+        let match_key = store
+            .resolve_allow_ttl_at(
+                "id-ttl",
+                Duration::from_secs(30),
+                origin + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(match_key, "http:GET api.example.com/repos");
+        assert_eq!(rx.await.unwrap(), Decision::AllowOnce);
+        assert!(store.is_ttl_allowed(&match_key));
+        assert_eq!(store.decision_scope(&match_key), "ttl");
+
+        assert!(store.is_allowed(&match_key));
+        {
+            let mut inner = store.inner.lock().expect("pending decision store poisoned");
+            PendingDecisionStore::evict_expired(
+                &mut inner,
+                origin + Duration::from_secs(40),
+                Duration::from_secs(60),
+            );
+        }
+        assert_eq!(store.decision_scope(&match_key), "once");
     }
 
     #[tokio::test]

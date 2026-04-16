@@ -1242,6 +1242,7 @@ mod tests {
             version: 1,
             session_id: "session-123".to_string(),
             mode: "proxy-enforce".to_string(),
+            decision_timeout_secs: 30,
             control_socket_path: PathBuf::from("/tmp/control.sock"),
             observation: strait::launch::ObservationHandle {
                 transport: "unix_socket".to_string(),
@@ -1278,6 +1279,7 @@ mod tests {
             version: 1,
             session_id: "session-456".to_string(),
             mode: "launch-enforce".to_string(),
+            decision_timeout_secs: 30,
             control_socket_path: PathBuf::from("/tmp/control.sock"),
             observation: strait::launch::ObservationHandle {
                 transport: "unix_socket".to_string(),
@@ -1755,6 +1757,7 @@ mod tests {
             version: strait::launch::SESSION_CONTROL_PROTOCOL_VERSION,
             session_id: "live-session".to_string(),
             mode: "observe".to_string(),
+            decision_timeout_secs: 30,
             control_socket_path: live_socket.clone(),
             observation: strait::launch::ObservationHandle {
                 transport: "unix_socket".to_string(),
@@ -1775,6 +1778,7 @@ mod tests {
             version: strait::launch::SESSION_CONTROL_PROTOCOL_VERSION,
             session_id: "stale-session".to_string(),
             mode: "observe".to_string(),
+            decision_timeout_secs: 30,
             control_socket_path: stale_socket,
             observation: strait::launch::ObservationHandle {
                 transport: "unix_socket".to_string(),

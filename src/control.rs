@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use chrono::{SecondsFormat, Utc};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream, UnixListenerStream};
@@ -18,9 +19,9 @@ use tower::service_fn;
 
 use crate::launch::{
     self, list_launch_sessions, request_launch_decision_allow_once,
-    request_launch_decision_allow_session, request_launch_decision_deny,
-    request_launch_decision_persist, request_launch_session_info, request_launch_session_stop,
-    request_launch_watch_attach, LaunchSessionMetadata,
+    request_launch_decision_allow_session, request_launch_decision_allow_ttl,
+    request_launch_decision_deny, request_launch_decision_persist, request_launch_session_info,
+    request_launch_session_stop, request_launch_watch_attach, LaunchSessionMetadata,
 };
 use crate::observe::{CandidateException, EventKind, ExceptionDirective, ObservationEvent};
 
@@ -610,8 +611,18 @@ fn blocked_event_from_observation(
     session: &LaunchSessionMetadata,
     event: &ObservationEvent,
 ) -> Option<proto::BlockedRequestEvent> {
+    let hold_timeout_secs = session.decision_timeout_secs.min(u32::MAX as u64) as u32;
     let session = Some(map_session(session));
     let raw_json = serde_json::to_string(event).ok()?;
+    let hold_expires_at = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+        .ok()
+        .and_then(|timestamp| {
+            chrono::Duration::from_std(Duration::from_secs(u64::from(hold_timeout_secs)))
+                .ok()
+                .map(|duration| (timestamp + duration).with_timezone(&Utc))
+        })
+        .map(|timestamp| timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
+        .unwrap_or_default();
 
     match &event.event {
         EventKind::NetworkRequest {
@@ -637,6 +648,9 @@ fn blocked_event_from_observation(
                 .map(exception_suggestions)
                 .unwrap_or_default(),
             raw_json,
+            observed_at: event.timestamp.clone(),
+            hold_timeout_secs,
+            hold_expires_at,
         }),
         EventKind::PolicyViolation {
             decision,
@@ -660,6 +674,9 @@ fn blocked_event_from_observation(
                     .map(exception_suggestions)
                     .unwrap_or_default(),
                 raw_json,
+                observed_at: event.timestamp.clone(),
+                hold_timeout_secs,
+                hold_expires_at,
             })
         }
         _ => None,
@@ -842,6 +859,20 @@ impl proto::session_control_service_server::SessionControlService for SessionCon
             )
             .await
             .map_err(internal_status)?,
+            proto::DecisionAction::AllowTtl => {
+                if request.ttl_seconds == 0 {
+                    return Err(Status::invalid_argument(
+                        "ttl_seconds is required for allow_ttl",
+                    ));
+                }
+                request_launch_decision_allow_ttl(
+                    &session.control_socket_path,
+                    &request.blocked_id,
+                    u64::from(request.ttl_seconds),
+                )
+                .await
+                .map_err(internal_status)?
+            }
             proto::DecisionAction::Persist => {
                 request_launch_decision_persist(&session.control_socket_path, &request.blocked_id)
                     .await
@@ -1026,6 +1057,7 @@ mod tests {
             version: launch::SESSION_CONTROL_PROTOCOL_VERSION,
             session_id: session_id.to_string(),
             mode: "observe".to_string(),
+            decision_timeout_secs: 30,
             control_socket_path: PathBuf::from(format!("/tmp/{session_id}.control.sock")),
             observation: launch::ObservationHandle {
                 transport: "unix".to_string(),

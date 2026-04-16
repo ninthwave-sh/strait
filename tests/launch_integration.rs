@@ -471,7 +471,7 @@ async fn launch_cli_devcontainer_wires_build_mounts_workspace_and_user() {
         devcontainer_dir.join("Dockerfile"),
         r#"
 FROM ubuntu:24.04
-RUN useradd -m -u 1000 vscode
+ RUN if ! id -u vscode >/dev/null 2>&1; then useradd -m vscode; fi
 RUN printf 'built\n' >/image-built
 "#,
     )

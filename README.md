@@ -31,6 +31,7 @@ We explored a host-scoped pivot after looking closely at `nono`. The learning wa
   │  Strait Host Process                                 │
   │   - Container lifecycle management                   │
   │   - Local control API (session.info/watch.attach)    │
+  │   - gRPC control service for desktop clients         │
   │   - Observation stream (Unix socket + JSONL)         │
   │   - strait session watch - colored live event viewer │
   │   - strait generate - Cedar policy from observations │
@@ -88,6 +89,38 @@ strait session watch --session <SESSION_ID>
 `strait session info` reports the session ID, mode, control socket, observation socket, and container identity when present. `strait session watch` renders the live event stream for that session, including lifecycle events such as `container:start`, live control-plane events such as `policy:reload`, and PTY resize events such as `tty:resize`.
 
 The older `strait watch` command remains as a compatibility alias, but session-targeted commands are the primary interface for live launch management.
+
+### Run the gRPC control service
+
+`strait` also ships a gRPC control service for desktop clients and remote operators. The protobuf contract lives in `proto/control.proto` and is designed to be remote-capable from the start: endpoint fields carry generic transport information instead of assuming localhost.
+
+Local-only service:
+
+```bash
+strait service start --socket /tmp/strait-control.sock
+strait service status --socket /tmp/strait-control.sock
+strait service stop --socket /tmp/strait-control.sock
+```
+
+Managed launch plus control service in one process:
+
+```bash
+strait service start \
+  --socket /tmp/strait-control.sock \
+  --observe \
+  --image ubuntu:24.04 \
+  --output /tmp/service-observations.jsonl \
+  -- ./my-agent
+```
+
+The gRPC service exposes:
+
+- `ListSessions` and `GetSessionStatus` for published session discovery
+- `StreamBlockedRequests` for blocked-request events
+- `SubmitDecision` for deny, allow-once, allow-session, and persist actions
+- `Subscribe` for live session inventory, status changes, and session event streams
+
+Remote operators can optionally expose the same service on mTLS-authenticated TCP with `--tcp-listen`, `--tls-cert`, `--tls-key`, and `--tls-client-ca`.
 
 ### Understand the live-update boundary
 

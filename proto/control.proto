@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package strait.control.v1;
+
+service SessionControlService {
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+  rpc GetSessionStatus(GetSessionStatusRequest) returns (GetSessionStatusResponse);
+  rpc StreamBlockedRequests(StreamBlockedRequestsRequest) returns (stream BlockedRequestEvent);
+  rpc SubmitDecision(SubmitDecisionRequest) returns (SubmitDecisionResponse);
+  rpc Subscribe(stream SubscribeRequest) returns (stream SubscribeEvent);
+}
+
+service ServiceAdmin {
+  rpc GetServiceStatus(GetServiceStatusRequest) returns (GetServiceStatusResponse);
+  rpc StopService(StopServiceRequest) returns (StopServiceResponse);
+}
+
+message Endpoint {
+  string network = 1;
+  string address = 2;
+}
+
+message Session {
+  string session_id = 1;
+  string mode = 2;
+  Endpoint control = 3;
+  Endpoint observation = 4;
+  string container_id = 5;
+  string container_name = 6;
+}
+
+message ListSessionsRequest {}
+
+message ListSessionsResponse {
+  repeated Session sessions = 1;
+}
+
+message GetSessionStatusRequest {
+  string session_id = 1;
+}
+
+message GetSessionStatusResponse {
+  Session session = 1;
+}
+
+enum DecisionAction {
+  DECISION_ACTION_UNSPECIFIED = 0;
+  DECISION_ACTION_DENY = 1;
+  DECISION_ACTION_ALLOW_ONCE = 2;
+  DECISION_ACTION_ALLOW_SESSION = 3;
+  DECISION_ACTION_PERSIST = 4;
+}
+
+message ExceptionSuggestion {
+  string lifetime = 1;
+  string summary = 2;
+  string cedar_snippet = 3;
+  string scope = 4;
+  bool ambiguous = 5;
+}
+
+message BlockedRequestEvent {
+  Session session = 1;
+  string source_type = 2;
+  string blocked_id = 3;
+  string match_key = 4;
+  string explanation = 5;
+  string method = 6;
+  string host = 7;
+  string path = 8;
+  string decision = 9;
+  repeated ExceptionSuggestion suggestions = 10;
+  string raw_json = 11;
+}
+
+message StreamBlockedRequestsRequest {
+  string session_id = 1;
+}
+
+message SubmitDecisionRequest {
+  string session_id = 1;
+  string blocked_id = 2;
+  DecisionAction action = 3;
+}
+
+message SubmitDecisionResponse {
+  string session_id = 1;
+  string blocked_id = 2;
+  string match_key = 3;
+}
+
+message SubscribeRequest {
+  string session_id = 1;
+  bool include_inventory = 2;
+}
+
+message SessionInventory {
+  repeated Session sessions = 1;
+}
+
+message SessionStatusChanged {
+  Session session = 1;
+  string state = 2;
+}
+
+message SessionObservationEvent {
+  Session session = 1;
+  string event_type = 2;
+  string raw_json = 3;
+}
+
+message SubscribeEvent {
+  oneof event {
+    SessionInventory inventory = 1;
+    SessionStatusChanged status = 2;
+    SessionObservationEvent observation = 3;
+  }
+}
+
+message GetServiceStatusRequest {}
+
+message GetServiceStatusResponse {
+  Endpoint local_endpoint = 1;
+  Endpoint remote_endpoint = 2;
+  bool remote_enabled = 3;
+  uint32 session_count = 4;
+  repeated Session sessions = 5;
+}
+
+message StopServiceRequest {}
+
+message StopServiceResponse {
+  bool accepted = 1;
+}

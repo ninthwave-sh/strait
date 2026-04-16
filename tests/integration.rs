@@ -4,15 +4,24 @@
 //! without requiring external network access.
 
 use std::sync::Arc;
+use std::sync::Once;
 
 use rcgen::{CertificateParams, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+fn ensure_rustls_crypto_provider() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Start a local TLS server that echoes back the HTTP request as the response body.
 /// Returns (addr, CA cert PEM) so the test client can trust this server.
 async fn start_tls_echo_server() -> (std::net::SocketAddr, String, CertificateDer<'static>) {
+    ensure_rustls_crypto_provider();
     let key_pair = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::default();
     ca_params
@@ -117,6 +126,7 @@ async fn start_tls_echo_server() -> (std::net::SocketAddr, String, CertificateDe
 /// and handles multiple sequential requests on the same TLS connection.
 /// Returns (addr, CA cert PEM, CA cert DER) so the test client can trust this server.
 async fn start_keepalive_echo_server() -> (std::net::SocketAddr, String, CertificateDer<'static>) {
+    ensure_rustls_crypto_provider();
     let key_pair = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::default();
     ca_params
@@ -509,6 +519,7 @@ async fn mitm_preserves_request_body_through_pipeline() {
 /// Returns (addr, CA cert DER) so callers can build a TLS client config
 /// that trusts this server.
 async fn start_aws_echo_server(sans: &[&str]) -> (std::net::SocketAddr, CertificateDer<'static>) {
+    ensure_rustls_crypto_provider();
     let key_pair = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::default();
     ca_params
@@ -625,6 +636,7 @@ fn build_sigv4_proxy_context(
     mitm_hosts: Vec<String>,
     creds: &TestAwsCreds,
 ) -> strait::config::ProxyContext {
+    ensure_rustls_crypto_provider();
     use std::time::{Duration, Instant};
     use strait::audit::AuditLogger;
     use strait::ca::SessionCa;
@@ -703,6 +715,7 @@ async fn send_through_proxy(
     extra_headers: &[(&str, &str)],
     body: Option<&[u8]>,
 ) -> String {
+    ensure_rustls_crypto_provider();
     // Start the proxy listener
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -2327,6 +2340,7 @@ async fn connect_through_mitm(
     ca_pem: &str,
     hostname: &str,
 ) -> tokio_rustls::client::TlsStream<TcpStream> {
+    ensure_rustls_crypto_provider();
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
 
     // Send CONNECT
@@ -2608,6 +2622,7 @@ async fn mitm_content_length_body_still_works() {
 /// gets rejected with 400 Bad Request by the MITM pipeline.
 #[tokio::test]
 async fn mitm_rejects_conflicting_cl_te_headers() {
+    ensure_rustls_crypto_provider();
     let ca = strait_test_helpers::generate_ca();
     let ctx = strait_test_helpers::build_mitm_proxy_context(&ca, None);
     let ca_pem = ctx.session_ca.ca_cert_pem.clone();
@@ -2692,6 +2707,7 @@ async fn mitm_rejects_conflicting_cl_te_headers() {
 /// Test that HTTP/0.9 requests are rejected with 400.
 #[tokio::test]
 async fn mitm_rejects_http_09_version() {
+    ensure_rustls_crypto_provider();
     let ca = strait_test_helpers::generate_ca();
     let ctx = strait_test_helpers::build_mitm_proxy_context(&ca, None);
     let ca_pem = ctx.session_ca.ca_cert_pem.clone();
@@ -2756,6 +2772,7 @@ async fn mitm_rejects_http_09_version() {
 /// Test that fabricated HTTP version strings (HTTP/9.9) are rejected with 400.
 #[tokio::test]
 async fn mitm_rejects_fabricated_http_version() {
+    ensure_rustls_crypto_provider();
     let ca = strait_test_helpers::generate_ca();
     let ctx = strait_test_helpers::build_mitm_proxy_context(&ca, None);
     let ca_pem = ctx.session_ca.ca_cert_pem.clone();
@@ -2971,6 +2988,7 @@ async fn start_stalled_tcp_server() -> std::net::SocketAddr {
 /// request, but never sends a response back. Used to test upstream response
 /// timeout behavior.
 async fn start_stalled_response_tls_server() -> (std::net::SocketAddr, CertificateDer<'static>) {
+    ensure_rustls_crypto_provider();
     let key_pair = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::default();
     ca_params
@@ -3035,6 +3053,7 @@ async fn start_stalled_response_tls_server() -> (std::net::SocketAddr, Certifica
 
 #[tokio::test]
 async fn upstream_connect_timeout_returns_504() {
+    ensure_rustls_crypto_provider();
     // Start a server that accepts TCP connections but never responds
     let stalled_addr = start_stalled_tcp_server().await;
 
@@ -3110,6 +3129,7 @@ async fn upstream_connect_timeout_returns_504() {
 
 #[tokio::test]
 async fn upstream_response_timeout_returns_504() {
+    ensure_rustls_crypto_provider();
     // Start a TLS server that accepts but never responds
     let (stalled_addr, _ca_der) = start_stalled_response_tls_server().await;
 
@@ -3184,6 +3204,7 @@ async fn upstream_response_timeout_returns_504() {
 
 #[tokio::test]
 async fn normal_upstream_succeeds_with_timeouts_configured() {
+    ensure_rustls_crypto_provider();
     // Verify that normal traffic works when timeouts are configured but do not fire.
     let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
 
@@ -3349,6 +3370,7 @@ fn build_persist_decision_context(
     tempfile::TempDir,
     std::path::PathBuf,
 ) {
+    ensure_rustls_crypto_provider();
     let obs_stream = strait::observe::ObservationStream::new();
     let session_ca = strait::ca::SessionCa::generate().unwrap();
     let audit_logger = Arc::new(strait::audit::AuditLogger::new(None).unwrap());
@@ -3725,6 +3747,7 @@ mod strait_test_helpers {
         hostname: &str,
         keepalive_timeout: std::time::Duration,
     ) -> strait::config::ProxyContext {
+        ensure_rustls_crypto_provider();
         let session_ca = strait::ca::SessionCa::generate().unwrap();
         let audit_logger = Arc::new(strait::audit::AuditLogger::new(None).unwrap());
 
@@ -3769,6 +3792,7 @@ mod strait_test_helpers {
         hostname: &str,
         deny_path: &str,
     ) -> strait::config::ProxyContext {
+        ensure_rustls_crypto_provider();
         let session_ca = strait::ca::SessionCa::generate().unwrap();
         let audit_logger = Arc::new(strait::audit::AuditLogger::new(None).unwrap());
 

@@ -42,7 +42,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{oneshot, watch, RwLock};
 use tracing::{info, warn};
 
 use crate::audit::AuditLogger;
@@ -1373,6 +1373,9 @@ enum LaunchTerminalMode {
     Test(TestTerminalOptions),
 }
 
+#[cfg(unix)]
+type LaunchReadySender = oneshot::Sender<LaunchSessionMetadata>;
+
 #[derive(Debug, Clone)]
 enum TerminalResizeSource {
     Disabled,
@@ -1634,6 +1637,37 @@ pub async fn run_launch_observe(
         extra_mounts,
         tty,
         LaunchTerminalMode::Host,
+        None,
+    )
+    .await
+}
+
+/// Internal observe-mode entry point that reports the published session.
+#[doc(hidden)]
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_launch_observe_with_ready_signal(
+    command: Vec<String>,
+    image: Option<&str>,
+    output: Option<PathBuf>,
+    credential_store: Option<Arc<CredentialStore>>,
+    mitm_hosts: Vec<String>,
+    extra_env: Vec<String>,
+    extra_mounts: Vec<ExtraMount>,
+    tty: bool,
+    ready_tx: LaunchReadySender,
+) -> anyhow::Result<i32> {
+    run_launch_observe_with_terminal_mode(
+        command,
+        image,
+        output,
+        credential_store,
+        mitm_hosts,
+        extra_env,
+        extra_mounts,
+        tty,
+        LaunchTerminalMode::Host,
+        Some(ready_tx),
     )
     .await
 }
@@ -1662,6 +1696,7 @@ pub async fn run_launch_observe_with_test_terminal(
         extra_mounts,
         tty,
         LaunchTerminalMode::Test(terminal),
+        None,
     )
     .await
 }
@@ -1677,6 +1712,7 @@ async fn run_launch_observe_with_terminal_mode(
     extra_mounts: Vec<ExtraMount>,
     tty: bool,
     terminal_mode: LaunchTerminalMode,
+    #[cfg(unix)] ready_tx: Option<LaunchReadySender>,
 ) -> anyhow::Result<i32> {
     let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
@@ -1731,6 +1767,10 @@ async fn run_launch_observe_with_terminal_mode(
     .await?;
     #[cfg(unix)]
     launch_session.publish(&obs_stream).await?;
+    #[cfg(unix)]
+    if let Some(ready_tx) = ready_tx {
+        let _ = ready_tx.send(launch_session.metadata().await);
+    }
 
     let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx.clone()));
 
@@ -1907,6 +1947,41 @@ pub async fn run_launch_with_policy(
         extra_mounts,
         tty,
         LaunchTerminalMode::Host,
+        None,
+    )
+    .await
+}
+
+/// Internal policy-mode entry point that reports the published session.
+#[doc(hidden)]
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_launch_with_policy_with_ready_signal(
+    mode: EnforcementMode,
+    policy_path: &Path,
+    command: Vec<String>,
+    image: Option<&str>,
+    output: Option<PathBuf>,
+    credential_store: Option<Arc<CredentialStore>>,
+    mitm_hosts: Vec<String>,
+    extra_env: Vec<String>,
+    extra_mounts: Vec<ExtraMount>,
+    tty: bool,
+    ready_tx: LaunchReadySender,
+) -> anyhow::Result<i32> {
+    run_launch_with_policy_with_terminal_mode(
+        mode,
+        policy_path,
+        command,
+        image,
+        output,
+        credential_store,
+        mitm_hosts,
+        extra_env,
+        extra_mounts,
+        tty,
+        LaunchTerminalMode::Host,
+        Some(ready_tx),
     )
     .await
 }
@@ -1939,6 +2014,7 @@ pub async fn run_launch_with_policy_with_test_terminal(
         extra_mounts,
         tty,
         LaunchTerminalMode::Test(terminal),
+        None,
     )
     .await
 }
@@ -1956,6 +2032,7 @@ async fn run_launch_with_policy_with_terminal_mode(
     extra_mounts: Vec<ExtraMount>,
     tty: bool,
     terminal_mode: LaunchTerminalMode,
+    #[cfg(unix)] ready_tx: Option<LaunchReadySender>,
 ) -> anyhow::Result<i32> {
     let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
@@ -2026,6 +2103,10 @@ async fn run_launch_with_policy_with_terminal_mode(
         LaunchSession::create(proxy_ctx.audit_logger.session_id(), mode, proxy_ctx.clone()).await?;
     #[cfg(unix)]
     launch_session.publish(&obs_stream).await?;
+    #[cfg(unix)]
+    if let Some(ready_tx) = ready_tx {
+        let _ = ready_tx.send(launch_session.metadata().await);
+    }
 
     let proxy_handle = tokio::spawn(run_mitm_proxy_loop(proxy_listener, proxy_ctx.clone()));
 

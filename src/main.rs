@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use strait::config;
+use strait::control::{self, ControlServiceOptions, ManagedSessionOptions, TcpTlsOptions};
 use strait::credentials::CredentialStore;
 use strait::generate;
 use strait::observe::ObservationStream;
@@ -128,6 +129,89 @@ enum SessionAction {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
+enum ServiceAction {
+    /// Start the gRPC control service.
+    #[command(after_help = "\
+The control service listens on a Unix domain socket locally and can also\
+listen on mTLS-authenticated TCP for remote operators.\
+\nIf you provide one of --observe, --warn, or --policy plus a command after\
+`--`, the service will launch and own that session while still publishing the\
+existing control socket and observation socket contracts.")]
+    Start {
+        /// Unix socket path for the local gRPC control service.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+
+        /// Optional remote listen address for mTLS-authenticated gRPC.
+        #[arg(long, value_name = "ADDR")]
+        tcp_listen: Option<SocketAddr>,
+
+        /// PEM-encoded server certificate for remote TLS.
+        #[arg(long, value_name = "FILE")]
+        tls_cert: Option<PathBuf>,
+
+        /// PEM-encoded server private key for remote TLS.
+        #[arg(long, value_name = "FILE")]
+        tls_key: Option<PathBuf>,
+
+        /// PEM-encoded client CA bundle for remote mTLS.
+        #[arg(long, value_name = "FILE")]
+        tls_client_ca: Option<PathBuf>,
+
+        /// Launch a managed session in observe mode.
+        #[arg(long)]
+        observe: bool,
+
+        /// Launch a managed session in warn mode with the supplied policy.
+        #[arg(long, value_name = "POLICY_FILE")]
+        warn: Option<PathBuf>,
+
+        /// Launch a managed session in enforce mode with the supplied policy.
+        #[arg(long, value_name = "POLICY_FILE")]
+        policy: Option<PathBuf>,
+
+        /// Container image for the managed session.
+        #[arg(long, value_name = "IMAGE")]
+        image: Option<String>,
+
+        /// Observation log path for the managed session.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+
+        /// Additional environment variable for the managed session.
+        #[arg(long, value_name = "KEY=VALUE")]
+        env: Vec<String>,
+
+        /// Additional bind mount for the managed session.
+        #[arg(long, value_name = "HOST:CONTAINER[:ro|rw]")]
+        mount: Vec<String>,
+
+        /// Managed session command. Pass after `--`.
+        #[arg(
+            value_name = "COMMAND",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        command: Vec<String>,
+    },
+
+    /// Show control service status and published sessions.
+    Status {
+        /// Unix socket path for the local gRPC control service.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+
+    /// Stop a running gRPC control service.
+    Stop {
+        /// Unix socket path for the local gRPC control service.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Start the HTTPS proxy for standalone integrations.
     #[command(after_help = "\
@@ -231,6 +315,12 @@ LIVE POLICY UPDATES:
     Session {
         #[command(subcommand)]
         action: SessionAction,
+    },
+
+    /// Manage the background gRPC control service.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
     },
 
     /// Launch a command in a sandboxed container with Cedar policy enforcement.
@@ -380,6 +470,7 @@ fn init_tracing() {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    strait::ensure_rustls_crypto_provider();
     let cli = Cli::parse();
 
     match cli.command {
@@ -418,6 +509,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Session { action } => {
             run_session_command(action).await?;
+        }
+        Commands::Service { action } => {
+            run_service_command(action).await?;
         }
         Commands::Proxy { config } => {
             run_proxy(config).await?;
@@ -588,6 +682,94 @@ async fn run_session_command(action: SessionAction) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 async fn run_session_command(_action: SessionAction) -> anyhow::Result<()> {
     anyhow::bail!("session commands are only supported on Unix platforms")
+}
+
+#[cfg(unix)]
+async fn run_service_command(action: ServiceAction) -> anyhow::Result<()> {
+    match action {
+        ServiceAction::Start {
+            socket,
+            tcp_listen,
+            tls_cert,
+            tls_key,
+            tls_client_ca,
+            observe,
+            warn,
+            policy,
+            image,
+            output,
+            env,
+            mount,
+            command,
+        } => {
+            let socket_path = socket.unwrap_or_else(control::default_service_socket_path);
+            let managed_session = ManagedSessionOptions {
+                observe,
+                warn,
+                policy,
+                image,
+                output,
+                env,
+                mount,
+                command,
+            };
+            let tcp_tls = match (tcp_listen, tls_cert, tls_key, tls_client_ca) {
+                (None, None, None, None) => None,
+                (Some(listen_addr), Some(cert_path), Some(key_path), Some(client_ca_path)) => {
+                    Some(TcpTlsOptions {
+                        listen_addr,
+                        cert_path,
+                        key_path,
+                        client_ca_path,
+                    })
+                }
+                _ => anyhow::bail!(
+                    "remote TLS requires --tcp-listen, --tls-cert, --tls-key, and --tls-client-ca together"
+                ),
+            };
+
+            init_tracing();
+            eprintln!("Control service socket: {}", socket_path.display());
+            if let Some(remote) = &tcp_tls {
+                eprintln!("Remote control endpoint: {}", remote.listen_addr);
+            }
+
+            control::run_control_service(ControlServiceOptions {
+                socket_path,
+                tcp_tls,
+                managed_session,
+            })
+            .await?;
+        }
+        ServiceAction::Status { socket } => {
+            let socket_path = socket.unwrap_or_else(control::default_service_socket_path);
+            let status = control::query_service_status(&socket_path).await?;
+            println!("Control service: running");
+            println!("Local endpoint: {}", status.local_endpoint.address);
+            if let Some(remote_endpoint) = status.remote_endpoint {
+                println!("Remote endpoint: {}", remote_endpoint.address);
+            }
+            println!("Sessions: {}", status.sessions.len());
+            for session in status.sessions {
+                println!("- {} ({})", session.session_id, session.mode);
+            }
+        }
+        ServiceAction::Stop { socket } => {
+            let socket_path = socket.unwrap_or_else(control::default_service_socket_path);
+            control::request_service_stop(&socket_path).await?;
+            println!(
+                "Stop requested for control service at {}.",
+                socket_path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn run_service_command(_action: ServiceAction) -> anyhow::Result<()> {
+    anyhow::bail!("control service commands are only supported on Unix platforms")
 }
 
 #[cfg(unix)]
@@ -1333,6 +1515,95 @@ mod tests {
     }
 
     #[test]
+    fn test_service_start_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "service",
+            "start",
+            "--socket",
+            "/tmp/strait-control.sock",
+            "--observe",
+            "--image",
+            "ubuntu:24.04",
+            "--output",
+            "/tmp/service-observations.jsonl",
+            "--mount",
+            "/tmp/fixture:/fixture:ro",
+            "--",
+            "sh",
+            "-lc",
+            "sleep 60",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Service {
+                action:
+                    ServiceAction::Start {
+                        socket,
+                        observe,
+                        image,
+                        output,
+                        mount,
+                        command,
+                        ..
+                    },
+            } => {
+                assert_eq!(
+                    socket.unwrap().to_str().unwrap(),
+                    "/tmp/strait-control.sock"
+                );
+                assert!(observe);
+                assert_eq!(image.as_deref(), Some("ubuntu:24.04"));
+                assert_eq!(
+                    output.unwrap().to_str().unwrap(),
+                    "/tmp/service-observations.jsonl"
+                );
+                assert_eq!(mount, vec!["/tmp/fixture:/fixture:ro"]);
+                assert_eq!(command, vec!["sh", "-lc", "sleep 60"]);
+            }
+            _ => panic!("expected Service::Start subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_service_status_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "service",
+            "status",
+            "--socket",
+            "/tmp/strait.sock",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Service {
+                action: ServiceAction::Status { socket },
+            } => {
+                assert_eq!(socket.unwrap().to_str().unwrap(), "/tmp/strait.sock");
+            }
+            _ => panic!("expected Service::Status subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_service_stop_subcommand_parses() {
+        let cli =
+            Cli::try_parse_from(["strait", "service", "stop", "--socket", "/tmp/strait.sock"])
+                .unwrap();
+
+        match cli.command {
+            Commands::Service {
+                action: ServiceAction::Stop { socket },
+            } => {
+                assert_eq!(socket.unwrap().to_str().unwrap(), "/tmp/strait.sock");
+            }
+            _ => panic!("expected Service::Stop subcommand"),
+        }
+    }
+
+    #[test]
     fn test_help_lists_all_subcommands() {
         let cmd = Cli::command();
         let subcommand_names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
@@ -1369,6 +1640,10 @@ mod tests {
             subcommand_names.contains(&"session"),
             "missing 'session' subcommand"
         );
+        assert!(
+            subcommand_names.contains(&"service"),
+            "missing 'service' subcommand"
+        );
     }
 
     #[test]
@@ -1400,6 +1675,30 @@ mod tests {
         assert!(
             help.contains("Live updates apply to network policy only."),
             "launch help should describe the live update boundary: {help}"
+        );
+    }
+
+    #[test]
+    fn test_service_help_mentions_grpc_and_remote_support() {
+        let mut cmd = Cli::command();
+        let service = cmd.find_subcommand_mut("service").unwrap();
+        let help = render_help(service);
+
+        assert!(
+            help.contains("background gRPC control service"),
+            "service help should describe the gRPC control plane: {help}"
+        );
+        assert!(
+            help.contains("start"),
+            "service help should list the start subcommand: {help}"
+        );
+        assert!(
+            help.contains("status"),
+            "service help should list the status subcommand: {help}"
+        );
+        assert!(
+            help.contains("stop"),
+            "service help should list the stop subcommand: {help}"
         );
     }
 

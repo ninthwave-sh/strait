@@ -249,7 +249,8 @@ fn event_to_action_resource(event: &EventKind) -> Option<(String, String)> {
         | EventKind::ContainerStop { .. }
         | EventKind::PolicyViolation { .. }
         | EventKind::PolicyReloaded { .. }
-        | EventKind::TtyResized { .. } => None,
+        | EventKind::TtyResized { .. }
+        | EventKind::LiveDecision { .. } => None,
     }
 }
 

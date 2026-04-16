@@ -263,6 +263,22 @@ pub enum EventKind {
         /// Origin of the resize event.
         source: String,
     },
+    /// Live decision action applied through the launch control plane.
+    ///
+    /// Emitted when an external client resolves a blocked request via
+    /// `decision.allow_once`, `decision.allow_session`, or
+    /// `decision.deny`. Mirrors the blocked-request metadata on
+    /// `NetworkRequest` emissions so downstream consumers can
+    /// correlate the decision with the originating block.
+    LiveDecision {
+        /// Decision method applied. One of `decision.allow_once`,
+        /// `decision.allow_session`, or `decision.deny`.
+        action: String,
+        /// Blocked-request identifier the decision was applied against.
+        blocked_id: String,
+        /// Normalized match key the decision applies to.
+        match_key: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

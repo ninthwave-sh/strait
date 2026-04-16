@@ -80,7 +80,8 @@ pub fn classify_event(event: &EventKind) -> EventColor {
         | EventKind::ContainerStop { .. }
         | EventKind::Mount { .. }
         | EventKind::PolicyReloaded { .. }
-        | EventKind::TtyResized { .. } => EventColor::Lifecycle,
+        | EventKind::TtyResized { .. }
+        | EventKind::LiveDecision { .. } => EventColor::Lifecycle,
         EventKind::FsAccess { .. } | EventKind::ProcExec { .. } => EventColor::Passthrough,
         EventKind::PolicyViolation { decision, .. } => match decision.as_str() {
             "deny" => EventColor::Deny,
@@ -282,6 +283,15 @@ fn format_event_parts(event: &EventKind) -> (String, String, String) {
             "tty:resize".to_string(),
             format!("{cols}x{rows}"),
             source.clone(),
+        ),
+        EventKind::LiveDecision {
+            action,
+            blocked_id,
+            match_key,
+        } => (
+            action.clone(),
+            match_key.clone(),
+            format!("blocked_id={blocked_id}"),
         ),
     }
 }

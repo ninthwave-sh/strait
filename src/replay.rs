@@ -331,7 +331,8 @@ fn evaluate_event(
         | EventKind::ContainerStop { .. }
         | EventKind::PolicyViolation { .. }
         | EventKind::PolicyReloaded { .. }
-        | EventKind::TtyResized { .. } => EventEvaluation::Skip,
+        | EventKind::TtyResized { .. }
+        | EventKind::LiveDecision { .. } => EventEvaluation::Skip,
     }
 }
 
@@ -427,6 +428,13 @@ fn format_event_summary(event: &ObservationEvent) -> String {
         }
         EventKind::TtyResized { rows, cols, source } => {
             format!("tty resize {cols}x{rows} ({source})")
+        }
+        EventKind::LiveDecision {
+            action,
+            blocked_id,
+            match_key,
+        } => {
+            format!("decision {action} blocked_id={blocked_id} match_key={match_key}")
         }
     }
 }

@@ -3,6 +3,11 @@
 Run Claude Code inside a sandboxed container with policy enforcement,
 credential injection, and audit logging.
 
+If you are starting from Claude Code's reference devcontainer, read
+[`docs/devcontainer.md`](../../docs/devcontainer.md) first. It explains how
+the reference `init-firewall.sh` setup maps onto strait and why you should
+remove that firewall script once strait is in place.
+
 Two auth models are supported:
 
 1. **Max subscription (OAuth)** -- primary path. Anthropic traffic passes

@@ -278,6 +278,11 @@ Features in proxy mode today: MITM with Cedar policy evaluation, credential inje
 
 This mode shares the same session publication and watch surfaces as the primary `strait` runtime, but it is not the primary enforcement story because host trust and subprocess coverage vary by client.
 
+## Docs and examples
+
+- [Devcontainer comparison](docs/devcontainer.md) - where strait fits relative to the devcontainer spec and Claude Code's `init-firewall.sh` setup
+- [Claude Code example](examples/claude-code/README.md) - run Claude Code inside a strait-managed container
+
 ## Policy tooling
 
 ```bash

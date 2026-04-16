@@ -5,6 +5,7 @@
 //! of shared state that connection handlers need, replacing the previous 8+
 //! positional parameters.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,12 +57,6 @@ pub struct StraitConfig {
 
     /// Health check configuration (reserved for future use).
     pub health: Option<HealthConfig>,
-
-    /// Container image specification for auto-building.
-    ///
-    /// When present, strait generates a Dockerfile from this spec, builds the
-    /// image, and caches it by content hash. Overridden by `--image` on the CLI.
-    pub container: Option<ContainerSpec>,
 }
 
 /// `[listen]` section — address and port for the proxy listener.
@@ -104,6 +99,9 @@ const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_SECS: u64 = 60;
 
 /// Default live decision hold timeout (seconds).
 const DEFAULT_DECISION_TIMEOUT_SECS: u64 = 30;
+
+/// Strategy doc referenced by devcontainer validation errors.
+const DEVCONTAINER_STRATEGY_DOC: &str = "docs/designs/devcontainer-strategy.md";
 
 /// `[mitm]` section — which hosts to intercept.
 #[derive(Debug, Deserialize, Clone)]
@@ -318,28 +316,253 @@ pub struct HealthConfig {
     pub port: u16,
 }
 
-/// `[container]` section — declarative container image specification.
-///
-/// When present, strait generates a Dockerfile from the spec, builds the image
-/// via the Docker API, and caches it by content hash (`strait-cache:<hash>`).
-/// Overridden by `--image` on the CLI.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ContainerSpec {
-    /// Base image (e.g. `"ubuntu:24.04"`). Required.
-    pub base_image: String,
+/// Typed subset of devcontainer.json fields honored by strait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevcontainerConfig {
+    /// Prebuilt image reference from `image`.
+    pub image: Option<String>,
+    /// Docker build configuration from `build`.
+    pub build: Option<DevcontainerBuildConfig>,
+    /// Environment variables injected into the container.
+    pub container_env: BTreeMap<String, String>,
+    /// Lifecycle hook run before the agent command.
+    pub post_create_command: Option<DevcontainerCommand>,
+    /// Lifecycle hook run during container creation.
+    pub on_create_command: Option<DevcontainerCommand>,
+    /// Preferred workspace folder inside the container.
+    pub workspace_folder: Option<String>,
+    /// User account the agent should run as.
+    pub remote_user: Option<String>,
+}
 
-    /// APT packages to install (optional, default empty).
-    #[serde(default)]
-    pub apt: Vec<String>,
+/// Docker build configuration extracted from `devcontainer.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevcontainerBuildConfig {
+    /// Dockerfile path resolved relative to the devcontainer file.
+    pub dockerfile: PathBuf,
+    /// Optional build context resolved relative to the devcontainer file.
+    pub context: Option<PathBuf>,
+}
 
-    /// npm packages to install globally (optional, default empty).
-    #[serde(default)]
-    pub npm: Vec<String>,
+/// Lifecycle command shape used by `postCreateCommand` and `onCreateCommand`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DevcontainerCommand {
+    /// Shell command string.
+    Shell(String),
+    /// Exec-form argv list.
+    Exec(Vec<String>),
+    /// Named commands represented as an object map.
+    Named(BTreeMap<String, DevcontainerCommandStep>),
+}
 
-    /// pip packages to install (optional, default empty).
+/// Leaf command shape for named lifecycle commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DevcontainerCommandStep {
+    /// Shell command string.
+    Shell(String),
+    /// Exec-form argv list.
+    Exec(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDevcontainerConfig {
+    image: Option<String>,
+    build: Option<RawDevcontainerBuildConfig>,
     #[serde(default)]
-    pub pip: Vec<String>,
+    container_env: BTreeMap<String, String>,
+    post_create_command: Option<RawDevcontainerCommand>,
+    on_create_command: Option<RawDevcontainerCommand>,
+    workspace_folder: Option<String>,
+    remote_user: Option<String>,
+    privileged: Option<bool>,
+    cap_add: Option<serde_json::Value>,
+    run_args: Option<Vec<String>>,
+    forward_ports: Option<serde_json::Value>,
+    mounts: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDevcontainerBuildConfig {
+    dockerfile: String,
+    context: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawDevcontainerCommand {
+    Shell(String),
+    Exec(Vec<String>),
+    Named(BTreeMap<String, RawDevcontainerCommandStep>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawDevcontainerCommandStep {
+    Shell(String),
+    Exec(Vec<String>),
+}
+
+impl From<RawDevcontainerCommand> for DevcontainerCommand {
+    fn from(value: RawDevcontainerCommand) -> Self {
+        match value {
+            RawDevcontainerCommand::Shell(command) => Self::Shell(command),
+            RawDevcontainerCommand::Exec(command) => Self::Exec(command),
+            RawDevcontainerCommand::Named(commands) => Self::Named(
+                commands
+                    .into_iter()
+                    .map(|(name, step)| (name, step.into()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl From<RawDevcontainerCommandStep> for DevcontainerCommandStep {
+    fn from(value: RawDevcontainerCommandStep) -> Self {
+        match value {
+            RawDevcontainerCommandStep::Shell(command) => Self::Shell(command),
+            RawDevcontainerCommandStep::Exec(command) => Self::Exec(command),
+        }
+    }
+}
+
+/// Load and validate a `devcontainer.json` / JSONC file.
+pub fn parse_devcontainer(path: &Path) -> anyhow::Result<DevcontainerConfig> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read devcontainer file: {}", path.display()))?;
+    let raw: RawDevcontainerConfig = json5::from_str(&text)
+        .with_context(|| format!("invalid devcontainer.json: {}", path.display()))?;
+
+    validate_devcontainer_fields(&raw)?;
+    warn_on_ignored_devcontainer_fields(&raw, path);
+
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    Ok(DevcontainerConfig {
+        image: raw.image,
+        build: raw.build.map(|build| DevcontainerBuildConfig {
+            dockerfile: resolve_devcontainer_path(base_dir, &build.dockerfile),
+            context: build
+                .context
+                .as_deref()
+                .map(|context| resolve_devcontainer_path(base_dir, context)),
+        }),
+        container_env: raw.container_env,
+        post_create_command: raw.post_create_command.map(Into::into),
+        on_create_command: raw.on_create_command.map(Into::into),
+        workspace_folder: raw.workspace_folder,
+        remote_user: raw.remote_user,
+    })
+}
+
+fn resolve_devcontainer_path(base_dir: &Path, raw_path: &str) -> PathBuf {
+    let path = Path::new(raw_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn validate_devcontainer_fields(config: &RawDevcontainerConfig) -> anyhow::Result<()> {
+    if config.privileged.unwrap_or(false) {
+        return Err(reject_devcontainer_field(
+            "privileged",
+            "privileged containers can bypass Strait's network boundary",
+        ));
+    }
+
+    if has_nonempty_value(config.cap_add.as_ref()) {
+        return Err(reject_devcontainer_field(
+            "capAdd",
+            "Linux capability additions are not compatible with Strait's network isolation",
+        ));
+    }
+
+    if let Some(run_arg) = config
+        .run_args
+        .as_ref()
+        .and_then(|args| args.iter().find(|arg| is_unsafe_run_arg(arg)))
+    {
+        return Err(reject_devcontainer_field(
+            "runArgs",
+            &format!("unsafe value '{run_arg}' can weaken Strait's network boundary"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn reject_devcontainer_field(field: &str, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "devcontainer.json field '{field}' is not supported: {reason}. See {DEVCONTAINER_STRATEGY_DOC}."
+    )
+}
+
+fn warn_on_ignored_devcontainer_fields(config: &RawDevcontainerConfig, path: &Path) {
+    if has_nonempty_value(config.forward_ports.as_ref()) {
+        warn!(
+            path = %path.display(),
+            "ignoring devcontainer field 'forwardPorts'; inbound port forwarding does not fit Strait's network model. See {}.",
+            DEVCONTAINER_STRATEGY_DOC
+        );
+    }
+
+    if has_nonempty_value(config.mounts.as_ref()) {
+        warn!(
+            path = %path.display(),
+            "ignoring devcontainer field 'mounts' during parse; mounts are honored by the container runtime directly. See {}.",
+            DEVCONTAINER_STRATEGY_DOC
+        );
+    }
+}
+
+fn has_nonempty_value(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Array(items)) => !items.is_empty(),
+        Some(serde_json::Value::Object(map)) => !map.is_empty(),
+        Some(serde_json::Value::String(text)) => !text.is_empty(),
+        Some(serde_json::Value::Null) | None => false,
+        Some(_) => true,
+    }
+}
+
+fn is_unsafe_run_arg(arg: &str) -> bool {
+    if matches!(
+        arg,
+        "--privileged"
+            | "--cap-add"
+            | "--net"
+            | "--network"
+            | "--pid"
+            | "--ipc"
+            | "--uts"
+            | "--device"
+            | "--mount"
+            | "--volume"
+            | "-v"
+            | "--security-opt"
+    ) {
+        return true;
+    }
+
+    let prefixes = [
+        "--privileged=",
+        "--cap-add=",
+        "--net=",
+        "--network=",
+        "--pid=",
+        "--ipc=",
+        "--uts=",
+        "--device=",
+        "--mount=",
+        "--volume=",
+        "-v=",
+        "--security-opt=",
+    ];
+
+    prefixes.iter().any(|prefix| arg.starts_with(prefix))
 }
 
 impl StraitConfig {
@@ -1119,7 +1342,8 @@ pub async fn sighup_reload_task(ctx: Arc<ProxyContext>) {
 mod tests {
     use super::*;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use std::sync::{Arc, Mutex};
+    use tempfile::{NamedTempFile, TempDir};
 
     fn write_config(content: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
@@ -1134,6 +1358,55 @@ mod tests {
             .unwrap()
             .persist
             .cedar_snippet
+    }
+
+    fn write_devcontainer(content: &str) -> (TempDir, PathBuf) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let devcontainer_dir = temp_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer_dir).unwrap();
+
+        let path = devcontainer_dir.join("devcontainer.json");
+        std::fs::write(&path, content).unwrap();
+
+        (temp_dir, path)
+    }
+
+    struct WarnCollector {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for WarnCollector {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = MsgExtractor(String::new());
+            event.record(&mut visitor);
+            self.messages.lock().unwrap().push(visitor.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    struct MsgExtractor(String);
+
+    impl tracing::field::Visit for MsgExtractor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{:?}", value);
+            }
+        }
     }
 
     #[test]
@@ -1244,7 +1517,6 @@ ca_cert_path = "/tmp/ca.pem"
         assert!(config.audit.is_none());
         assert!(config.identity.is_none());
         assert!(config.health.is_none());
-        assert!(config.container.is_none());
     }
 
     #[test]
@@ -2505,96 +2777,222 @@ upstream_response_timeout_secs = 90
         assert_eq!(ctx.upstream_response_timeout, Duration::from_secs(90));
     }
 
-    // -- Container spec tests --------------------------------------------------
+    // -- devcontainer.json tests -----------------------------------------------
 
     #[test]
-    fn container_spec_full_parses() {
-        let f = write_config(
+    fn parse_devcontainer_minimal_image_only_jsonc() {
+        let (_temp_dir, path) = write_devcontainer(
             r#"
-ca_cert_path = "/tmp/ca.pem"
-
-[container]
-base_image = "ubuntu:24.04"
-apt = ["git", "curl", "ca-certificates"]
-npm = ["@anthropic-ai/claude-code"]
-pip = ["ruff"]
-"#,
+            {
+              // minimal image-based config
+              image: "ghcr.io/example/agent:latest",
+            }
+            "#,
         );
-        let config = StraitConfig::load(f.path()).unwrap();
-        let spec = config.container.as_ref().unwrap();
-        assert_eq!(spec.base_image, "ubuntu:24.04");
-        assert_eq!(spec.apt, vec!["git", "curl", "ca-certificates"]);
-        assert_eq!(spec.npm, vec!["@anthropic-ai/claude-code"]);
-        assert_eq!(spec.pip, vec!["ruff"]);
+
+        let config = parse_devcontainer(&path).unwrap();
+        assert_eq!(
+            config.image.as_deref(),
+            Some("ghcr.io/example/agent:latest")
+        );
+        assert!(config.build.is_none());
+        assert!(config.container_env.is_empty());
+        assert!(config.post_create_command.is_none());
+        assert!(config.on_create_command.is_none());
+        assert!(config.workspace_folder.is_none());
+        assert!(config.remote_user.is_none());
     }
 
     #[test]
-    fn container_spec_base_image_only() {
-        let f = write_config(
+    fn parse_devcontainer_build_based_config() {
+        let (temp_dir, path) = write_devcontainer(
             r#"
-ca_cert_path = "/tmp/ca.pem"
-
-[container]
-base_image = "alpine:3.20"
-"#,
+            {
+              build: {
+                dockerfile: "Dockerfile",
+                context: "..",
+              },
+            }
+            "#,
         );
-        let config = StraitConfig::load(f.path()).unwrap();
-        let spec = config.container.as_ref().unwrap();
-        assert_eq!(spec.base_image, "alpine:3.20");
-        assert!(spec.apt.is_empty());
-        assert!(spec.npm.is_empty());
-        assert!(spec.pip.is_empty());
+
+        let config = parse_devcontainer(&path).unwrap();
+        let build = config.build.as_ref().unwrap();
+        assert_eq!(
+            build.dockerfile,
+            temp_dir.path().join(".devcontainer").join("Dockerfile")
+        );
+        assert_eq!(
+            build.context.as_ref(),
+            Some(&temp_dir.path().join(".devcontainer").join(".."))
+        );
+        assert!(config.image.is_none());
     }
 
     #[test]
-    fn container_spec_optional_fields_default_empty() {
-        let f = write_config(
+    fn parse_devcontainer_full_config() {
+        let (_temp_dir, path) = write_devcontainer(
             r#"
-ca_cert_path = "/tmp/ca.pem"
-
-[container]
-base_image = "node:20"
-apt = ["curl"]
-"#,
+            {
+              image: "mcr.microsoft.com/devcontainers/rust:1",
+              build: {
+                dockerfile: "Dockerfile",
+                context: "..",
+              },
+              containerEnv: {
+                RUST_LOG: "debug",
+                CI: "1",
+              },
+              postCreateCommand: ["cargo", "test"],
+              onCreateCommand: {
+                bootstrap: "scripts/bootstrap.sh",
+                verify: ["cargo", "fmt", "--check"],
+              },
+              workspaceFolder: "/workspaces/strait",
+              remoteUser: "vscode",
+            }
+            "#,
         );
-        let config = StraitConfig::load(f.path()).unwrap();
-        let spec = config.container.as_ref().unwrap();
-        assert_eq!(spec.apt, vec!["curl"]);
-        assert!(spec.npm.is_empty());
-        assert!(spec.pip.is_empty());
+
+        let config = parse_devcontainer(&path).unwrap();
+        assert_eq!(
+            config.image.as_deref(),
+            Some("mcr.microsoft.com/devcontainers/rust:1")
+        );
+        assert_eq!(
+            config.container_env.get("RUST_LOG").map(String::as_str),
+            Some("debug")
+        );
+        assert_eq!(
+            config.container_env.get("CI").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            config.post_create_command,
+            Some(DevcontainerCommand::Exec(vec![
+                "cargo".to_string(),
+                "test".to_string(),
+            ]))
+        );
+        assert_eq!(
+            config.on_create_command,
+            Some(DevcontainerCommand::Named(BTreeMap::from([
+                (
+                    "bootstrap".to_string(),
+                    DevcontainerCommandStep::Shell("scripts/bootstrap.sh".to_string()),
+                ),
+                (
+                    "verify".to_string(),
+                    DevcontainerCommandStep::Exec(vec![
+                        "cargo".to_string(),
+                        "fmt".to_string(),
+                        "--check".to_string(),
+                    ]),
+                ),
+            ])))
+        );
+        assert_eq!(
+            config.workspace_folder.as_deref(),
+            Some("/workspaces/strait")
+        );
+        assert_eq!(config.remote_user.as_deref(), Some("vscode"));
     }
 
     #[test]
-    fn container_spec_missing_base_image_errors() {
-        let f = write_config(
+    fn parse_devcontainer_rejects_privileged_true() {
+        let (_temp_dir, path) = write_devcontainer(
             r#"
-ca_cert_path = "/tmp/ca.pem"
-
-[container]
-apt = ["git"]
-"#,
+            {
+              image: "ubuntu:24.04",
+              privileged: true,
+            }
+            "#,
         );
-        let result = StraitConfig::load(f.path());
-        assert!(result.is_err());
-        let err = format!("{:#}", result.unwrap_err());
+
+        let err = parse_devcontainer(&path).unwrap_err().to_string();
         assert!(
-            err.contains("base_image"),
-            "error should mention base_image, got: {err}"
+            err.contains("privileged"),
+            "error should name the field, got: {err}"
+        );
+        assert!(
+            err.contains(DEVCONTAINER_STRATEGY_DOC),
+            "error should point to the strategy doc, got: {err}"
         );
     }
 
     #[test]
-    fn container_spec_unknown_field_errors() {
-        let f = write_config(
+    fn parse_devcontainer_rejects_cap_add() {
+        let (_temp_dir, path) = write_devcontainer(
             r#"
-ca_cert_path = "/tmp/ca.pem"
-
-[container]
-base_image = "alpine"
-unknown_field = "value"
-"#,
+            {
+              image: "ubuntu:24.04",
+              capAdd: ["NET_ADMIN"],
+            }
+            "#,
         );
-        let result = StraitConfig::load(f.path());
-        assert!(result.is_err(), "unknown fields should be rejected");
+
+        let err = parse_devcontainer(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("capAdd"),
+            "error should name the field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_devcontainer_rejects_unsafe_run_args() {
+        let (_temp_dir, path) = write_devcontainer(
+            r#"
+            {
+              image: "ubuntu:24.04",
+              runArgs: ["--network=host"],
+            }
+            "#,
+        );
+
+        let err = parse_devcontainer(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("runArgs"),
+            "error should name the field, got: {err}"
+        );
+        assert!(
+            err.contains("--network=host"),
+            "error should name the value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_devcontainer_warns_on_forward_ports_and_mounts() {
+        let (_temp_dir, path) = write_devcontainer(
+            r#"
+            {
+              image: "ubuntu:24.04",
+              forwardPorts: [3000],
+              mounts: ["source=/tmp,target=/mnt,type=bind"],
+            }
+            "#,
+        );
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let collector = WarnCollector {
+            messages: messages.clone(),
+        };
+        let _guard = tracing::subscriber::set_default(collector);
+
+        let config = parse_devcontainer(&path).unwrap();
+        assert_eq!(config.image.as_deref(), Some("ubuntu:24.04"));
+
+        let messages = messages.lock().unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("forwardPorts")),
+            "warning should mention forwardPorts, got: {:?}",
+            *messages
+        );
+        assert!(
+            messages.iter().any(|message| message.contains("mounts")),
+            "warning should mention mounts, got: {:?}",
+            *messages
+        );
     }
 }

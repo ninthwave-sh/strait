@@ -288,8 +288,7 @@ LIVE POLICY UPDATES:
 
         /// Docker image to use for the container.
         ///
-        /// When set, overrides any `[container]` auto-build spec in strait.toml.
-        /// Defaults to ubuntu:24.04 if neither --image nor [container] is set.
+        /// Defaults to ubuntu:24.04 when omitted.
         #[arg(long)]
         image: Option<String>,
 
@@ -437,42 +436,28 @@ async fn main() -> anyhow::Result<()> {
         } => {
             init_tracing();
 
-            // Load credential store, MITM hosts, and container spec from config if provided.
-            let (credential_store, mitm_hosts, container_spec) =
-                if let Some(ref config_path) = config {
-                    let cfg = StraitConfig::load(config_path)?;
-                    info!(path = %config_path.display(), "launch config loaded");
+            // Load credential store and MITM hosts from config if provided.
+            let (credential_store, mitm_hosts) = if let Some(ref config_path) = config {
+                let cfg = StraitConfig::load(config_path)?;
+                info!(path = %config_path.display(), "launch config loaded");
 
-                    let cred_store = if cfg.credential.is_empty() {
-                        None
-                    } else {
-                        let store = CredentialStore::from_entries(&cfg.credential)?;
-                        info!(
-                            count = cfg.credential.len(),
-                            "credentials loaded from config"
-                        );
-                        Some(Arc::new(store))
-                    };
-
-                    (cred_store, cfg.mitm.hosts.clone(), cfg.container.clone())
+                let cred_store = if cfg.credential.is_empty() {
+                    None
                 } else {
-                    (None, Vec::new(), None)
+                    let store = CredentialStore::from_entries(&cfg.credential)?;
+                    info!(
+                        count = cfg.credential.len(),
+                        "credentials loaded from config"
+                    );
+                    Some(Arc::new(store))
                 };
 
-            // Resolve image: --image wins, then [container] spec auto-build,
-            // then DEFAULT_IMAGE fallback.
-            let resolved_image = if let Some(ref img) = image {
-                img.clone()
-            } else if let Some(ref spec) = container_spec {
-                // Auto-build from [container] spec. We need a Docker connection
-                // for the build, but the launch functions also create one. To
-                // avoid connecting twice, we build here and pass the tag.
-                let docker = bollard::Docker::connect_with_local_defaults()
-                    .context("failed to connect to Docker for image build")?;
-                strait::container::build_or_reuse_image(&docker, spec).await?
+                (cred_store, cfg.mitm.hosts.clone())
             } else {
-                "ubuntu:24.04".to_string()
+                (None, Vec::new())
             };
+
+            let resolved_image = image.unwrap_or_else(|| "ubuntu:24.04".to_string());
 
             // clap's ArgGroup "mode" guarantees exactly one of these is set.
             let tty = !no_tty;

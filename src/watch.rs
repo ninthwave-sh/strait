@@ -440,7 +440,7 @@ fn discover_socket_in(dir: &Path) -> Option<PathBuf> {
         .collect();
 
     // Newest first.
-    sockets.sort_by(|a, b| b.1.cmp(&a.1));
+    sockets.sort_by_key(|b| std::cmp::Reverse(b.1));
     sockets.into_iter().next().map(|(path, _)| path)
 }
 

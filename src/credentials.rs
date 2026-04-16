@@ -95,10 +95,8 @@ pub fn parse_aws_host(host: &str) -> Option<AwsHostInfo> {
     // match a `.amazonaws.com.cn` hostname.
     let prefix = if let Some(p) = host.strip_suffix(".amazonaws.com.cn") {
         p
-    } else if let Some(p) = host.strip_suffix(".amazonaws.com") {
-        p
     } else {
-        return None;
+        host.strip_suffix(".amazonaws.com")?
     };
 
     if prefix.is_empty() {

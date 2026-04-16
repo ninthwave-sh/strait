@@ -2513,18 +2513,42 @@ fn launch_policy_replace_live_updates_running_session() {
         .expect("session.info should succeed while policy probe is running");
     assert_eq!(info.mode, "enforce");
 
-    session.write_line("probe").unwrap();
-    let denied = session
-        .wait_for_event("probe", Duration::from_secs(10))
-        .unwrap();
-    assert_eq!(denied["status"].as_str(), Some("403"));
-
     let observation = runtime
         .block_on(strait::launch::request_launch_watch_attach(
             &live_session.control_socket_path,
         ))
         .expect("watch.attach should succeed for policy probe session");
     let observation_path = observation.path.clone();
+    let blocked_observation_path = observation_path.clone();
+    let blocked_task = runtime.spawn(async move {
+        wait_for_observation_socket_event(
+            &blocked_observation_path,
+            "policy_violation",
+            Duration::from_secs(10),
+        )
+        .await
+    });
+
+    session.write_line("probe").unwrap();
+    let blocked_event = runtime.block_on(async {
+        blocked_task
+            .await
+            .expect("watch.attach blocked-request observer task should complete")
+    });
+    let blocked_id = blocked_event["blocked"]["blocked_id"]
+        .as_str()
+        .expect("blocked policy violation should include a blocked request id");
+    runtime
+        .block_on(strait::launch::request_launch_decision_deny(
+            &live_session.control_socket_path,
+            blocked_id,
+        ))
+        .expect("decision.deny should resolve the held probe request");
+    let denied = session
+        .wait_for_event("probe", Duration::from_secs(15))
+        .unwrap();
+    assert_eq!(denied["status"].as_str(), Some("403"));
+
     let watch_task = runtime.spawn(async move {
         wait_for_observation_socket_event(
             &observation_path,

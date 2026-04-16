@@ -81,8 +81,8 @@ pub fn classify_event(event: &EventKind) -> EventColor {
         | EventKind::Mount { .. }
         | EventKind::PolicyReloaded { .. }
         | EventKind::TtyResized { .. }
+        | EventKind::TtyResized { .. }
         | EventKind::LiveDecision { .. } => EventColor::Lifecycle,
-        EventKind::FsAccess { .. } | EventKind::ProcExec { .. } => EventColor::Passthrough,
         EventKind::PolicyViolation { decision, .. } => match decision.as_str() {
             "deny" => EventColor::Deny,
             "warn" => EventColor::Warn,
@@ -234,12 +234,6 @@ fn format_event_parts(event: &EventKind) -> (String, String, String) {
             ("container:stop".to_string(), short_id.to_string(), detail)
         }
         EventKind::Mount { path, mode } => ("mount".to_string(), path.clone(), mode.clone()),
-        EventKind::FsAccess { path, operation } => {
-            (format!("fs:{operation}"), path.clone(), String::new())
-        }
-        EventKind::ProcExec { command, .. } => {
-            ("proc:exec".to_string(), command.clone(), String::new())
-        }
         EventKind::PolicyViolation {
             action,
             resource,
@@ -735,24 +729,6 @@ mod tests {
         assert_eq!(classify_event(&event), EventColor::Lifecycle);
     }
 
-    #[test]
-    fn fs_access_classified_passthrough() {
-        let event = EventKind::FsAccess {
-            path: "/etc/passwd".into(),
-            operation: "read".into(),
-        };
-        assert_eq!(classify_event(&event), EventColor::Passthrough);
-    }
-
-    #[test]
-    fn proc_exec_classified_passthrough() {
-        let event = EventKind::ProcExec {
-            pid: 42,
-            command: "git status".into(),
-        };
-        assert_eq!(classify_event(&event), EventColor::Passthrough);
-    }
-
     // -- Time formatting ------------------------------------------------------
 
     #[test]
@@ -937,29 +913,6 @@ mod tests {
         let output = format_event(&event, 120);
         assert!(output.contains(DIM));
         assert!(output.contains("passthrough"));
-    }
-
-    #[test]
-    fn format_fs_access_colored_dim() {
-        let event = make_event(EventKind::FsAccess {
-            path: "/etc/passwd".into(),
-            operation: "read".into(),
-        });
-        let output = format_event(&event, 120);
-        assert!(output.contains(DIM));
-        assert!(output.contains("fs:read"));
-    }
-
-    #[test]
-    fn format_proc_exec_colored_dim() {
-        let event = make_event(EventKind::ProcExec {
-            pid: 42,
-            command: "git status".into(),
-        });
-        let output = format_event(&event, 120);
-        assert!(output.contains(DIM));
-        assert!(output.contains("proc:exec"));
-        assert!(output.contains("git status"));
     }
 
     // -- Edge case: long resource paths truncated to terminal width -----------

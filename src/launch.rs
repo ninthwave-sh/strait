@@ -1732,7 +1732,10 @@ fn resolve_string_devcontainer_mount(
             "target" | "dst" | "destination" => target = Some(value),
             "type" => mount_type = value,
             "readonly" => readonly = value.eq_ignore_ascii_case("true"),
-            "consistency" => unsupported_options.push("consistency".to_string()),
+            "consistency" => {
+                // Docker ignores this on all platforms now; warn and drop.
+                eprintln!("warning: ignoring unsupported mount option 'consistency' in devcontainer mount: {raw}");
+            }
             other => unsupported_options.push(other.to_string()),
         }
     }
@@ -1784,9 +1787,13 @@ fn resolve_object_devcontainer_mount(
         ));
     }
 
-    let mut unsupported_options = mount.unsupported_keys.clone();
+    let unsupported_options = mount.unsupported_keys.clone();
     if mount.consistency.is_some() {
-        unsupported_options.push("consistency".to_string());
+        // Docker ignores this on all platforms now; warn and drop.
+        eprintln!(
+            "warning: ignoring unsupported mount option 'consistency' in devcontainer mount: {}",
+            mount.raw
+        );
     }
     if !unsupported_options.is_empty() {
         return Err(unsupported_devcontainer_mount(
@@ -5550,19 +5557,19 @@ forbid(principal, action, resource);
     }
 
     #[test]
-    fn resolve_devcontainer_mounts_rejects_unhandled_mount_options() {
-        let err = resolve_devcontainer_mounts(
+    fn resolve_devcontainer_mounts_warns_and_drops_consistency() {
+        // consistency is deprecated/ignored by Docker; should succeed with a warning
+        let result = resolve_devcontainer_mounts(
             &[DevcontainerMount::String(
                 "source=/tmp,target=/mnt,type=bind,consistency=cached".to_string(),
             )],
             Path::new("/workspace"),
-        )
-        .unwrap_err();
-
-        assert!(
-            err.to_string().contains("unsupported options: consistency"),
-            "got: {err}"
         );
+
+        assert!(result.is_ok(), "consistency should be warned, not rejected");
+        let mounts = result.unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].target, "/mnt");
     }
 
     #[test]

@@ -51,6 +51,13 @@ forbid(
     resource in Resource::"api.github.com/repos"
 );
 
+// NOTE: this guard blocks ref updates whose path already ends in
+// `/git/refs/heads/main` (for example, fast-forwarding main via the
+// update-a-reference API). It does NOT catch creating a brand-new
+// `refs/heads/main` via `POST /repos/{owner}/{repo}/git/refs`, where
+// the ref name lives in the request body rather than the URL path.
+// Teams that need full main-branch protection should layer GitHub
+// branch protection rules on top of this Cedar guard.
 @id("deny-push-main")
 @reason("Direct pushes to main are prohibited; use pull requests")
 forbid(

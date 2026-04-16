@@ -534,13 +534,21 @@ fn parse_devcontainer_arg(raw: &str) -> Result<PathBuf, String> {
 /// paths. Uses `$XDG_CACHE_HOME` when set, falls back to `$HOME/.cache`
 /// on unix-like systems, and finally to the system temp directory.
 ///
-/// The extraction is idempotent -- files are overwritten on every call
-/// -- so operators can safely re-run with the same preset after a
-/// binary upgrade ships new preset contents.
+/// The devcontainer.json, strait.toml, and README.md files are always
+/// rewritten so they stay in sync with the embedded binary copy after
+/// a strait upgrade. The `policy.cedar` file is **preserved** if it
+/// already exists, because persisted decisions written by
+/// `strait session persist-decision` (or the desktop control plane)
+/// land in that file. Overwriting it on every launch would silently
+/// discard rules the operator explicitly opted into keeping.
+///
+/// Operators who want to pull in a newer starter policy shipped by a
+/// later strait version can re-extract with `strait preset apply` into
+/// a fresh directory.
 fn resolve_preset_layout(name: &str) -> anyhow::Result<presets::PresetLayout> {
     let preset = presets::find(name).ok_or_else(|| presets::unknown_preset_error(name))?;
     let cache_dir = preset_cache_dir(preset.name);
-    preset.apply_to(&cache_dir)
+    preset.apply_to(&cache_dir, presets::PolicyWriteMode::PreserveIfExists)
 }
 
 fn preset_cache_dir(preset_name: &str) -> PathBuf {
@@ -2419,9 +2427,38 @@ mod tests {
     }
 
     #[test]
+    fn test_launch_preset_conflicts_with_warn() {
+        let result = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--preset",
+            "claude-code-devcontainer",
+            "--warn",
+            "policy.cedar",
+            "echo",
+            "hello",
+        ]);
+        assert!(result.is_err(), "--preset and --warn should conflict");
+    }
+
+    /// Serializes tests that mutate process environment variables. Rust's
+    /// test harness runs tests on multiple threads by default, and
+    /// `std::env::set_var` is not thread-safe -- another test can observe
+    /// the temp value if this mutex is not held.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
     fn test_resolve_preset_layout_materializes_cache() {
         // Point the cache at a scratch directory so the test does not
         // touch the user's real cache. XDG_CACHE_HOME wins over HOME.
+        // Hold `env_lock` to keep the set/remove pair atomic relative
+        // to any other env-mutating test in this binary.
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("XDG_CACHE_HOME");
         std::env::set_var("XDG_CACHE_HOME", tmp.path());
@@ -2437,6 +2474,39 @@ mod tests {
                 .starts_with(tmp.path().join("strait").join("presets")),
             "preset cache should live under XDG_CACHE_HOME, got {}",
             layout.root.display()
+        );
+
+        match prev {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_preset_layout_preserves_persisted_policy_edits() {
+        // Regression guard: `strait launch --preset <name>` must not
+        // overwrite a policy.cedar that already has user-authored rules
+        // in it (e.g. from `strait session persist-decision`).
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", tmp.path());
+
+        let first = resolve_preset_layout("claude-code-devcontainer").unwrap();
+        let edited = format!(
+            "{}\n@id(\"persisted\")\npermit(principal, action, resource in Resource::\"api.acme.test\");\n",
+            std::fs::read_to_string(&first.policy_path).unwrap()
+        );
+        std::fs::write(&first.policy_path, &edited).unwrap();
+
+        let second = resolve_preset_layout("claude-code-devcontainer").unwrap();
+        assert_eq!(first.policy_path, second.policy_path);
+        assert_eq!(
+            std::fs::read_to_string(&second.policy_path).unwrap(),
+            edited,
+            "--preset relaunch must keep persisted decisions"
         );
 
         match prev {

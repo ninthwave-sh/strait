@@ -1,4 +1,13 @@
 {
+  // Minimal devcontainer for the strait first-run dogfood path.
+  // Image, user, workspace, and container env live here. strait owns
+  // outbound HTTP policy via strait.toml and policy.cedar.
+  //
+  // "remoteUser": "root" is chosen for first-run simplicity so operators
+  // can install language toolchains without friction. For production
+  // adoption, prefer a non-root user and grant specific capabilities --
+  // container escapes land with this user's privileges inside the
+  // container, and strait's network boundary does not change that.
   "name": "Claude Code (strait)",
   "image": "ubuntu:24.04",
   "remoteUser": "root",

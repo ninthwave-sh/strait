@@ -77,12 +77,37 @@ pub struct PresetLayout {
     pub readme_path: PathBuf,
 }
 
+/// How `Preset::apply_to` should treat an existing `policy.cedar` file.
+///
+/// The other files in a preset (devcontainer.json, strait.toml, README.md)
+/// are safe to overwrite -- they do not accumulate user state. The policy
+/// file, however, is a durable record of persisted decisions made via
+/// `strait session persist-decision`. Overwriting it silently would
+/// discard rules the operator opted into keeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyWriteMode {
+    /// Always overwrite `policy.cedar`. Used by `strait preset apply`,
+    /// which extracts a fresh starter policy for the operator to edit.
+    Overwrite,
+    /// Preserve `policy.cedar` if it already exists. Used by the
+    /// `strait launch --preset` cache so persisted decisions accumulate
+    /// across relaunches instead of being reset every run.
+    PreserveIfExists,
+}
+
 impl Preset {
     /// Write the preset's files into `dir`, creating it if necessary.
     ///
-    /// Returns the resulting filesystem layout. Existing files are
-    /// overwritten so `preset apply` is idempotent.
-    pub fn apply_to(&self, dir: &Path) -> anyhow::Result<PresetLayout> {
+    /// Returns the resulting filesystem layout. Existing devcontainer.json,
+    /// strait.toml, and README.md files are always overwritten so the
+    /// extracted preset stays in sync with the embedded copy. The
+    /// `policy_mode` argument controls how an existing `policy.cedar` is
+    /// treated -- see [`PolicyWriteMode`] for the options.
+    pub fn apply_to(
+        &self,
+        dir: &Path,
+        policy_mode: PolicyWriteMode,
+    ) -> anyhow::Result<PresetLayout> {
         std::fs::create_dir_all(dir).with_context(|| {
             format!(
                 "failed to create preset output directory: {}",
@@ -109,8 +134,17 @@ impl Preset {
         })?;
         std::fs::write(&config_path, self.strait_toml)
             .with_context(|| format!("failed to write strait.toml: {}", config_path.display()))?;
-        std::fs::write(&policy_path, self.policy_cedar)
-            .with_context(|| format!("failed to write policy.cedar: {}", policy_path.display()))?;
+
+        let should_write_policy = match policy_mode {
+            PolicyWriteMode::Overwrite => true,
+            PolicyWriteMode::PreserveIfExists => !policy_path.exists(),
+        };
+        if should_write_policy {
+            std::fs::write(&policy_path, self.policy_cedar).with_context(|| {
+                format!("failed to write policy.cedar: {}", policy_path.display())
+            })?;
+        }
+
         std::fs::write(&readme_path, self.readme)
             .with_context(|| format!("failed to write README.md: {}", readme_path.display()))?;
 
@@ -155,10 +189,13 @@ pub fn print_list() {
 /// Apply a preset by name.
 ///
 /// Writes the four files into `output_dir`, returns the resulting
-/// layout, and prints the written paths to stderr.
+/// layout, and prints the written paths to stderr. Uses
+/// [`PolicyWriteMode::Overwrite`] because `preset apply` is the
+/// "extract a fresh starter policy" command -- users expect it to
+/// reset the files they edited to the shipped defaults.
 pub fn apply(name: &str, output_dir: &Path) -> anyhow::Result<PresetLayout> {
     let preset = find(name).ok_or_else(|| unknown_preset_error(name))?;
-    let layout = preset.apply_to(output_dir)?;
+    let layout = preset.apply_to(output_dir, PolicyWriteMode::Overwrite)?;
     eprintln!("Preset '{name}' written to {}", layout.root.display());
     eprintln!("  devcontainer: {}", layout.devcontainer_path.display());
     eprintln!("  config:       {}", layout.config_path.display());
@@ -182,6 +219,7 @@ pub fn devcontainer_onboarding_lines() -> Vec<String> {
         "  - Approve once via `strait session persist-decision --session <ID> <BLOCKED_ID>`,"
             .to_string(),
         "    or from the desktop control plane, to write a durable Cedar rule.".to_string(),
+        "  - Persisted rules land in your policy.cedar and survive across relaunches.".to_string(),
         "  - Re-run the same command in a new session to confirm the rule persisted.".to_string(),
     ]
 }
@@ -341,6 +379,108 @@ mod tests {
         let first = apply("claude-code-devcontainer", dir.path()).unwrap();
         let second = apply("claude-code-devcontainer", dir.path()).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn apply_overwrite_mode_resets_user_edits_to_policy() {
+        // `preset apply` is the "extract a fresh starter policy"
+        // command. Re-running it after the operator edited the policy
+        // should restore the shipped content.
+        let dir = tempfile::tempdir().unwrap();
+        let preset = find("claude-code-devcontainer").unwrap();
+        let layout = preset
+            .apply_to(dir.path(), PolicyWriteMode::Overwrite)
+            .unwrap();
+        std::fs::write(&layout.policy_path, "// user edit\n").unwrap();
+        preset
+            .apply_to(dir.path(), PolicyWriteMode::Overwrite)
+            .unwrap();
+        let restored = std::fs::read_to_string(&layout.policy_path).unwrap();
+        assert_eq!(
+            restored, preset.policy_cedar,
+            "Overwrite mode should restore the shipped policy content"
+        );
+    }
+
+    #[test]
+    fn apply_preserve_mode_keeps_existing_policy() {
+        // `strait launch --preset` points at the same cache directory
+        // on every invocation. Persisted decisions land in the cached
+        // policy.cedar; the second apply must not overwrite them.
+        let dir = tempfile::tempdir().unwrap();
+        let preset = find("claude-code-devcontainer").unwrap();
+
+        let layout = preset
+            .apply_to(dir.path(), PolicyWriteMode::PreserveIfExists)
+            .unwrap();
+        let starter_policy = std::fs::read_to_string(&layout.policy_path).unwrap();
+        assert_eq!(starter_policy, preset.policy_cedar);
+
+        let persisted_policy = format!(
+            "{}\n\n@id(\"allow-acme-api\")\npermit(principal, action, resource in Resource::\"api.acme.test\");\n",
+            preset.policy_cedar
+        );
+        std::fs::write(&layout.policy_path, &persisted_policy).unwrap();
+
+        preset
+            .apply_to(dir.path(), PolicyWriteMode::PreserveIfExists)
+            .unwrap();
+
+        let after_relaunch = std::fs::read_to_string(&layout.policy_path).unwrap();
+        assert_eq!(
+            after_relaunch, persisted_policy,
+            "PreserveIfExists must keep persisted decisions across relaunches"
+        );
+    }
+
+    #[test]
+    fn apply_preserve_mode_still_overwrites_non_policy_files() {
+        // PreserveIfExists should only protect the policy file. The
+        // devcontainer.json, strait.toml, and README.md files stay in
+        // sync with the embedded binary copy after upgrades.
+        let dir = tempfile::tempdir().unwrap();
+        let preset = find("claude-code-devcontainer").unwrap();
+        let layout = preset
+            .apply_to(dir.path(), PolicyWriteMode::PreserveIfExists)
+            .unwrap();
+
+        std::fs::write(&layout.devcontainer_path, "{ \"stale\": true }").unwrap();
+        std::fs::write(&layout.config_path, "# stale\n").unwrap();
+        std::fs::write(&layout.readme_path, "stale readme").unwrap();
+
+        preset
+            .apply_to(dir.path(), PolicyWriteMode::PreserveIfExists)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&layout.devcontainer_path).unwrap(),
+            preset.devcontainer_json,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&layout.config_path).unwrap(),
+            preset.strait_toml,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&layout.readme_path).unwrap(),
+            preset.readme,
+        );
+    }
+
+    #[test]
+    fn apply_preserve_mode_writes_policy_on_first_apply() {
+        // Starter policy must be written when the cache directory is
+        // fresh -- PreserveIfExists only short-circuits on second and
+        // later applies.
+        let dir = tempfile::tempdir().unwrap();
+        let preset = find("claude-code-devcontainer").unwrap();
+        let layout = preset
+            .apply_to(dir.path(), PolicyWriteMode::PreserveIfExists)
+            .unwrap();
+        assert!(layout.policy_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&layout.policy_path).unwrap(),
+            preset.policy_cedar,
+        );
     }
 
     #[test]

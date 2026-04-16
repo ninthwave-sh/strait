@@ -102,7 +102,6 @@ pub struct ServiceStatusSummary {
 struct ManagedLaunchHandle {
     session: Arc<RwLock<Option<LaunchSessionMetadata>>>,
     join: tokio::task::JoinHandle<anyhow::Result<i32>>,
-    tracker: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug)]
@@ -431,15 +430,9 @@ async fn start_managed_launch(
         }
     });
 
-    let tracker = tokio::spawn(async move {
-        let _ = wait_for_managed_session(ready_rx, session_clone).await;
-    });
+    wait_for_managed_session(ready_rx, session_clone).await?;
 
-    Ok(ManagedLaunchHandle {
-        session,
-        join,
-        tracker,
-    })
+    Ok(ManagedLaunchHandle { session, join })
 }
 
 async fn wait_for_managed_session(
@@ -464,7 +457,6 @@ async fn shutdown_managed_launch(managed_launch: Option<ManagedLaunchHandle>) {
         let _ = request_launch_session_stop(&session.control_socket_path).await;
     }
 
-    managed_launch.tracker.abort();
     let _ = tokio::time::timeout(Duration::from_secs(30), managed_launch.join).await;
 }
 
@@ -699,6 +691,49 @@ async fn connect_observation_socket(
     Ok(tokio::io::BufReader::new(stream))
 }
 
+fn spawn_subscribe_observation_task(
+    session: LaunchSessionMetadata,
+    tx: mpsc::Sender<Result<proto::SubscribeEvent, Status>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Ok(mut reader) = connect_observation_socket(&session).await else {
+            return;
+        };
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let event = match serde_json::from_str::<ObservationEvent>(line) {
+                        Ok(event) => event,
+                        Err(_) => continue,
+                    };
+                    let observation = proto::SubscribeEvent {
+                        event: Some(proto::subscribe_event::Event::Observation(
+                            proto::SessionObservationEvent {
+                                session: Some(map_session(&session)),
+                                event_type: event_type_name(&event).to_string(),
+                                raw_json: match serde_json::to_string(&event) {
+                                    Ok(json) => json,
+                                    Err(_) => continue,
+                                },
+                            },
+                        )),
+                    };
+                    if tx.send(Ok(observation)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
 #[tonic::async_trait]
 impl proto::session_control_service_server::SessionControlService for SessionControlApi {
     type StreamBlockedRequestsStream = ReceiverStream<Result<proto::BlockedRequestEvent, Status>>;
@@ -841,65 +876,34 @@ impl proto::session_control_service_server::SessionControlService for SessionCon
 
         tokio::spawn(async move {
             let mut previous: Option<Vec<proto::Session>> = None;
-            let mut observation_task = None;
-
-            if let Some(session_id) = requested_session_id.clone() {
-                let tx = tx.clone();
-                observation_task = Some(tokio::spawn(async move {
-                    let Ok(session) = resolve_session(&session_id).await else {
-                        return;
-                    };
-                    let Ok(mut reader) = connect_observation_socket(&session).await else {
-                        return;
-                    };
-                    loop {
-                        let mut line = String::new();
-                        match reader.read_line(&mut line).await {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                let line = line.trim();
-                                if line.is_empty() {
-                                    continue;
-                                }
-                                let event = match serde_json::from_str::<ObservationEvent>(line) {
-                                    Ok(event) => event,
-                                    Err(_) => continue,
-                                };
-                                let observation = proto::SubscribeEvent {
-                                    event: Some(proto::subscribe_event::Event::Observation(
-                                        proto::SessionObservationEvent {
-                                            session: Some(map_session(&session)),
-                                            event_type: event_type_name(&event).to_string(),
-                                            raw_json: match serde_json::to_string(&event) {
-                                                Ok(json) => json,
-                                                Err(_) => continue,
-                                            },
-                                        },
-                                    )),
-                                };
-                                if tx.send(Ok(observation)).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }));
-            }
+            let mut observation_task: Option<tokio::task::JoinHandle<()>> = None;
+            let mut observed_session: Option<LaunchSessionMetadata> = None;
 
             loop {
-                let sessions = match list_live_sessions().await {
+                let live_sessions = match list_live_sessions().await {
                     Ok(sessions) => {
                         filter_sessions_for_subscription(sessions, requested_session_id.as_deref())
-                            .into_iter()
-                            .map(|session| map_session(&session))
-                            .collect::<Vec<_>>()
                     }
                     Err(error) => {
                         let _ = tx.send(Err(Status::internal(error.to_string()))).await;
                         break;
                     }
                 };
+
+                if requested_session_id.is_some() {
+                    let next_session = live_sessions.first().cloned();
+                    if observed_session != next_session {
+                        if let Some(task) = observation_task.take() {
+                            task.abort();
+                        }
+                        observation_task = next_session.as_ref().map(|session| {
+                            spawn_subscribe_observation_task(session.clone(), tx.clone())
+                        });
+                        observed_session = next_session;
+                    }
+                }
+
+                let sessions = live_sessions.iter().map(map_session).collect::<Vec<_>>();
 
                 if include_inventory && previous.as_ref() != Some(&sessions) {
                     let inventory = proto::SubscribeEvent {

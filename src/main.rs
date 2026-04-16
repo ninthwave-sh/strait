@@ -135,7 +135,7 @@ enum ServiceAction {
     #[command(after_help = "\
 The control service listens on a Unix domain socket locally and can also\
 listen on mTLS-authenticated TCP for remote operators.\
-\n+If you provide one of --observe, --warn, or --policy plus a command after\
+\nIf you provide one of --observe, --warn, or --policy plus a command after\
 `--`, the service will launch and own that session while still publishing the\
 existing control socket and observation socket contracts.")]
     Start {

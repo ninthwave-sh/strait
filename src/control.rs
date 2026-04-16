@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -127,13 +126,6 @@ pub fn default_service_socket_path() -> PathBuf {
     crate::observe::runtime_dir().join(DEFAULT_SERVICE_SOCKET_NAME)
 }
 
-fn ensure_rustls_crypto_provider() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
 pub async fn connect_unix_channel(path: &Path) -> anyhow::Result<Channel> {
     let socket_path = path.to_path_buf();
     Endpoint::try_from("http://[::]:50051")?
@@ -155,7 +147,7 @@ pub async fn connect_tcp_tls_channel(
     ca_pem: Vec<u8>,
     identity_pem: Option<(Vec<u8>, Vec<u8>)>,
 ) -> anyhow::Result<Channel> {
-    ensure_rustls_crypto_provider();
+    crate::ensure_rustls_crypto_provider();
     let mut tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(ca_pem))
         .domain_name(domain_name);
@@ -319,7 +311,7 @@ async fn start_tcp_tls_server(
     state: SharedState,
     shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
-    ensure_rustls_crypto_provider();
+    crate::ensure_rustls_crypto_provider();
     let cert_pem = std::fs::read(&tcp_tls.cert_path)
         .with_context(|| format!("failed to read TLS cert '{}'", tcp_tls.cert_path.display()))?;
     let key_pem = std::fs::read(&tcp_tls.key_path)

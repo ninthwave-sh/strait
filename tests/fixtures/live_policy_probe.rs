@@ -221,6 +221,7 @@ async fn perform_probe(config: &ProbeConfig) -> String {
 }
 
 fn main() -> anyhow::Result<()> {
+    strait::ensure_rustls_crypto_provider();
     let config = parse_args()?;
     let runtime = tokio::runtime::Runtime::new().context("failed to build tokio runtime")?;
 

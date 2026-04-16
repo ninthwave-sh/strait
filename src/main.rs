@@ -470,6 +470,7 @@ fn init_tracing() {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    strait::ensure_rustls_crypto_provider();
     let cli = Cli::parse();
 
     match cli.command {

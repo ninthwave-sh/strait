@@ -10,11 +10,11 @@ Built-in Cedar policy templates for common access patterns.
 | `github-org-contributor` | Read + PR creation, deny push to main/release branches, deny repo admin |
 | `aws-s3-readonly` | Read-only S3 access (GetObject, ListBucket) |
 | `aws-s3-readwrite` | S3 read + write, deny DeleteBucket/DeleteObject |
-| `container-sandbox` | Container sandbox: fs read/write + scoped HTTP access |
+| `container-sandbox` | Container sandbox: scoped HTTP access |
 
-## Unified Schema
+## Shared Network Schema
 
-`strait.cedarschema` is a unified schema covering all action domains (HTTP, filesystem, process). Use it when combining rules from multiple domains (e.g., GitHub + AWS, or HTTP + filesystem for container sandboxes). AWS context attributes (`aws_service`, `aws_region`) are declared as optional, so policies work correctly for both AWS and non-AWS hosts.
+`strait.cedarschema` is the shared schema for Strait's HTTP policy model. Use it when combining network rules from multiple hosts or services (for example GitHub + AWS). AWS context attributes (`aws_service`, `aws_region`) are declared as optional, so policies work correctly for both AWS and non-AWS hosts.
 
 ## Usage
 

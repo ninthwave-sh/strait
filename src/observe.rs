@@ -1,8 +1,8 @@
-//! Unified observation event model and stream infrastructure.
+//! Observation event model and stream infrastructure.
 //!
 //! Defines event types covering network requests, container lifecycle,
-//! filesystem access, and process execution. Events flow through a tokio
-//! broadcast channel and persist to JSONL file.
+//! and launch control-plane activity. Events flow through a tokio
+//! broadcast channel and persist to a JSONL file.
 //!
 //! This module exists alongside the v0.2 `AuditLogger` (which remains
 //! untouched for backward compatibility). Callers migrate to
@@ -30,7 +30,7 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 4096;
 ///
 /// Bumped when the event format changes. Consumers can use this to handle
 /// backward/forward compatibility across strait versions.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Default capacity for the recent-events ring buffer used for watch catch-up.
 const DEFAULT_RING_BUFFER_CAPACITY: usize = 256;
@@ -221,15 +221,11 @@ pub enum EventKind {
         /// "read-only" or "read-write".
         mode: String,
     },
-    /// Filesystem access observed (future — not MVP).
-    FsAccess { path: String, operation: String },
-    /// Process execution observed (future — not MVP).
-    ProcExec { pid: u32, command: String },
     /// Policy violation detected (used in warn and enforce modes).
     PolicyViolation {
         /// Enforcement mode: "warn" or "enforce".
         enforcement_mode: String,
-        /// The action that was evaluated (e.g. "http:CONNECT", "fs:write").
+        /// The action that was evaluated (e.g. "http:CONNECT").
         action: String,
         /// The resource that was evaluated (e.g. host, path).
         resource: String,
@@ -241,8 +237,8 @@ pub enum EventKind {
         ///
         /// Populated when the violation corresponds to an HTTP request
         /// that strait could synthesize a candidate exception for. `None`
-        /// for non-HTTP violations (for example, fs-mount denials emitted
-        /// by `launch`) and for violations from older strait runtimes.
+        /// for violations that are not tied to a concrete HTTP request and
+        /// for violations from older strait runtimes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         blocked: Option<BlockedRequest>,
     },
@@ -950,42 +946,6 @@ mod tests {
     }
 
     #[test]
-    fn fs_access_serializes_with_correct_fields() {
-        let event = ObservationEvent {
-            version: 1,
-            timestamp: "2026-03-27T00:00:00.000Z".to_string(),
-            session: None,
-            event: EventKind::FsAccess {
-                path: "/etc/passwd".to_string(),
-                operation: "read".to_string(),
-            },
-        };
-
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "fs_access");
-        assert_eq!(json["path"], "/etc/passwd");
-        assert_eq!(json["operation"], "read");
-    }
-
-    #[test]
-    fn proc_exec_serializes_with_correct_fields() {
-        let event = ObservationEvent {
-            version: 1,
-            timestamp: "2026-03-27T00:00:00.000Z".to_string(),
-            session: None,
-            event: EventKind::ProcExec {
-                pid: 42,
-                command: "node index.js".to_string(),
-            },
-        };
-
-        let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["type"], "proc_exec");
-        assert_eq!(json["pid"], 42);
-        assert_eq!(json["command"], "node index.js");
-    }
-
-    #[test]
     fn event_roundtrips_through_json() {
         let original = ObservationEvent {
             version: 1,
@@ -1244,7 +1204,7 @@ mod tests {
             event: EventKind::PolicyReloaded {
                 applied: true,
                 source: "reload".to_string(),
-                restart_required_domains: vec!["fs".to_string()],
+                restart_required_domains: vec!["http".to_string()],
             },
         };
 
@@ -1253,7 +1213,7 @@ mod tests {
         assert_eq!(json["session"]["session_id"], "session-123");
         assert_eq!(json["session"]["mode"], "warn");
         assert_eq!(json["source"], "reload");
-        assert_eq!(json["restart_required_domains"][0], "fs");
+        assert_eq!(json["restart_required_domains"][0], "http");
     }
 
     #[test]
@@ -1824,9 +1784,9 @@ mod tests {
                 version: 1,
                 timestamp: "2026-03-27T00:00:01.000Z".to_string(),
                 session: None,
-                event: EventKind::FsAccess {
-                    path: "/workspace/src".to_string(),
-                    operation: "read".to_string(),
+                event: EventKind::ContainerStop {
+                    container_id: "abc123".to_string(),
+                    exit_code: Some(0),
                 },
             },
         ];
@@ -1854,9 +1814,14 @@ mod tests {
             version: 1,
             timestamp: "2026-03-27T00:00:00.000Z".to_string(),
             session: None,
-            event: EventKind::ProcExec {
-                pid: 42,
-                command: "node index.js".to_string(),
+            event: EventKind::NetworkRequest {
+                method: "GET".to_string(),
+                host: "api.github.com".to_string(),
+                path: "/repos/org/repo".to_string(),
+                decision: "allow".to_string(),
+                latency_us: 100,
+                enforcement_mode: String::new(),
+                blocked: None,
             },
         };
 

@@ -1,10 +1,10 @@
 //! Cedar policy generation from observation logs.
 //!
 //! Reads a JSONL observation log (produced by `ObservationStream`) and
-//! generates a Cedar policy file + schema file covering all observed activity.
+//! generates a Cedar policy file + schema file covering observed HTTP activity.
 //!
 //! The generator:
-//! 1. Groups events by action namespace (http, fs, proc)
+//! 1. Groups HTTP request events by action
 //! 2. Collapses dynamic path segments (UUIDs, long numbers, SHAs) to `*`
 //! 3. Deduplicates (action, resource) pairs
 //! 4. Emits `permit()` statements with annotation comments
@@ -179,15 +179,14 @@ fn compute_wildcard_fields(
     let truncated = segments[..first_wc].join("/");
 
     // Build the like pattern for actions that populate context.path.
-    let like_pattern = if action.starts_with("http:") || action.starts_with("fs:") {
+    let like_pattern = if action.starts_with("http:") {
         // For HTTP, resource is "host/path_segments" — skip the host (index 0).
-        // For FS, resource is "fs::/path_segments" — skip the prefix (index 0).
         // The like pattern is the path portion with a leading "/".
         let path_parts: Vec<String> = segments[1..]
             .iter()
             .enumerate()
             .map(|(i, seg)| {
-                let resource_idx = i + 1; // offset for the skipped first segment
+                let resource_idx = i + 1; // offset for the skipped host segment
                 if *seg == "*" && wildcard_originals.contains_key(&resource_idx) {
                     // Collapsed wildcard — use Cedar like wildcard
                     "*".to_string()
@@ -229,9 +228,9 @@ fn event_to_action_resource(event: &EventKind) -> Option<(String, String)> {
             };
             Some((action, resource))
         }
-        EventKind::FsAccess { .. } | EventKind::ProcExec { .. } | EventKind::Mount { .. } => None,
-        // Container lifecycle and policy violation events don't map to Cedar actions.
-        EventKind::ContainerStart { .. }
+        // Non-HTTP observation events don't map to Cedar actions.
+        EventKind::Mount { .. }
+        | EventKind::ContainerStart { .. }
         | EventKind::ContainerStop { .. }
         | EventKind::PolicyViolation { .. }
         | EventKind::PolicyReloaded { .. }
@@ -402,12 +401,6 @@ fn generate_schema(rules: &[PolicyRule]) -> String {
                 "  context: {{ \"host\": __cedar::String, \"path\": __cedar::String, \"method\": __cedar::String }},"
             )
             .unwrap();
-        } else if action.starts_with("fs:") {
-            writeln!(
-                out,
-                "  context: {{ \"path\": __cedar::String, \"operation\": __cedar::String }},"
-            )
-            .unwrap();
         }
 
         writeln!(out, "}};").unwrap();
@@ -452,18 +445,6 @@ mod tests {
                 latency_us: 100,
                 enforcement_mode: String::new(),
                 blocked: None,
-            },
-        }
-    }
-
-    fn make_fs_event(path: &str, operation: &str) -> ObservationEvent {
-        ObservationEvent {
-            version: 1,
-            timestamp: "2026-03-27T00:00:00.000Z".to_string(),
-            session: None,
-            event: EventKind::FsAccess {
-                path: path.to_string(),
-                operation: operation.to_string(),
             },
         }
     }
@@ -542,9 +523,9 @@ mod tests {
     }
 
     #[test]
-    fn fs_numeric_segment_collapsed() {
-        let (collapsed, wildcards) = collapse_resource("fs::/workspace/data/123456/file.txt");
-        assert_eq!(collapsed, "fs::/workspace/data/*/file.txt");
+    fn http_numeric_segment_collapsed() {
+        let (collapsed, wildcards) = collapse_resource("api.example.com/data/123456/file.txt");
+        assert_eq!(collapsed, "api.example.com/data/*/file.txt");
         assert_eq!(wildcards.len(), 1);
         assert_eq!(wildcards[0].1, "123456");
     }
@@ -580,7 +561,6 @@ mod tests {
     fn non_http_events_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let events = vec![
-            make_fs_event("/etc/passwd", "read"),
             ObservationEvent {
                 version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
@@ -594,9 +574,9 @@ mod tests {
                 version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
                 session: None,
-                event: EventKind::ProcExec {
-                    pid: 42,
-                    command: "node index.js".to_string(),
+                event: EventKind::ContainerStart {
+                    container_id: "abc123".to_string(),
+                    image: "node:20".to_string(),
                 },
             },
         ];
@@ -607,14 +587,8 @@ mod tests {
         let wildcard_count = generate(&obs_path, &policy_path, &schema_path).unwrap();
 
         assert_eq!(wildcard_count, 0);
-        assert!(
-            !policy_path.exists(),
-            "non-http observations should not generate a policy"
-        );
-        assert!(
-            !schema_path.exists(),
-            "non-http observations should not generate a schema"
-        );
+        assert!(!policy_path.exists());
+        assert!(!schema_path.exists());
     }
 
     #[test]
@@ -771,24 +745,6 @@ mod tests {
                     mode: "read-write".to_string(),
                 },
             },
-            ObservationEvent {
-                version: 1,
-                timestamp: "2026-03-27T00:00:00.000Z".to_string(),
-                session: None,
-                event: EventKind::FsAccess {
-                    path: "/workspace/file.txt".to_string(),
-                    operation: "read".to_string(),
-                },
-            },
-            ObservationEvent {
-                version: 1,
-                timestamp: "2026-03-27T00:00:00.000Z".to_string(),
-                session: None,
-                event: EventKind::ProcExec {
-                    pid: 42,
-                    command: "node index.js".to_string(),
-                },
-            },
         ];
 
         for event in &events {
@@ -813,14 +769,13 @@ mod tests {
                     mode: "read-write".to_string(),
                 },
             },
-            make_fs_event("/workspace/src/main.rs", "read"),
             ObservationEvent {
                 version: 1,
                 timestamp: "2026-03-27T00:00:00.000Z".to_string(),
                 session: None,
-                event: EventKind::ProcExec {
-                    pid: 42,
-                    command: "node index.js".to_string(),
+                event: EventKind::ContainerStop {
+                    container_id: "abc123".to_string(),
+                    exit_code: Some(0),
                 },
             },
         ];
@@ -832,8 +787,7 @@ mod tests {
 
         let policy = std::fs::read_to_string(&policy_path).unwrap();
         assert!(policy.contains(r#"action == Action::"http:GET""#));
-        assert!(!policy.contains("fs:"));
-        assert!(!policy.contains("proc:"));
+        assert_eq!(policy.matches("permit(").count(), 1);
 
         crate::policy::PolicyEngine::load(&policy_path, Some(&schema_path))
             .expect("generated policy should load under the runtime guard");
@@ -909,13 +863,10 @@ mod tests {
             schema.contains(r#"action "http:POST""#),
             "schema should declare http:POST: {schema}"
         );
-        assert!(
-            !schema.contains("fs:"),
-            "schema should not declare fs actions: {schema}"
-        );
-        assert!(
-            !schema.contains("proc:"),
-            "schema should not declare proc actions: {schema}"
+        assert_eq!(
+            schema.matches("action \"").count(),
+            2,
+            "schema should declare only the observed HTTP actions: {schema}"
         );
     }
 
@@ -1143,20 +1094,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fs_only_observations_do_not_emit_schema() {
-        let dir = tempfile::tempdir().unwrap();
-        let events = vec![make_fs_event("/workspace/src/main.rs", "read")];
-        let obs_path = write_observations(&dir, &events);
-        let policy_path = dir.path().join("policy.cedar");
-        let schema_path = dir.path().join("policy.cedarschema");
-
-        let wildcard_count = generate(&obs_path, &policy_path, &schema_path).unwrap();
-        assert_eq!(wildcard_count, 0);
-        assert!(!policy_path.exists());
-        assert!(!schema_path.exists());
-    }
-
     // -- E2E roundtrip test ---------------------------------------------------
 
     #[test]
@@ -1235,7 +1172,6 @@ mod tests {
                 "/repos/org/550e8400-e29b-41d4-a716-446655440000/issues",
             ),
             make_network_event("POST", "api.github.com", "/repos/org/repo/issues"),
-            make_fs_event("/workspace/src/main.rs", "read"),
         ];
         let obs_path = write_observations(&dir, &events);
         let policy_path = dir.path().join("policy.cedar");

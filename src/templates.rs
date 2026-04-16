@@ -122,6 +122,14 @@ mod tests {
     use cedar_policy::{PolicySet, Schema, ValidationMode, Validator};
     use std::str::FromStr;
 
+    fn policy_actions(policy: &str) -> Vec<&str> {
+        policy
+            .split("Action::\"")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap())
+            .collect()
+    }
+
     fn engine_from_policy(policy: &str) -> crate::policy::PolicyEngine {
         crate::policy::PolicyEngine::from_text(policy, None, None).unwrap()
     }
@@ -161,6 +169,20 @@ mod tests {
                     .validation_errors()
                     .map(|e| e.to_string())
                     .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn all_templates_only_use_http_actions() {
+        for t in TEMPLATES {
+            let actions = policy_actions(t.policy);
+            assert!(!actions.is_empty(), "template {} has no actions", t.name);
+            assert!(
+                actions.iter().all(|action| action.starts_with("http:")),
+                "template {} contains non-HTTP actions: {:?}",
+                t.name,
+                actions
             );
         }
     }

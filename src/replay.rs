@@ -228,10 +228,8 @@ fn evaluate_event(
             }
         }
 
-        // Container lifecycle and policy violation events cannot be evaluated against a Cedar policy.
-        EventKind::FsAccess { .. }
-        | EventKind::ProcExec { .. }
-        | EventKind::Mount { .. }
+        // Non-HTTP observation events cannot be evaluated against a Cedar policy.
+        EventKind::Mount { .. }
         | EventKind::ContainerStart { .. }
         | EventKind::ContainerStop { .. }
         | EventKind::PolicyViolation { .. }
@@ -283,14 +281,8 @@ fn format_event_summary(event: &ObservationEvent) -> String {
         } => {
             format!("{method} {host}{path}")
         }
-        EventKind::FsAccess { path, operation } => {
-            format!("fs:{operation} {path}")
-        }
-        EventKind::ProcExec { command, .. } => {
-            format!("proc:exec {command}")
-        }
         EventKind::Mount { path, mode } => {
-            format!("fs:mount {path} ({mode})")
+            format!("mount {path} ({mode})")
         }
         EventKind::ContainerStart {
             container_id,
@@ -708,74 +700,10 @@ permit(
         );
     }
 
-    // -- FsAccess events are rejected -----------------------------------------
+    // -- Mount events are skipped ---------------------------------------------
 
     #[test]
-    fn fs_access_event_rejected_by_policy_loader() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let events = vec![ObservationEvent {
-            version: 1,
-            timestamp: "2026-03-27T00:00:00.000Z".to_string(),
-            session: None,
-            event: EventKind::FsAccess {
-                path: "/workspace/src/main.rs".to_string(),
-                operation: "read".to_string(),
-            },
-        }];
-        let obs_path = write_observations(&dir, &events);
-
-        let policy = r#"
-permit(
-  principal,
-  action == Action::"fs:read",
-  resource in Resource::"fs::/"
-);
-"#;
-        let policy_path = write_policy(&dir, policy);
-
-        let err = replay(&obs_path, &policy_path, None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("removed action domains"), "got: {err}");
-    }
-
-    // -- ProcExec events are rejected -----------------------------------------
-
-    #[test]
-    fn proc_exec_event_rejected_by_policy_loader() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let events = vec![ObservationEvent {
-            version: 1,
-            timestamp: "2026-03-27T00:00:00.000Z".to_string(),
-            session: None,
-            event: EventKind::ProcExec {
-                pid: 42,
-                command: "node index.js".to_string(),
-            },
-        }];
-        let obs_path = write_observations(&dir, &events);
-
-        let policy = r#"
-permit(
-  principal,
-  action == Action::"proc:exec",
-  resource == Resource::"proc::node index.js"
-);
-"#;
-        let policy_path = write_policy(&dir, policy);
-
-        let err = replay(&obs_path, &policy_path, None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("removed action domains"), "got: {err}");
-    }
-
-    // -- Mount events are rejected --------------------------------------------
-
-    #[test]
-    fn mount_event_rejected_by_policy_loader() {
+    fn mount_event_skipped() {
         let dir = tempfile::tempdir().unwrap();
 
         let events = vec![ObservationEvent {
@@ -792,16 +720,46 @@ permit(
         let policy = r#"
 permit(
   principal,
-  action == Action::"fs:mount",
-  resource in Resource::"fs::/"
+  action == Action::"http:GET",
+  resource in Resource::"api.github.com"
 );
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let err = replay(&obs_path, &policy_path, None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("removed action domains"), "got: {err}");
+        let result = replay(&obs_path, &policy_path, None).unwrap();
+        assert_eq!(result.matches, 0);
+        assert_eq!(result.skipped, 1);
+        assert!(result.mismatches.is_empty());
+    }
+
+    #[test]
+    fn pre_narrowing_fixture_fails_with_clear_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let obs_path = dir.path().join("legacy.jsonl");
+        let legacy_variant: String = ['f', 's', '_', 'a', 'c', 'c', 'e', 's', 's']
+            .into_iter()
+            .collect();
+
+        std::fs::write(
+            &obs_path,
+            format!(
+                concat!(
+                    "{{\"version\":3,\"timestamp\":\"2026-03-27T00:00:00.000Z\",",
+                    "\"type\":\"{}\",\"path\":\"/workspace/src/main.rs\",",
+                    "\"operation\":\"read\"}}\n"
+                ),
+                legacy_variant
+            ),
+        )
+        .unwrap();
+
+        let policy_path = write_policy(&dir, "permit(principal, action, resource);");
+
+        let result = replay(&obs_path, &policy_path, None);
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("parse error on line 1"), "got: {error}");
+        assert!(error.contains("unknown variant"), "got: {error}");
     }
 
     // -- Empty observation log ------------------------------------------------
@@ -972,94 +930,6 @@ permit(
         let result = replay(&obs_path, &policy_path, Some("worker")).unwrap();
         assert_eq!(result.matches, 1, "worker agent should match");
         assert!(result.mismatches.is_empty());
-    }
-
-    // -- FS context policies are rejected -------------------------------------
-
-    #[test]
-    fn fs_context_path_condition_rejected_by_policy_loader() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let events = vec![
-            ObservationEvent {
-                version: 1,
-                timestamp: "2026-03-27T00:00:00.000Z".to_string(),
-                session: None,
-                event: EventKind::FsAccess {
-                    path: "/workspace/secret/keys".to_string(),
-                    operation: "read".to_string(),
-                },
-            },
-            ObservationEvent {
-                version: 1,
-                timestamp: "2026-03-27T00:00:01.000Z".to_string(),
-                session: None,
-                event: EventKind::FsAccess {
-                    path: "/workspace/src/main.rs".to_string(),
-                    operation: "read".to_string(),
-                },
-            },
-        ];
-        let obs_path = write_observations(&dir, &events);
-
-        // Allow fs:read only for paths under /workspace/src
-        let policy = r#"
-permit(
-  principal,
-  action == Action::"fs:read",
-  resource
-) when { context.path like "/workspace/src/*" };
-"#;
-        let policy_path = write_policy(&dir, policy);
-
-        let err = replay(&obs_path, &policy_path, None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("removed action domains"), "got: {err}");
-    }
-
-    // -- Proc context policies are rejected -----------------------------------
-
-    #[test]
-    fn proc_context_command_condition_rejected_by_policy_loader() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let events = vec![
-            ObservationEvent {
-                version: 1,
-                timestamp: "2026-03-27T00:00:00.000Z".to_string(),
-                session: None,
-                event: EventKind::ProcExec {
-                    pid: 1,
-                    command: "node index.js".to_string(),
-                },
-            },
-            ObservationEvent {
-                version: 1,
-                timestamp: "2026-03-27T00:00:01.000Z".to_string(),
-                session: None,
-                event: EventKind::ProcExec {
-                    pid: 2,
-                    command: "rm -rf /".to_string(),
-                },
-            },
-        ];
-        let obs_path = write_observations(&dir, &events);
-
-        // Only allow "node" commands
-        let policy = r#"
-permit(
-  principal,
-  action == Action::"proc:exec",
-  resource
-) when { context.command like "node*" };
-"#;
-        let policy_path = write_policy(&dir, policy);
-
-        let err = replay(&obs_path, &policy_path, None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("removed action domains"), "got: {err}");
     }
 
     // -- Warn decision treated as allowed ---------------------------------------

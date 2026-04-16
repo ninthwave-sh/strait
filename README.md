@@ -67,6 +67,35 @@ Standalone proxy mode (`strait proxy`) does **not** share this container-local g
 
 ## Quick start
 
+### First run with a devcontainer
+
+The shortest path from "I just installed strait" to "my agent runs inside the container trust boundary" is the bundled `claude-code-devcontainer` preset. It ships a working `.devcontainer/devcontainer.json`, a `strait.toml`, and a starter Cedar policy for GitHub and npm together.
+
+Apply the preset into an empty directory and launch:
+
+```bash
+strait preset list
+strait preset apply claude-code-devcontainer ./my-agent
+cd my-agent
+strait launch \
+  --devcontainer .devcontainer/devcontainer.json \
+  --config strait.toml \
+  --policy policy.cedar \
+  -- curl -fsS https://api.github.com/zen
+```
+
+Or skip the extract step and let `--preset` do the wiring for you:
+
+```bash
+strait launch --preset claude-code-devcontainer -- curl -fsS https://api.github.com/zen
+```
+
+`--preset` runs in enforce mode using the preset's starter policy. If you want to edit the policy, pick a different mode (`--observe` / `--warn`), or run the same files from a directory you own, use `strait preset apply` first.
+
+Startup prints an onboarding block that names the container trust boundary, explains that blocked requests are held open as live decisions, and tells you where the session-local CA lives (`/strait/ca.pem`, removed on exit). No machine-wide CA install happens at any point.
+
+For the full walkthrough -- running the control service, attaching the desktop shell, approving a blocked request, and confirming persistence in a second session -- see [`examples/claude-code-devcontainer/README.md`](examples/claude-code-devcontainer/README.md).
+
 ### Launch an interactive session
 
 ```bash
@@ -309,11 +338,14 @@ This mode shares the same session publication and watch surfaces as the primary 
 
 - [Devcontainer comparison](docs/devcontainer.md) - where strait fits relative to the devcontainer spec and Claude Code's `init-firewall.sh` setup
 - [Devcontainer strategy](docs/designs/devcontainer-strategy.md) - architecture rationale for the network-only devcontainer framing
+- [Claude Code devcontainer dogfood](examples/claude-code-devcontainer/README.md) - phase-1 first-run path: devcontainer.json + strait.toml + policy.cedar bundled as the `claude-code-devcontainer` preset
 - [Claude Code example](examples/claude-code/README.md) - run Claude Code inside a strait-managed container
 
 ## Policy tooling
 
 ```bash
+strait preset list                                 # list built-in launch presets
+strait preset apply claude-code-devcontainer <dir>  # extract a preset's files into <dir>
 strait template list                              # list built-in starter policies
 strait template apply github-org-readonly          # apply a template
 strait session list                                # list active Strait sessions

@@ -1,0 +1,9 @@
+{
+  "name": "Claude Code (strait)",
+  "image": "ubuntu:24.04",
+  "remoteUser": "root",
+  "containerEnv": {
+    "STRAIT_EXAMPLE": "claude-code-devcontainer"
+  },
+  "workspaceFolder": "/workspace"
+}

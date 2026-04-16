@@ -12,6 +12,7 @@ use strait::control::{self, ControlServiceOptions, ManagedSessionOptions, TcpTls
 use strait::credentials::CredentialStore;
 use strait::generate;
 use strait::observe::ObservationStream;
+use strait::presets;
 use strait::templates;
 use strait::watch;
 
@@ -51,6 +52,21 @@ enum TemplateAction {
         /// If omitted, both files are printed to stdout.
         #[arg(long, value_name = "DIR")]
         output_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PresetAction {
+    /// List built-in launch presets.
+    List,
+    /// Apply a preset -- write devcontainer.json + strait.toml + policy.cedar.
+    Apply {
+        /// Preset name (e.g. "claude-code-devcontainer").
+        name: String,
+
+        /// Output directory for the generated files.
+        #[arg(value_name = "DIR")]
+        output_dir: PathBuf,
     },
 }
 
@@ -307,6 +323,16 @@ TLS TRUST:
         action: TemplateAction,
     },
 
+    /// Manage built-in launch presets.
+    ///
+    /// A preset bundles a devcontainer.json, a strait.toml, and a Cedar
+    /// policy for a supported first-run flow. List available presets or
+    /// apply one to an output directory and launch from there.
+    Preset {
+        #[command(subcommand)]
+        action: PresetAction,
+    },
+
     /// Manage running strait sessions over the local control API.
     #[command(after_help = "\
 LIVE POLICY UPDATES:
@@ -335,7 +361,7 @@ LIVE POLICY UPDATES:
     /// Network traffic routes through the built-in proxy. Filesystem access is
     /// controlled via bind-mount restrictions derived from Cedar `fs:` policies.
     #[command(
-        group(ArgGroup::new("mode").required(true).args(["observe", "warn", "policy"])),
+        group(ArgGroup::new("mode").required(true).args(["observe", "warn", "policy", "preset"])),
         after_help = "\
 SESSION MANAGEMENT:
   strait launch prints a session ID once the session is ready.
@@ -344,7 +370,13 @@ SESSION MANAGEMENT:
 
 LIVE POLICY UPDATES:
   Live updates apply to network policy only.
-  Filesystem or process policy changes require relaunch."
+  Filesystem or process policy changes require relaunch.
+
+PRESETS:
+  `--preset <name>` bundles a devcontainer.json, a strait.toml, and a
+  starter Cedar policy. It runs in enforce mode using the preset's
+  policy; use `strait preset apply` if you want to run `--observe` or
+  customize the files before launch."
     )]
     Launch {
         /// Run in observation mode: allow all activity, record to JSONL.
@@ -383,8 +415,24 @@ LIVE POLICY UPDATES:
         image: Option<String>,
 
         /// Path to a devcontainer.json file to drive the launch environment.
-        #[arg(long, value_name = "FILE", conflicts_with = "image", value_parser = parse_devcontainer_arg)]
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["image", "preset"], value_parser = parse_devcontainer_arg)]
         devcontainer: Option<PathBuf>,
+
+        /// Launch with a built-in preset's bundled devcontainer, config, and policy.
+        ///
+        /// Selects a named preset (see `strait preset list`), extracts
+        /// its files into a cached location on first use, and launches
+        /// in enforce mode with the preset's starter Cedar policy. Not
+        /// compatible with `--image`, `--devcontainer`, `--config`,
+        /// `--policy`, `--warn`, or `--observe`: use
+        /// `strait preset apply` if you want to edit the files or pick
+        /// a different mode before launch.
+        #[arg(
+            long,
+            value_name = "NAME",
+            conflicts_with_all = ["image", "devcontainer", "config"]
+        )]
+        preset: Option<String>,
 
         /// Output path for the observation JSONL file.
         #[arg(long, default_value = "observations.jsonl")]
@@ -479,6 +527,30 @@ fn parse_devcontainer_arg(raw: &str) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
+/// Resolve a `--preset <name>` flag into an on-disk `PresetLayout`.
+///
+/// Materializes the preset's files into a per-user cache directory so
+/// that the same launch command run twice in a row reuses the same
+/// paths. Uses `$XDG_CACHE_HOME` when set, falls back to `$HOME/.cache`
+/// on unix-like systems, and finally to the system temp directory.
+///
+/// The extraction is idempotent -- files are overwritten on every call
+/// -- so operators can safely re-run with the same preset after a
+/// binary upgrade ships new preset contents.
+fn resolve_preset_layout(name: &str) -> anyhow::Result<presets::PresetLayout> {
+    let preset = presets::find(name).ok_or_else(|| presets::unknown_preset_error(name))?;
+    let cache_dir = preset_cache_dir(preset.name);
+    preset.apply_to(&cache_dir)
+}
+
+fn preset_cache_dir(preset_name: &str) -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("strait").join("presets").join(preset_name)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     strait::ensure_rustls_crypto_provider();
@@ -502,6 +574,14 @@ async fn main() -> anyhow::Result<()> {
             }
             TemplateAction::Apply { name, output_dir } => {
                 templates::apply(&name, output_dir.as_deref())?;
+            }
+        },
+        Commands::Preset { action } => match action {
+            PresetAction::List => {
+                presets::print_list();
+            }
+            PresetAction::Apply { name, output_dir } => {
+                presets::apply(&name, &output_dir)?;
             }
         },
         Commands::Test {
@@ -534,6 +614,7 @@ async fn main() -> anyhow::Result<()> {
             config,
             image,
             devcontainer,
+            preset,
             output,
             no_tty,
             env,
@@ -541,6 +622,23 @@ async fn main() -> anyhow::Result<()> {
             command,
         } => {
             init_tracing();
+
+            // When `--preset <name>` is used, extract the preset's
+            // files to a cached location and substitute them for
+            // `--devcontainer`, `--config`, and `--policy`. The clap
+            // ArgGroup + conflicts_with rules already guarantee that
+            // `--preset` is the only source of those inputs in this
+            // branch.
+            let (devcontainer, config, policy) = if let Some(preset_name) = preset.as_deref() {
+                let layout = resolve_preset_layout(preset_name)?;
+                (
+                    Some(layout.devcontainer_path),
+                    Some(layout.config_path),
+                    Some(layout.policy_path),
+                )
+            } else {
+                (devcontainer, config, policy)
+            };
 
             // Load credential store and MITM hosts from config if provided.
             let (credential_store, mitm_hosts) = if let Some(ref config_path) = config {
@@ -567,6 +665,17 @@ async fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .map(|path| strait::config::parse_devcontainer(path))
                 .transpose()?;
+
+            // Emit the devcontainer onboarding block at startup when
+            // the operator picked a devcontainer launch path (either
+            // directly or via a preset). This is the first place a new
+            // user learns what the container trust boundary does and
+            // how to unblock a request from the control plane.
+            if devcontainer_config.is_some() {
+                for line in presets::devcontainer_onboarding_lines() {
+                    eprintln!("{line}");
+                }
+            }
 
             // clap's ArgGroup "mode" guarantees exactly one of these is set.
             let tty = !no_tty;
@@ -2151,5 +2260,207 @@ mod tests {
             }
             _ => panic!("expected Launch subcommand"),
         }
+    }
+
+    #[test]
+    fn test_preset_list_subcommand_parses() {
+        let cli = Cli::try_parse_from(["strait", "preset", "list"]).unwrap();
+        match cli.command {
+            Commands::Preset { action } => match action {
+                PresetAction::List => {}
+                PresetAction::Apply { .. } => panic!("expected PresetAction::List"),
+            },
+            _ => panic!("expected Preset subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_preset_apply_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "preset",
+            "apply",
+            "claude-code-devcontainer",
+            "./my-agent",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Preset { action } => match action {
+                PresetAction::Apply { name, output_dir } => {
+                    assert_eq!(name, "claude-code-devcontainer");
+                    assert_eq!(output_dir.to_str().unwrap(), "./my-agent");
+                }
+                PresetAction::List => panic!("expected PresetAction::Apply"),
+            },
+            _ => panic!("expected Preset subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_preset_apply_requires_name_and_output_dir() {
+        assert!(Cli::try_parse_from(["strait", "preset", "apply"]).is_err());
+        assert!(
+            Cli::try_parse_from(["strait", "preset", "apply", "claude-code-devcontainer"]).is_err()
+        );
+    }
+
+    #[test]
+    fn test_launch_preset_flag_parses_as_mode() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--preset",
+            "claude-code-devcontainer",
+            "echo",
+            "hello",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Launch {
+                preset,
+                observe,
+                warn,
+                policy,
+                command,
+                ..
+            } => {
+                assert_eq!(preset.as_deref(), Some("claude-code-devcontainer"));
+                assert!(!observe, "--preset should not set --observe");
+                assert!(warn.is_none(), "--preset should not set --warn");
+                assert!(policy.is_none(), "--preset should not set --policy");
+                assert_eq!(command, vec!["echo", "hello"]);
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_preset_conflicts_with_observe() {
+        let result = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--preset",
+            "claude-code-devcontainer",
+            "--observe",
+            "echo",
+            "hello",
+        ]);
+        assert!(result.is_err(), "--preset and --observe should conflict");
+    }
+
+    #[test]
+    fn test_launch_preset_conflicts_with_policy() {
+        let result = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--preset",
+            "claude-code-devcontainer",
+            "--policy",
+            "policy.cedar",
+            "echo",
+            "hello",
+        ]);
+        assert!(result.is_err(), "--preset and --policy should conflict");
+    }
+
+    #[test]
+    fn test_launch_preset_conflicts_with_devcontainer() {
+        let (_temp_dir, path) = write_devcontainer(
+            r#"
+            {
+              image: "ubuntu:24.04"
+            }
+            "#,
+        );
+        let result = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--preset",
+            "claude-code-devcontainer",
+            "--devcontainer",
+            path.to_str().unwrap(),
+            "echo",
+            "hello",
+        ]);
+        assert!(
+            result.is_err(),
+            "--preset and --devcontainer should conflict"
+        );
+    }
+
+    #[test]
+    fn test_launch_preset_conflicts_with_config() {
+        let result = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--preset",
+            "claude-code-devcontainer",
+            "--config",
+            "strait.toml",
+            "echo",
+            "hello",
+        ]);
+        assert!(result.is_err(), "--preset and --config should conflict");
+    }
+
+    #[test]
+    fn test_launch_preset_conflicts_with_image() {
+        let result = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--preset",
+            "claude-code-devcontainer",
+            "--image",
+            "ubuntu:24.04",
+            "echo",
+            "hello",
+        ]);
+        assert!(result.is_err(), "--preset and --image should conflict");
+    }
+
+    #[test]
+    fn test_resolve_preset_layout_materializes_cache() {
+        // Point the cache at a scratch directory so the test does not
+        // touch the user's real cache. XDG_CACHE_HOME wins over HOME.
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", tmp.path());
+
+        let layout = resolve_preset_layout("claude-code-devcontainer").unwrap();
+        assert!(layout.devcontainer_path.exists());
+        assert!(layout.config_path.exists());
+        assert!(layout.policy_path.exists());
+        assert!(layout.readme_path.exists());
+        assert!(
+            layout
+                .root
+                .starts_with(tmp.path().join("strait").join("presets")),
+            "preset cache should live under XDG_CACHE_HOME, got {}",
+            layout.root.display()
+        );
+
+        match prev {
+            Some(value) => std::env::set_var("XDG_CACHE_HOME", value),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_preset_layout_unknown_preset_errors() {
+        let err = resolve_preset_layout("does-not-exist").unwrap_err();
+        assert!(err.to_string().contains("unknown preset"));
+    }
+
+    #[test]
+    fn test_launch_help_mentions_preset_flag() {
+        let mut cmd = Cli::command();
+        let launch = cmd
+            .find_subcommand_mut("launch")
+            .expect("launch subcommand exists");
+        let help = render_help(launch);
+        assert!(
+            help.contains("--preset"),
+            "launch --help should document the --preset flag: {help}"
+        );
     }
 }

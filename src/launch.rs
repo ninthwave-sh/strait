@@ -36,7 +36,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
+use bollard::image::BuildImageOptions;
 use futures_util::StreamExt;
+use hyper::body::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -49,8 +51,8 @@ use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
 use crate::config::{
     persist_policy_exception, reload_policy, replace_policy, DevcontainerBuildConfig,
-    DevcontainerCommand, DevcontainerCommandStep, DevcontainerConfig, LivePolicyBounds,
-    PolicyConfig, PolicyMutationOutcome, ProxyContext,
+    DevcontainerCommand, DevcontainerCommandStep, DevcontainerConfig, DevcontainerMount,
+    DevcontainerMountObject, LivePolicyBounds, PolicyConfig, PolicyMutationOutcome, ProxyContext,
 };
 use crate::container::{
     container_trust_diagnostic_lines, ContainerManager, ContainerRuntimeOptions,
@@ -1686,71 +1688,154 @@ fn replace_devcontainer_vars(input: &str, workspace: &Path) -> String {
         .replace("${localWorkspaceFolderBasename}", &basename)
 }
 
+fn unsupported_devcontainer_mount(raw: &str, detail: &str) -> anyhow::Error {
+    anyhow::anyhow!("devcontainer mount is not supported yet: {raw} ({detail})")
+}
+
+fn resolve_devcontainer_bind_source(source: &str, workspace: &Path) -> String {
+    let source_path = Path::new(source);
+    let resolved = if source_path.is_absolute() {
+        source_path.to_path_buf()
+    } else {
+        workspace.join(source_path)
+    };
+    resolved.to_string_lossy().to_string()
+}
+
+fn resolve_string_devcontainer_mount(
+    raw: &str,
+    workspace: &Path,
+) -> anyhow::Result<ResolvedDevcontainerMount> {
+    let mut source = None;
+    let mut target = None;
+    let mut mount_type = "bind".to_string();
+    let mut readonly = false;
+    let mut unsupported_options = Vec::new();
+
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part.eq_ignore_ascii_case("readonly") || part.eq_ignore_ascii_case("ro") {
+            readonly = true;
+            continue;
+        }
+
+        let Some((key, value)) = part.split_once('=') else {
+            anyhow::bail!("invalid devcontainer mount entry: {raw}");
+        };
+        let key = key.trim();
+        let value = replace_devcontainer_vars(value.trim(), workspace);
+        match key {
+            "source" | "src" => source = Some(value),
+            "target" | "dst" | "destination" => target = Some(value),
+            "type" => mount_type = value,
+            "readonly" => readonly = value.eq_ignore_ascii_case("true"),
+            "consistency" => unsupported_options.push("consistency".to_string()),
+            other => unsupported_options.push(other.to_string()),
+        }
+    }
+
+    if mount_type != "bind" {
+        return Err(unsupported_devcontainer_mount(
+            raw,
+            &format!("unsupported mount type: {mount_type}"),
+        ));
+    }
+    if !unsupported_options.is_empty() {
+        return Err(unsupported_devcontainer_mount(
+            raw,
+            &format!("unsupported options: {}", unsupported_options.join(", ")),
+        ));
+    }
+
+    let source = source.with_context(|| format!("devcontainer mount is missing source: {raw}"))?;
+    let target = target.with_context(|| format!("devcontainer mount is missing target: {raw}"))?;
+    if !target.starts_with('/') {
+        anyhow::bail!("devcontainer mount target must be absolute: {target}");
+    }
+
+    Ok(ResolvedDevcontainerMount {
+        source: resolve_devcontainer_bind_source(&source, workspace),
+        target,
+        mode: if readonly {
+            "ro".to_string()
+        } else {
+            "rw".to_string()
+        },
+        mount_type,
+        raw: raw.to_string(),
+    })
+}
+
+fn resolve_object_devcontainer_mount(
+    mount: &DevcontainerMountObject,
+    workspace: &Path,
+) -> anyhow::Result<ResolvedDevcontainerMount> {
+    let mount_type = mount
+        .mount_type
+        .clone()
+        .unwrap_or_else(|| "bind".to_string());
+    if mount_type != "bind" {
+        return Err(unsupported_devcontainer_mount(
+            &mount.raw,
+            &format!("unsupported mount type: {mount_type}"),
+        ));
+    }
+
+    let mut unsupported_options = mount.unsupported_keys.clone();
+    if mount.consistency.is_some() {
+        unsupported_options.push("consistency".to_string());
+    }
+    if !unsupported_options.is_empty() {
+        return Err(unsupported_devcontainer_mount(
+            &mount.raw,
+            &format!("unsupported options: {}", unsupported_options.join(", ")),
+        ));
+    }
+
+    let source = mount
+        .source
+        .clone()
+        .with_context(|| format!("devcontainer mount is missing source: {}", mount.raw))?;
+    let target = mount
+        .target
+        .clone()
+        .with_context(|| format!("devcontainer mount is missing target: {}", mount.raw))?;
+    let target = replace_devcontainer_vars(&target, workspace);
+    if !target.starts_with('/') {
+        anyhow::bail!("devcontainer mount target must be absolute: {target}");
+    }
+
+    Ok(ResolvedDevcontainerMount {
+        source: resolve_devcontainer_bind_source(
+            &replace_devcontainer_vars(&source, workspace),
+            workspace,
+        ),
+        target,
+        mode: if mount.readonly {
+            "ro".to_string()
+        } else {
+            "rw".to_string()
+        },
+        mount_type,
+        raw: mount.raw.clone(),
+    })
+}
+
 fn resolve_devcontainer_mounts(
-    specs: &[String],
+    specs: &[DevcontainerMount],
     workspace: &Path,
 ) -> anyhow::Result<Vec<ResolvedDevcontainerMount>> {
     let mut mounts = Vec::with_capacity(specs.len());
 
-    for raw in specs {
-        let mut source = None;
-        let mut target = None;
-        let mut mount_type = "bind".to_string();
-        let mut readonly = false;
-
-        for part in raw.split(',') {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
+    for spec in specs {
+        mounts.push(match spec {
+            DevcontainerMount::String(raw) => resolve_string_devcontainer_mount(raw, workspace)?,
+            DevcontainerMount::Object(mount) => {
+                resolve_object_devcontainer_mount(mount, workspace)?
             }
-            if part.eq_ignore_ascii_case("readonly") || part.eq_ignore_ascii_case("ro") {
-                readonly = true;
-                continue;
-            }
-
-            let Some((key, value)) = part.split_once('=') else {
-                anyhow::bail!("invalid devcontainer mount entry: {raw}");
-            };
-            let value = replace_devcontainer_vars(value.trim(), workspace);
-            match key.trim() {
-                "source" | "src" => source = Some(value),
-                "target" | "dst" | "destination" => target = Some(value),
-                "type" => mount_type = value,
-                "readonly" => readonly = value.eq_ignore_ascii_case("true"),
-                _ => {}
-            }
-        }
-
-        let source =
-            source.with_context(|| format!("devcontainer mount is missing source: {raw}"))?;
-        let target =
-            target.with_context(|| format!("devcontainer mount is missing target: {raw}"))?;
-        if !target.starts_with('/') {
-            anyhow::bail!("devcontainer mount target must be absolute: {target}");
-        }
-
-        let source = if mount_type == "bind" {
-            let source_path = Path::new(&source);
-            let resolved = if source_path.is_absolute() {
-                source_path.to_path_buf()
-            } else {
-                workspace.join(source_path)
-            };
-            resolved.to_string_lossy().to_string()
-        } else {
-            source
-        };
-
-        mounts.push(ResolvedDevcontainerMount {
-            source,
-            target,
-            mode: if readonly {
-                "ro".to_string()
-            } else {
-                "rw".to_string()
-            },
-            mount_type,
-            raw: raw.clone(),
         });
     }
 
@@ -1788,6 +1873,31 @@ async fn resolve_launch_image(
         .unwrap_or_else(|| DEFAULT_IMAGE.to_string()))
 }
 
+fn dockerfile_path_in_context(context: &Path, dockerfile: &Path) -> anyhow::Result<String> {
+    let relative = dockerfile.strip_prefix(context).with_context(|| {
+        format!(
+            "devcontainer Dockerfile must be inside the build context when using the runtime API: {} is not under {}",
+            dockerfile.display(),
+            context.display()
+        )
+    })?;
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn archive_build_context(context: &Path) -> anyhow::Result<Bytes> {
+    let mut archive = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut archive);
+        builder
+            .append_dir_all(".", context)
+            .with_context(|| format!("failed to archive build context: {}", context.display()))?;
+        builder
+            .finish()
+            .context("failed to finalize build context archive")?;
+    }
+    Ok(Bytes::from(archive))
+}
+
 async fn build_devcontainer_image(
     build: &DevcontainerBuildConfig,
     image_tag: Option<&str>,
@@ -1809,30 +1919,34 @@ async fn build_devcontainer_image(
         context.display()
     );
 
-    let output = tokio::process::Command::new("docker")
-        .arg("build")
-        .arg("--file")
-        .arg(&build.dockerfile)
-        .arg("--tag")
-        .arg(&tag)
-        .arg(&context)
-        .output()
-        .await
-        .context("failed to run docker build for devcontainer image")?;
+    let dockerfile = dockerfile_path_in_context(&context, &build.dockerfile)?;
+    let archive = archive_build_context(&context)?;
+    let docker = ContainerManager::new()?.docker().clone();
+    let options = BuildImageOptions::<String> {
+        dockerfile,
+        t: tag.clone(),
+        pull: true,
+        rm: true,
+        forcerm: true,
+        ..Default::default()
+    };
 
-    if !output.stdout.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stdout));
-    }
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "docker build failed for devcontainer image '{}' with status {}",
-            tag,
-            output.status
-        );
+    let mut stream = docker.build_image(options, None, Some(archive));
+    while let Some(result) = stream.next().await {
+        let chunk = result.context("failed to build devcontainer image via runtime API")?;
+        if let Some(stream) = chunk.stream {
+            eprint!("{stream}");
+        }
+        if let Some(status) = chunk.status {
+            if let Some(progress) = chunk.progress {
+                eprintln!("{status} {progress}");
+            } else {
+                eprintln!("{status}");
+            }
+        }
+        if let Some(error) = chunk.error {
+            anyhow::bail!("devcontainer image build failed: {error}");
+        }
     }
 
     Ok(tag)
@@ -5373,5 +5487,66 @@ forbid(principal, action, resource);
     fn parse_mount_empty_vec() {
         let mounts = parse_extra_mounts(&[]).unwrap();
         assert!(mounts.is_empty());
+    }
+
+    #[test]
+    fn resolve_devcontainer_mounts_accepts_object_form_bind_mounts() {
+        let mounts = resolve_devcontainer_mounts(
+            &[DevcontainerMount::Object(DevcontainerMountObject {
+                source: Some("cache".to_string()),
+                target: Some("/mnt/cache".to_string()),
+                mount_type: Some("bind".to_string()),
+                readonly: true,
+                consistency: None,
+                unsupported_keys: Vec::new(),
+                raw: r#"{"source":"cache","target":"/mnt/cache","type":"bind","readonly":true}"#
+                    .to_string(),
+            })],
+            Path::new("/workspace"),
+        )
+        .unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].to_bind_string(), "/workspace/cache:/mnt/cache:ro");
+    }
+
+    #[test]
+    fn resolve_devcontainer_mounts_rejects_unsupported_mount_types() {
+        let err = resolve_devcontainer_mounts(
+            &[DevcontainerMount::Object(DevcontainerMountObject {
+                source: Some("dind-var-lib-docker".to_string()),
+                target: Some("/var/lib/docker".to_string()),
+                mount_type: Some("volume".to_string()),
+                readonly: false,
+                consistency: None,
+                unsupported_keys: Vec::new(),
+                raw:
+                    r#"{"source":"dind-var-lib-docker","target":"/var/lib/docker","type":"volume"}"#
+                        .to_string(),
+            })],
+            Path::new("/workspace"),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("unsupported mount type: volume"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_devcontainer_mounts_rejects_unhandled_mount_options() {
+        let err = resolve_devcontainer_mounts(
+            &[DevcontainerMount::String(
+                "source=/tmp,target=/mnt,type=bind,consistency=cached".to_string(),
+            )],
+            Path::new("/workspace"),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("unsupported options: consistency"),
+            "got: {err}"
+        );
     }
 }

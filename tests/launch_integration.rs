@@ -494,8 +494,8 @@ RUN printf 'built\n' >/image-built
   containerEnv: {{
     FEATURE_FLAG: "devcontainer"
   }},
-  onCreateCommand: "test -n \"$SSL_CERT_FILE\" && test -f \"$SSL_CERT_FILE\" && printf 'onCreate\\n' >> /workspaces/demo/lifecycle.log",
-  postCreateCommand: ["sh", "-lc", "test -n \"$SSL_CERT_FILE\" && test -f \"$SSL_CERT_FILE\" && printf 'postCreate\\n' >> /workspaces/demo/lifecycle.log"]
+  onCreateCommand: "test -n \"$SSL_CERT_FILE\" && test -f \"$SSL_CERT_FILE\" && echo onCreate >> /workspaces/demo/lifecycle.log",
+  postCreateCommand: ["sh", "-lc", "test -n \"$SSL_CERT_FILE\" && test -f \"$SSL_CERT_FILE\" && echo postCreate >> /workspaces/demo/lifecycle.log"]
 }}"#,
             declared = declared_dir.display(),
         ),

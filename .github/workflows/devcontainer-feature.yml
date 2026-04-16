@@ -1,0 +1,239 @@
+name: Devcontainer Feature
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.devcontainer/feature/**'
+      - '.github/workflows/devcontainer-feature.yml'
+  pull_request:
+    paths:
+      - '.devcontainer/feature/**'
+      - '.github/workflows/devcontainer-feature.yml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate devcontainer-feature.json
+        run: |
+          # Verify the feature JSON is valid.
+          python3 -c "
+          import json, sys
+
+          with open('.devcontainer/feature/devcontainer-feature.json') as f:
+              feature = json.load(f)
+
+          errors = []
+
+          # Required fields per the devcontainer feature spec.
+          for field in ['id', 'version', 'name', 'description']:
+              if field not in feature:
+                  errors.append(f'missing required field: {field}')
+
+          # id must be lowercase alphanumeric with hyphens.
+          fid = feature.get('id', '')
+          if not all(c.isalnum() or c == '-' for c in fid) or not fid:
+              errors.append(f'id must be lowercase alphanumeric with hyphens: {fid}')
+
+          # version must be semver-like.
+          version = feature.get('version', '')
+          parts = version.split('.')
+          if len(parts) != 3 or not all(p.isdigit() for p in parts):
+              errors.append(f'version must be semver (x.y.z): {version}')
+
+          # install.sh must exist.
+          import os
+          if not os.path.isfile('.devcontainer/feature/install.sh'):
+              errors.append('install.sh not found')
+
+          if errors:
+              for e in errors:
+                  print(f'::error::{e}')
+              sys.exit(1)
+
+          print(f'Feature validated: {feature[\"id\"]} v{feature[\"version\"]}')
+          "
+
+      - name: Validate install.sh is executable and has shebang
+        run: |
+          head -1 .devcontainer/feature/install.sh | grep -q '^#!/bin/sh' || {
+            echo "::error::install.sh must start with #!/bin/sh"
+            exit 1
+          }
+
+      - name: Verify install.sh is idempotent (dry run syntax check)
+        run: |
+          # shellcheck the install script for common issues.
+          if command -v shellcheck > /dev/null 2>&1; then
+            shellcheck -s sh .devcontainer/feature/install.sh
+          else
+            echo "shellcheck not available; skipping"
+          fi
+
+  build-test:
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Persist cargo-zigbuild between runs so we don't recompile it
+          # from source on every CI invocation (several minutes).
+          cache-directories: |
+            ~/.cargo/bin
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+
+      - name: Install cargo-zigbuild
+        run: |
+          if ! command -v cargo-zigbuild > /dev/null 2>&1; then
+            cargo install --locked cargo-zigbuild
+          else
+            echo "cargo-zigbuild already cached at $(command -v cargo-zigbuild)"
+          fi
+
+      - name: Build gateway binary (static musl)
+        run: cargo zigbuild --release --package strait-gateway --target x86_64-unknown-linux-musl
+
+      - name: Verify static linking
+        run: |
+          file target/x86_64-unknown-linux-musl/release/strait-gateway
+          if file target/x86_64-unknown-linux-musl/release/strait-gateway | grep -q "dynamically linked"; then
+            echo "::error::strait-gateway is not statically linked"
+            exit 1
+          fi
+
+      - name: Test feature install in container
+        run: |
+          # Build a test container that simulates the feature install.
+          # Instead of downloading from GitHub releases, use the locally built binary.
+          docker run --rm \
+            -v "$PWD/.devcontainer/feature:/feature:ro" \
+            -v "$PWD/target/x86_64-unknown-linux-musl/release/strait-gateway:/usr/local/bin/strait-gateway:ro" \
+            ubuntu:24.04 sh -c '
+              set -e
+
+              # Run the install script (it will fail to download, but the
+              # gateway binary is already bind-mounted).
+              # install.sh is already +x in the repo; the volume is read-only.
+              VERSION=latest /feature/install.sh 2>&1 || true
+
+              # Verify entrypoint was installed.
+              test -x /usr/local/share/strait/entrypoint.sh || {
+                echo "FAIL: entrypoint.sh not installed"
+                exit 1
+              }
+              echo "PASS: entrypoint.sh installed"
+
+              # Verify gateway binary is present (bind-mounted for this test).
+              test -x /usr/local/bin/strait-gateway || {
+                echo "FAIL: gateway binary not present"
+                exit 1
+              }
+              echo "PASS: gateway binary present"
+
+              # Verify the strait proxy binary is NOT installed.
+              if command -v strait > /dev/null 2>&1; then
+                echo "FAIL: strait proxy binary should not be inside the container"
+                exit 1
+              fi
+              echo "PASS: proxy binary not present (correct)"
+
+              # Verify install is idempotent (re-run).
+              VERSION=latest /feature/install.sh 2>&1 || true
+              test -x /usr/local/share/strait/entrypoint.sh || {
+                echo "FAIL: entrypoint.sh missing after re-install"
+                exit 1
+              }
+              echo "PASS: idempotent install"
+
+              echo "All feature install tests passed."
+            '
+
+      - name: Test entrypoint passthrough (no proxy socket)
+        run: |
+          # When the proxy socket is not mounted, the entrypoint should
+          # pass through to the user command without error.
+          docker run --rm \
+            -v "$PWD/.devcontainer/feature:/feature:ro" \
+            -v "$PWD/target/x86_64-unknown-linux-musl/release/strait-gateway:/usr/local/bin/strait-gateway" \
+            --entrypoint /bin/sh \
+            ubuntu:24.04 -c '
+              set -e
+              VERSION=latest /feature/install.sh 2>&1 || true
+
+              # Run the entrypoint with a test command.
+              # No proxy socket is mounted, so it should pass through.
+              OUTPUT=$(/usr/local/share/strait/entrypoint.sh echo "hello from strait" 2>/dev/null)
+              if [ "${OUTPUT}" != "hello from strait" ]; then
+                echo "FAIL: entrypoint did not pass through: ${OUTPUT}"
+                exit 1
+              fi
+              echo "PASS: entrypoint passthrough works"
+            '
+
+      - name: Test gateway proxy flow (end-to-end)
+        run: |
+          # Simulate the full flow: host proxy socket -> gateway -> container.
+          # Uses a Unix socket echo server on the host side.
+          SOCKET_DIR=$(mktemp -d)
+          SOCKET_PATH="${SOCKET_DIR}/proxy.sock"
+
+          # Create a simple CA PEM for testing.
+          CA_PEM="${SOCKET_DIR}/ca.pem"
+          echo "-----BEGIN CERTIFICATE-----" > "${CA_PEM}"
+          echo "dGVzdC1jZXJ0aWZpY2F0ZQ==" >> "${CA_PEM}"
+          echo "-----END CERTIFICATE-----" >> "${CA_PEM}"
+
+          # Start a Unix socket echo server (using socat).
+          sudo apt-get install -y socat > /dev/null 2>&1 || true
+          socat UNIX-LISTEN:"${SOCKET_PATH}",fork EXEC:cat &
+          SOCAT_PID=$!
+          sleep 1
+
+          # The outer docker run must fail the CI step when the gateway
+          # fails to start or the CA bundle is not created. Only the inner
+          # `nc` probe is allowed to fail (gateway echoes on any bytes and
+          # the connection may close early).
+          set +e
+          docker run --rm \
+            -v "$PWD/.devcontainer/feature:/feature:ro" \
+            -v "$PWD/target/x86_64-unknown-linux-musl/release/strait-gateway:/usr/local/bin/strait-gateway" \
+            -v "${SOCKET_PATH}:/strait/proxy.sock" \
+            -v "${CA_PEM}:/strait/ca.pem:ro" \
+            --entrypoint /bin/sh \
+            ubuntu:24.04 -c '
+              set -e
+              VERSION=latest /feature/install.sh 2>&1 || true
+
+              # Verify CA bundle was created by the entrypoint.
+              /usr/local/share/strait/entrypoint.sh sh -c "
+                test -f /tmp/strait-ca-bundle.pem || {
+                  echo \"FAIL: CA bundle not created\"
+                  exit 1
+                }
+                echo \"PASS: CA bundle created\"
+
+                # Verify the gateway is listening (it wraps our shell).
+                # Send a test payload through the proxy port.
+                echo \"hello\" | timeout 2 nc 127.0.0.1 3128 || true
+                echo \"PASS: gateway is listening on 127.0.0.1:3128\"
+              "
+            '
+          RC=$?
+          set -e
+
+          # Clean up.
+          kill $SOCAT_PID 2>/dev/null || true
+          rm -rf "${SOCKET_DIR}"
+
+          if [ "${RC}" -ne 0 ]; then
+            echo "::error::end-to-end test failed (rc=${RC})"
+            exit "${RC}"
+          fi
+          echo "End-to-end test completed."

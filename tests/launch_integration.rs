@@ -1245,6 +1245,10 @@ async fn launch_observe_forwards_terminal_resizes() {
             concat!(
                 "SECONDS=0; ",
                 "trap 'stty size > /test-out/resized.txt; exit 0' WINCH; ",
+                // Wait briefly for the host to propagate the initial TTY
+                // size into the container before sampling it. The scripted
+                // resize doesn't fire until 500 ms, so 200 ms is safe.
+                "sleep 0.2; ",
                 "stty size > /test-out/start.txt; ",
                 "while [ \"$SECONDS\" -lt 5 ]; do sleep 0.1; done; ",
                 "exit 99"

@@ -1,0 +1,39 @@
+{
+    "id": "strait",
+    "version": "0.1.0",
+    "name": "Strait Network Policy Gateway",
+    "description": "Installs the strait gateway binary, configures CA trust for the session-local CA, and registers with the host-side strait proxy. The proxy itself stays on the host for tamper resistance.",
+    "documentationURL": "https://github.com/ninthwave-io/strait",
+    "options": {
+        "version": {
+            "type": "string",
+            "default": "latest",
+            "description": "Version of the strait-gateway binary to install (e.g. '0.1.0' or 'latest')."
+        }
+    },
+    "containerEnv": {
+        "HTTPS_PROXY": "http://127.0.0.1:3128",
+        "HTTP_PROXY": "http://127.0.0.1:3128",
+        "https_proxy": "http://127.0.0.1:3128",
+        "http_proxy": "http://127.0.0.1:3128",
+        "SSL_CERT_FILE": "/tmp/strait-ca-bundle.pem",
+        "NODE_EXTRA_CA_CERTS": "/tmp/strait-ca-bundle.pem",
+        "REQUESTS_CA_BUNDLE": "/tmp/strait-ca-bundle.pem"
+    },
+    "mounts": [
+        {
+            "source": "${localEnv:STRAIT_PROXY_SOCKET}",
+            "target": "/strait/proxy.sock",
+            "type": "bind"
+        },
+        {
+            "source": "${localEnv:STRAIT_CA_PEM}",
+            "target": "/strait/ca.pem",
+            "type": "bind"
+        }
+    ],
+    "entrypoint": "/usr/local/share/strait/entrypoint.sh",
+    "installsAfter": [
+        "ghcr.io/devcontainers/features/common-utils"
+    ]
+}

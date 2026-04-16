@@ -1,0 +1,39 @@
+# strait.toml -- Claude Code devcontainer dogfood.
+#
+# The devcontainer image, mounts, user, and container env live in
+# .devcontainer/devcontainer.json. strait owns outbound network policy.
+#
+# MITM hosts are intercepted for request-level policy evaluation and
+# credential injection. Anthropic traffic passes through as a CONNECT
+# tunnel so OAuth (Claude Max) works without API-key injection.
+
+ca_cert_path = "/tmp/strait-ca.pem"
+
+[mitm]
+hosts = [
+    "api.github.com",
+    "registry.npmjs.org",
+]
+
+# GitHub API credential injection (bearer token).
+[[credential]]
+host = "api.github.com"
+header = "Authorization"
+value_prefix = "token "
+source = "env"
+env_var = "GITHUB_TOKEN"
+
+# npm registry credential injection for private packages.
+[[credential]]
+host = "registry.npmjs.org"
+header = "Authorization"
+value_prefix = "Bearer "
+source = "env"
+env_var = "NPM_TOKEN"
+
+[identity]
+header = "X-Strait-Agent"
+default = "claude-code"
+
+[audit]
+log_path = "/tmp/strait-audit.jsonl"

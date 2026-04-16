@@ -21,6 +21,7 @@ pub mod launch;
 pub mod mitm;
 pub mod observe;
 pub mod policy;
+pub mod presets;
 pub mod replay;
 pub mod sigv4;
 pub mod templates;

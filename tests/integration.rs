@@ -1984,9 +1984,9 @@ fn e2e_enforce_denies_unauthorized_actions() {
     assert_eq!(strait::replay::print_results(&bad_result), 1);
 }
 
-/// Edge case: replay skips filesystem-only activity.
+/// Edge case: generation ignores non-HTTP lifecycle activity.
 #[test]
-fn e2e_roundtrip_filesystem_only() {
+fn e2e_non_http_activity_produces_no_policy() {
     use strait::observe::{EventKind, ObservationStream};
 
     let dir = tempfile::tempdir().unwrap();
@@ -2000,13 +2000,9 @@ fn e2e_roundtrip_filesystem_only() {
         path: "/workspace".to_string(),
         mode: "read-write".to_string(),
     });
-    obs.emit(EventKind::FsAccess {
-        path: "/workspace/src/main.rs".to_string(),
-        operation: "read".to_string(),
-    });
-    obs.emit(EventKind::FsAccess {
-        path: "/workspace/build/output.o".to_string(),
-        operation: "write".to_string(),
+    obs.emit(EventKind::ContainerStop {
+        container_id: "abc123".to_string(),
+        exit_code: Some(0),
     });
     drop(obs);
 
@@ -2017,10 +2013,10 @@ fn e2e_roundtrip_filesystem_only() {
     assert!(!schema_path.exists());
 }
 
-/// Edge case: round-trip with network-only activity (no filesystem).
+/// Edge case: round-trip with network-only activity.
 ///
 /// Tests that the observe/generate/replay pipeline works correctly
-/// when the agent only makes network requests with no filesystem activity.
+/// when the agent only makes network requests.
 #[test]
 fn e2e_roundtrip_network_only() {
     use strait::observe::{EventKind, ObservationStream};
@@ -2033,7 +2029,7 @@ fn e2e_roundtrip_network_only() {
     let mut obs = ObservationStream::new();
     obs.persist_to_file(&obs_log_path).unwrap();
 
-    // Only network activity, no filesystem
+    // Only network activity.
     obs.emit(EventKind::NetworkRequest {
         method: "GET".to_string(),
         host: "api.github.com".to_string(),
@@ -2060,7 +2056,7 @@ fn e2e_roundtrip_network_only() {
 
     let policy_text = std::fs::read_to_string(&policy_path).unwrap();
 
-    // Policy should only contain http: actions, no fs: actions
+    // Policy should only contain the observed HTTP actions.
     assert!(
         policy_text.contains(r#"Action::"http:GET""#),
         "policy should contain http:GET"
@@ -2069,10 +2065,7 @@ fn e2e_roundtrip_network_only() {
         policy_text.contains(r#"Action::"http:POST""#),
         "policy should contain http:POST"
     );
-    assert!(
-        !policy_text.contains("fs:"),
-        "network-only policy should not contain fs: actions"
-    );
+    assert_eq!(policy_text.matches("permit(").count(), 2);
 
     // Replay should match all events
     let result = strait::replay::replay(&obs_log_path, &policy_path, None).unwrap();
@@ -2247,14 +2240,6 @@ fn e2e_roundtrip_full_lifecycle_mixed_events() {
         enforcement_mode: String::new(),
         blocked: None,
     });
-    obs.emit(EventKind::FsAccess {
-        path: "/workspace/output.txt".to_string(),
-        operation: "write".to_string(),
-    });
-    obs.emit(EventKind::FsAccess {
-        path: "/data/input.csv".to_string(),
-        operation: "read".to_string(),
-    });
     obs.emit(EventKind::ContainerStop {
         container_id: "abc123".to_string(),
         exit_code: Some(0),
@@ -2264,8 +2249,8 @@ fn e2e_roundtrip_full_lifecycle_mixed_events() {
     strait::generate::generate(&obs_log_path, &policy_path, &schema_path).unwrap();
     let result = strait::replay::replay(&obs_log_path, &policy_path, None).unwrap();
 
-    assert_eq!(result.total, 7);
-    assert_eq!(result.skipped, 6);
+    assert_eq!(result.total, 5);
+    assert_eq!(result.skipped, 4);
     assert_eq!(result.matches, 1);
     assert!(result.mismatches.is_empty());
     assert_eq!(strait::replay::print_results(&result), 0);

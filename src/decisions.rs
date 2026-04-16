@@ -143,18 +143,39 @@ impl PendingDecisionStore {
     /// Return whether the request is currently allowed by either a
     /// session-scoped or time-limited live decision.
     pub fn is_allowed(&self, match_key: &str) -> bool {
-        self.decision_scope(match_key) != "once"
+        self.try_allow(match_key).is_some()
+    }
+
+    /// Check whether the request is currently allowed and, if so, return the
+    /// decision scope in a single lock acquisition. Returns `None` when no
+    /// cached allow applies.
+    pub fn try_allow(&self, match_key: &str) -> Option<&'static str> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().expect("pending decision store poisoned");
+        Self::evict_expired(&mut inner, now, self.ttl);
+        if inner.session_allows.contains(match_key) {
+            Some("session")
+        } else if inner
+            .timed_allows
+            .get(match_key)
+            .is_some_and(|expires_at| *expires_at > now)
+        {
+            Some("ttl")
+        } else {
+            None
+        }
     }
 
     /// Return whether the request is currently allowed by a time-limited live
     /// decision.
     pub fn is_ttl_allowed(&self, match_key: &str) -> bool {
+        let now = Instant::now();
         let mut inner = self.inner.lock().expect("pending decision store poisoned");
-        Self::evict_expired(&mut inner, Instant::now(), self.ttl);
+        Self::evict_expired(&mut inner, now, self.ttl);
         inner
             .timed_allows
             .get(match_key)
-            .is_some_and(|expires_at| *expires_at > Instant::now())
+            .is_some_and(|expires_at| *expires_at > now)
     }
 
     /// Describe the currently active allow scope for a match key.

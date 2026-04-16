@@ -9,8 +9,11 @@ use std::env;
 use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+const PROBE_STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
 struct ProbeConfig {
@@ -150,10 +153,12 @@ async fn read_connect_response(
 
 async fn perform_probe(config: &ProbeConfig) -> String {
     let proxy_addr: SocketAddr = "127.0.0.1:3128".parse().unwrap();
-    let stream = match TcpStream::connect(proxy_addr).await {
-        Ok(stream) => stream,
-        Err(_) => return "proxy_connect_error".to_string(),
-    };
+    let stream =
+        match tokio::time::timeout(PROBE_STEP_TIMEOUT, TcpStream::connect(proxy_addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(_)) => return "proxy_connect_error".to_string(),
+            Err(_) => return "proxy_connect_timeout".to_string(),
+        };
 
     let mut reader = BufReader::new(stream);
     let connect_request = format!(
@@ -170,10 +175,12 @@ async fn perform_probe(config: &ProbeConfig) -> String {
         return "proxy_write_error".to_string();
     }
 
-    let (connect_status, stream) = match read_connect_response(reader).await {
-        Ok(result) => result,
-        Err(_) => return "connect_response_error".to_string(),
-    };
+    let (connect_status, stream) =
+        match tokio::time::timeout(PROBE_STEP_TIMEOUT, read_connect_response(reader)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => return "connect_response_error".to_string(),
+            Err(_) => return "connect_response_timeout".to_string(),
+        };
 
     if connect_status != 200 {
         return connect_status.to_string();
@@ -191,9 +198,15 @@ async fn perform_probe(config: &ProbeConfig) -> String {
         Err(_) => return "invalid_server_name".to_string(),
     };
 
-    let mut tls = match connector.connect(server_name, stream).await {
-        Ok(tls) => tls,
-        Err(_) => return "tls_handshake_error".to_string(),
+    let mut tls = match tokio::time::timeout(
+        PROBE_STEP_TIMEOUT,
+        connector.connect(server_name, stream),
+    )
+    .await
+    {
+        Ok(Ok(tls)) => tls,
+        Ok(Err(_)) => return "tls_handshake_error".to_string(),
+        Err(_) => return "tls_handshake_timeout".to_string(),
     };
 
     let request = format!(
@@ -209,14 +222,15 @@ async fn perform_probe(config: &ProbeConfig) -> String {
 
     let mut tls_reader = BufReader::new(tls);
     let mut status_line = String::new();
-    match tls_reader.read_line(&mut status_line).await {
-        Ok(0) => "upstream_error".to_string(),
-        Ok(_) => status_line
+    match tokio::time::timeout(PROBE_STEP_TIMEOUT, tls_reader.read_line(&mut status_line)).await {
+        Ok(Ok(0)) => "upstream_error".to_string(),
+        Ok(Ok(_)) => status_line
             .split_whitespace()
             .nth(1)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| "other".to_string()),
-        Err(_) => "upstream_error".to_string(),
+        Ok(Err(_)) => "upstream_error".to_string(),
+        Err(_) => "upstream_timeout".to_string(),
     }
 }
 

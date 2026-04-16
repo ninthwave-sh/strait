@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { resolveBridge, type DesktopBridge } from './bridge';
 import type {
@@ -39,7 +39,7 @@ export function buildBlockedBatches(
     .map(([key, requests]) => {
       const timeRemainingMs = Math.max(
         0,
-        Math.min(...requests.map((request) => parseTime(request.holdExpiresAt) || now)) - now
+        Math.min(...requests.map((request) => parseTime(request.holdExpiresAt) || Infinity)) - now
       );
       const sortedRequests = [...requests].sort(
         (left, right) => parseTime(left.observedAt) - parseTime(right.observedAt)
@@ -133,37 +133,36 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
     }
   }, [selectedBatch, selectedBatchId]);
 
-  async function submitDecision(
-    batch: BlockedBatch,
-    action: DecisionAction,
-    ttlSeconds?: number
-  ) {
-    setErrorMessage(null);
-    setPendingBatchIds((current) => ({ ...current, [batch.id]: true }));
-    try {
-      await bridge.submitDecision({
-        sessionId: batch.sessionId,
-        blockedIds: batch.blockedIds,
-        action,
-        ttlSeconds
-      });
-      setHiddenBlockedIds((current) => {
-        const next = { ...current };
-        for (const blockedId of batch.blockedIds) {
-          next[blockedId] = true;
-        }
-        return next;
-      });
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : 'Decision failed.');
-    } finally {
-      setPendingBatchIds((current) => {
-        const next = { ...current };
-        delete next[batch.id];
-        return next;
-      });
-    }
-  }
+  const submitDecision = useCallback(
+    async (batch: BlockedBatch, action: DecisionAction, ttlSeconds?: number) => {
+      setErrorMessage(null);
+      setPendingBatchIds((current) => ({ ...current, [batch.id]: true }));
+      try {
+        await bridge.submitDecision({
+          sessionId: batch.sessionId,
+          blockedIds: batch.blockedIds,
+          action,
+          ttlSeconds
+        });
+        setHiddenBlockedIds((current) => {
+          const next = { ...current };
+          for (const blockedId of batch.blockedIds) {
+            next[blockedId] = true;
+          }
+          return next;
+        });
+      } catch (error) {
+        setErrorMessage(error instanceof Error ? error.message : 'Decision failed.');
+      } finally {
+        setPendingBatchIds((current) => {
+          const next = { ...current };
+          delete next[batch.id];
+          return next;
+        });
+      }
+    },
+    [bridge]
+  );
 
   useEffect(() => {
     for (const batch of batches) {
@@ -172,7 +171,7 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
         break;
       }
     }
-  }, [batches, pendingBatchIds]);
+  }, [batches, pendingBatchIds, submitDecision]);
 
   return (
     <div className="app-shell">

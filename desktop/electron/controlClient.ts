@@ -127,6 +127,21 @@ export class ControlPlane extends EventEmitter {
 
   private pollTimer: NodeJS.Timeout | null = null;
   private streams = new Map<string, grpc.ClientReadableStream<any>>();
+  private client: GrpcClient | null = null;
+  private clientSocketPath: string | null = null;
+
+  private getClient(): GrpcClient {
+    const socketPath = this.snapshot.serviceSocketPath;
+    if (this.client && this.clientSocketPath === socketPath) {
+      return this.client;
+    }
+    if (this.client) {
+      this.client.close();
+    }
+    this.client = loadServiceClient(socketPath);
+    this.clientSocketPath = socketPath;
+    return this.client;
+  }
 
   getSnapshot(): DesktopSnapshot {
     return JSON.parse(JSON.stringify(this.snapshot)) as DesktopSnapshot;
@@ -153,34 +168,38 @@ export class ControlPlane extends EventEmitter {
   }
 
   async submitDecision(input: SubmitDecisionInput): Promise<SubmitDecisionResult> {
-    const client = loadServiceClient(this.snapshot.serviceSocketPath);
+    const client = this.getClient();
     const resolvedBlockedIds: string[] = [];
 
-    for (const blockedId of input.blockedIds) {
-      await new Promise<void>((resolve, reject) => {
-        client.submitDecision(
-          {
-            sessionId: input.sessionId,
-            blockedId,
-            action: decisionActionValue(input.action),
-            ttlSeconds: input.ttlSeconds ?? 0
-          },
-          (error) => {
-            if (error) {
-              reject(error);
-              return;
+    try {
+      for (const blockedId of input.blockedIds) {
+        await new Promise<void>((resolve, reject) => {
+          client.submitDecision(
+            {
+              sessionId: input.sessionId,
+              blockedId,
+              action: decisionActionValue(input.action),
+              ttlSeconds: input.ttlSeconds ?? 0
+            },
+            (error) => {
+              if (error) {
+                reject(error);
+                return;
+              }
+              resolvedBlockedIds.push(blockedId);
+              resolve();
             }
-            resolvedBlockedIds.push(blockedId);
-            resolve();
-          }
+          );
+        });
+      }
+    } finally {
+      if (resolvedBlockedIds.length > 0) {
+        this.snapshot.blockedRequests = this.snapshot.blockedRequests.filter(
+          (request) => !resolvedBlockedIds.includes(request.blockedId)
         );
-      });
+        this.emitState();
+      }
     }
-
-    this.snapshot.blockedRequests = this.snapshot.blockedRequests.filter(
-      (request) => !resolvedBlockedIds.includes(request.blockedId)
-    );
-    this.emitState();
 
     return { resolvedBlockedIds };
   }
@@ -191,6 +210,11 @@ export class ControlPlane extends EventEmitter {
       this.pollTimer = null;
     }
     this.stopStreams();
+    if (this.client) {
+      this.client.close();
+      this.client = null;
+      this.clientSocketPath = null;
+    }
   }
 
   private schedulePolling() {
@@ -222,7 +246,7 @@ export class ControlPlane extends EventEmitter {
   }
 
   private async listSessions(): Promise<SessionSummary[]> {
-    const client = loadServiceClient(this.snapshot.serviceSocketPath);
+    const client = this.getClient();
     return new Promise<SessionSummary[]>((resolve, reject) => {
       client.listSessions({}, (error, response) => {
         if (error) {
@@ -252,7 +276,7 @@ export class ControlPlane extends EventEmitter {
   }
 
   private startBlockedStream(sessionId: string) {
-    const client = loadServiceClient(this.snapshot.serviceSocketPath);
+    const client = this.getClient();
     const stream = client.streamBlockedRequests({ sessionId });
     this.streams.set(sessionId, stream);
 

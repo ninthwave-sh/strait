@@ -97,6 +97,10 @@ pub const PROXY_SOCKET_NAME: &str = "proxy.sock";
 /// Current version of the launch session control protocol.
 pub const SESSION_CONTROL_PROTOCOL_VERSION: u32 = 1;
 
+fn default_live_decision_timeout_secs() -> u64 {
+    30
+}
+
 /// Operator-facing reminder for live policy updates.
 pub const LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE: &str =
     "Live updates apply to network policy only; filesystem or process policy changes require relaunch.";
@@ -163,6 +167,9 @@ pub struct LaunchSessionMetadata {
     pub session_id: String,
     /// Active enforcement mode for the launch session.
     pub mode: String,
+    /// Hold timeout used for live decision prompts in this session.
+    #[serde(default = "default_live_decision_timeout_secs")]
+    pub decision_timeout_secs: u64,
     /// Path to the session control socket.
     pub control_socket_path: PathBuf,
     /// Observation attachment handle for watch clients.
@@ -193,6 +200,9 @@ pub struct LaunchControlRequest {
     /// the matching request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_id: Option<String>,
+    /// Requested TTL in seconds for `decision.allow_ttl`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
 }
 
 impl LaunchControlRequest {
@@ -202,6 +212,7 @@ impl LaunchControlRequest {
             method: method.as_str().to_string(),
             policy: None,
             blocked_id: None,
+            ttl_seconds: None,
         }
     }
 
@@ -211,6 +222,7 @@ impl LaunchControlRequest {
             method: method.as_str().to_string(),
             policy: Some(policy.into()),
             blocked_id: None,
+            ttl_seconds: None,
         }
     }
 
@@ -220,6 +232,21 @@ impl LaunchControlRequest {
             method: method.as_str().to_string(),
             policy: None,
             blocked_id: Some(blocked_id.into()),
+            ttl_seconds: None,
+        }
+    }
+
+    fn with_blocked_id_and_ttl(
+        method: ControlMethod,
+        blocked_id: impl Into<String>,
+        ttl_seconds: u64,
+    ) -> Self {
+        Self {
+            version: SESSION_CONTROL_PROTOCOL_VERSION,
+            method: method.as_str().to_string(),
+            policy: None,
+            blocked_id: Some(blocked_id.into()),
+            ttl_seconds: Some(ttl_seconds),
         }
     }
 }
@@ -272,6 +299,8 @@ pub enum LaunchControlResult {
     DecisionAllowSession { outcome: DecisionActionOutcome },
     /// Result for `decision.persist`.
     DecisionPersist { outcome: DecisionActionOutcome },
+    /// Result for `decision.allow_ttl`.
+    DecisionAllowTtl { outcome: DecisionActionOutcome },
     /// Result for `decision.deny`.
     DecisionDeny { outcome: DecisionActionOutcome },
 }
@@ -338,6 +367,7 @@ enum ControlMethod {
     PolicyReplace,
     DecisionAllowOnce,
     DecisionAllowSession,
+    DecisionAllowTtl,
     DecisionPersist,
     DecisionDeny,
 }
@@ -352,6 +382,7 @@ impl ControlMethod {
             Self::PolicyReplace => "policy.replace",
             Self::DecisionAllowOnce => "decision.allow_once",
             Self::DecisionAllowSession => "decision.allow_session",
+            Self::DecisionAllowTtl => "decision.allow_ttl",
             Self::DecisionPersist => "decision.persist",
             Self::DecisionDeny => "decision.deny",
         }
@@ -375,6 +406,7 @@ fn parse_control_method(request: &LaunchControlRequest) -> anyhow::Result<Contro
         "policy.replace" => Ok(ControlMethod::PolicyReplace),
         "decision.allow_once" => Ok(ControlMethod::DecisionAllowOnce),
         "decision.allow_session" => Ok(ControlMethod::DecisionAllowSession),
+        "decision.allow_ttl" => Ok(ControlMethod::DecisionAllowTtl),
         "decision.persist" => Ok(ControlMethod::DecisionPersist),
         "decision.deny" => Ok(ControlMethod::DecisionDeny),
         other => anyhow::bail!("unsupported control method '{other}'"),
@@ -715,6 +747,28 @@ pub async fn request_launch_decision_allow_session(
     }
 }
 
+/// Resolve a blocked request and allow equivalent requests for a bounded TTL.
+#[cfg(unix)]
+pub async fn request_launch_decision_allow_ttl(
+    control_socket_path: &Path,
+    blocked_id: impl Into<String>,
+    ttl_seconds: u64,
+) -> anyhow::Result<DecisionActionOutcome> {
+    let response = send_launch_control_request(
+        control_socket_path,
+        &LaunchControlRequest::with_blocked_id_and_ttl(
+            ControlMethod::DecisionAllowTtl,
+            blocked_id,
+            ttl_seconds,
+        ),
+    )
+    .await?;
+    match response.result {
+        Some(LaunchControlResult::DecisionAllowTtl { outcome }) => Ok(outcome),
+        other => anyhow::bail!("unexpected decision.allow_ttl response: {other:?}"),
+    }
+}
+
 /// Resolve a blocked request by persisting a durable Cedar exception and
 /// reloading it into the running session.
 #[cfg(unix)]
@@ -771,6 +825,26 @@ fn require_blocked_id(
 }
 
 #[cfg(unix)]
+fn require_ttl_seconds(
+    request: &LaunchControlRequest,
+    method: ControlMethod,
+) -> Result<u64, Box<LaunchControlResponse>> {
+    let Some(ttl_seconds) = request.ttl_seconds else {
+        return Err(Box::new(LaunchControlResponse::invalid_request(
+            "missing_ttl_seconds",
+            format!("{} requires ttl_seconds", method.as_str()),
+        )));
+    };
+    if ttl_seconds == 0 {
+        return Err(Box::new(LaunchControlResponse::invalid_request(
+            "invalid_ttl_seconds",
+            format!("{} requires ttl_seconds greater than zero", method.as_str()),
+        )));
+    }
+    Ok(ttl_seconds)
+}
+
+#[cfg(unix)]
 fn dispatch_decision_action(
     request: &LaunchControlRequest,
     method: ControlMethod,
@@ -780,11 +854,22 @@ fn dispatch_decision_action(
         Ok(blocked_id) => blocked_id,
         Err(response) => return *response,
     };
+    let ttl_seconds = match method {
+        ControlMethod::DecisionAllowTtl => match require_ttl_seconds(request, method) {
+            Ok(ttl_seconds) => Some(ttl_seconds),
+            Err(response) => return *response,
+        },
+        _ => None,
+    };
 
     let store = proxy_ctx.pending_decisions.as_ref();
     let apply = match method {
         ControlMethod::DecisionAllowOnce => store.resolve_allow_once(blocked_id),
         ControlMethod::DecisionAllowSession => store.resolve_allow_session(blocked_id),
+        ControlMethod::DecisionAllowTtl => store.resolve_allow_ttl(
+            blocked_id,
+            std::time::Duration::from_secs(ttl_seconds.expect("ttl required for allow_ttl")),
+        ),
         ControlMethod::DecisionDeny => store.resolve_deny(blocked_id),
         other => {
             return LaunchControlResponse::invalid_request(
@@ -807,6 +892,9 @@ fn dispatch_decision_action(
                 }
                 ControlMethod::DecisionAllowSession => {
                     LaunchControlResult::DecisionAllowSession { outcome }
+                }
+                ControlMethod::DecisionAllowTtl => {
+                    LaunchControlResult::DecisionAllowTtl { outcome }
                 }
                 ControlMethod::DecisionDeny => LaunchControlResult::DecisionDeny { outcome },
                 _ => unreachable!("decision dispatch on non-decision method"),
@@ -869,6 +957,7 @@ fn emit_decision_event(
     let action = match method {
         ControlMethod::DecisionAllowOnce => "decision.allow_once",
         ControlMethod::DecisionAllowSession => "decision.allow_session",
+        ControlMethod::DecisionAllowTtl => "decision.allow_ttl",
         ControlMethod::DecisionPersist => "decision.persist",
         ControlMethod::DecisionDeny => "decision.deny",
         _ => return,
@@ -970,6 +1059,11 @@ async fn handle_launch_control_client(
             Ok(ControlMethod::DecisionAllowSession) => dispatch_decision_action(
                 &request,
                 ControlMethod::DecisionAllowSession,
+                proxy_ctx.as_ref(),
+            ),
+            Ok(ControlMethod::DecisionAllowTtl) => dispatch_decision_action(
+                &request,
+                ControlMethod::DecisionAllowTtl,
                 proxy_ctx.as_ref(),
             ),
             Ok(ControlMethod::DecisionPersist) => {
@@ -1216,6 +1310,7 @@ impl LaunchSession {
             version: SESSION_CONTROL_PROTOCOL_VERSION,
             session_id: session_id.to_string(),
             mode: mode_label.to_string(),
+            decision_timeout_secs: proxy_ctx.decision_timeout.as_secs(),
             control_socket_path: session_dir.join(SESSION_CONTROL_SOCKET_NAME),
             observation: ObservationHandle {
                 transport: "unix_socket".to_string(),
@@ -3701,6 +3796,7 @@ permit(
             method: "session.info".to_string(),
             policy: None,
             blocked_id: None,
+            ttl_seconds: None,
         };
         let err = parse_control_method(&wrong_version).unwrap_err();
         assert!(
@@ -3714,6 +3810,7 @@ permit(
             method: "session.nope".to_string(),
             policy: None,
             blocked_id: None,
+            ttl_seconds: None,
         };
         let err = parse_control_method(&wrong_method).unwrap_err();
         assert!(
@@ -3748,6 +3845,37 @@ permit(
             blank_response.error.unwrap().code,
             "missing_blocked_id",
             "decision methods should reject a blank blocked_id"
+        );
+
+        let missing_ttl =
+            LaunchControlRequest::with_blocked_id(ControlMethod::DecisionAllowTtl, "blocked-ttl");
+        let missing_ttl_response = dispatch_decision_action(
+            &missing_ttl,
+            ControlMethod::DecisionAllowTtl,
+            proxy_ctx.as_ref(),
+        );
+        assert!(!missing_ttl_response.ok);
+        assert_eq!(
+            missing_ttl_response.error.unwrap().code,
+            "missing_ttl_seconds",
+            "allow-ttl should reject a missing ttl_seconds"
+        );
+
+        let zero_ttl = LaunchControlRequest::with_blocked_id_and_ttl(
+            ControlMethod::DecisionAllowTtl,
+            "blocked-ttl",
+            0,
+        );
+        let zero_ttl_response = dispatch_decision_action(
+            &zero_ttl,
+            ControlMethod::DecisionAllowTtl,
+            proxy_ctx.as_ref(),
+        );
+        assert!(!zero_ttl_response.ok);
+        assert_eq!(
+            zero_ttl_response.error.unwrap().code,
+            "invalid_ttl_seconds",
+            "allow-ttl should reject zero ttl_seconds"
         );
 
         let persist_missing = LaunchControlRequest::new(ControlMethod::DecisionPersist);
@@ -3863,6 +3991,25 @@ permit(
         assert_eq!(blocked_id, "blocked-session");
         assert_eq!(match_key, "http:GET example.com/session");
 
+        let ttl_rx = proxy_ctx
+            .pending_decisions
+            .register_pending("blocked-ttl", "http:GET example.com/ttl");
+        let allow_ttl = request_launch_decision_allow_ttl(&control_socket, "blocked-ttl", 45)
+            .await
+            .unwrap();
+        assert_eq!(allow_ttl.match_key, "http:GET example.com/ttl");
+        assert_eq!(ttl_rx.await.unwrap(), crate::decisions::Decision::AllowOnce);
+        assert!(
+            proxy_ctx
+                .pending_decisions
+                .is_ttl_allowed("http:GET example.com/ttl"),
+            "allow-ttl should cache the match key for the requested TTL"
+        );
+        let (blocked_id, match_key) =
+            wait_for_live_decision_event(&mut obs_rx, "decision.allow_ttl").await;
+        assert_eq!(blocked_id, "blocked-ttl");
+        assert_eq!(match_key, "http:GET example.com/ttl");
+
         let deny_rx = proxy_ctx
             .pending_decisions
             .register_pending("blocked-deny", "http:GET example.com/deny");
@@ -3967,6 +4114,7 @@ permit(
             version: SESSION_CONTROL_PROTOCOL_VERSION,
             session_id: "test-session".to_string(),
             mode: "observe".to_string(),
+            decision_timeout_secs: default_live_decision_timeout_secs(),
             control_socket_path: PathBuf::from("/tmp/control.sock"),
             observation: ObservationHandle {
                 transport: "unix_socket".to_string(),
@@ -4014,6 +4162,7 @@ permit(
             version: SESSION_CONTROL_PROTOCOL_VERSION,
             session_id: "trust-test".to_string(),
             mode: "enforce".to_string(),
+            decision_timeout_secs: default_live_decision_timeout_secs(),
             control_socket_path: PathBuf::from("/tmp/control.sock"),
             observation: ObservationHandle {
                 transport: "unix_socket".to_string(),

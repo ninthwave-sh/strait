@@ -28,3 +28,8 @@ target
 .claude/skills/
 .opencode/agents/
 .github/agents/
+
+# desktop shell build outputs
+desktop/node_modules/
+desktop/dist/
+desktop/electron-dist/

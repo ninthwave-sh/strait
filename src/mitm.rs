@@ -425,7 +425,7 @@ where
 
             if !decision.allowed && !ctx.warn_only {
                 let match_key = crate::policy::build_match_key(host, &method, &path);
-                if ctx.pending_decisions.is_session_allowed(&match_key) {
+                if let Some(decision_scope) = ctx.pending_decisions.try_allow(&match_key) {
                     let credential_injected = inject_credential(
                         host,
                         &method,
@@ -454,7 +454,7 @@ where
                         path = path.as_str(),
                         agent = agent_id.as_str(),
                         policy = policy_display.as_str(),
-                        decision_scope = "session",
+                        decision_scope = decision_scope,
                         credential_injected = credential_injected,
                         "ALLOW: cached live decision override matched blocked request"
                     );
@@ -502,11 +502,7 @@ where
                         Ok(Ok(crate::decisions::Decision::AllowOnce))
                         | Ok(Ok(crate::decisions::Decision::AllowSession)) => {
                             let decision_scope =
-                                if ctx.pending_decisions.is_session_allowed(&blocked.match_key) {
-                                    "session"
-                                } else {
-                                    "once"
-                                };
+                                ctx.pending_decisions.decision_scope(&blocked.match_key);
 
                             let credential_injected = inject_credential(
                                 host,

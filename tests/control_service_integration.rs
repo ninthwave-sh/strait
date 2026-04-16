@@ -338,6 +338,7 @@ async fn service_startup_prunes_stale_socket_and_registry() {
         version: strait::launch::SESSION_CONTROL_PROTOCOL_VERSION,
         session_id: "stale-session".to_string(),
         mode: "observe".to_string(),
+        decision_timeout_secs: 30,
         control_socket_path: session_dir.join("control.sock"),
         observation: strait::launch::ObservationHandle {
             transport: "unix_socket".to_string(),
@@ -514,12 +515,16 @@ async fn service_streams_blocked_requests_and_submits_decisions() {
     );
     assert_eq!(blocked.host, upstream_addr.ip().to_string());
     assert_eq!(blocked.path, "/policy-probe");
+    assert_eq!(blocked.hold_timeout_secs, 30);
+    assert!(!blocked.observed_at.is_empty());
+    assert!(!blocked.hold_expires_at.is_empty());
 
     let decision = client
         .submit_decision(proto::SubmitDecisionRequest {
             session_id: session_id.clone(),
             blocked_id: blocked.blocked_id.clone(),
             action: proto::DecisionAction::AllowOnce as i32,
+            ttl_seconds: 0,
         })
         .await
         .unwrap()

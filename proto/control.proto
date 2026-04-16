@@ -49,6 +49,7 @@ enum DecisionAction {
   DECISION_ACTION_ALLOW_ONCE = 2;
   DECISION_ACTION_ALLOW_SESSION = 3;
   DECISION_ACTION_PERSIST = 4;
+  DECISION_ACTION_ALLOW_TTL = 5;
 }
 
 message ExceptionSuggestion {
@@ -71,6 +72,9 @@ message BlockedRequestEvent {
   string decision = 9;
   repeated ExceptionSuggestion suggestions = 10;
   string raw_json = 11;
+  string observed_at = 12;
+  uint32 hold_timeout_secs = 13;
+  string hold_expires_at = 14;
 }
 
 message StreamBlockedRequestsRequest {
@@ -81,6 +85,7 @@ message SubmitDecisionRequest {
   string session_id = 1;
   string blocked_id = 2;
   DecisionAction action = 3;
+  uint32 ttl_seconds = 4;
 }
 
 message SubmitDecisionResponse {

@@ -117,10 +117,29 @@ The gRPC service exposes:
 
 - `ListSessions` and `GetSessionStatus` for published session discovery
 - `StreamBlockedRequests` for blocked-request events
-- `SubmitDecision` for deny, allow-once, allow-session, and persist actions
+- `SubmitDecision` for deny, allow-once, allow-session, bounded-TTL, and persist actions
 - `Subscribe` for live session inventory, status changes, and session event streams
 
 Remote operators can optionally expose the same service on mTLS-authenticated TCP with `--tcp-listen`, `--tls-cert`, `--tls-key`, and `--tls-client-ca`.
+
+### Run the desktop shell
+
+The first desktop control plane lives in `desktop/`. It is a thin Electron shell over the gRPC control service with:
+
+- system tray presence with quick session access
+- live blocked-request alerts with hold countdowns
+- host-level batching for related blocked requests
+- deny, allow-once, allow-session, persist, and custom TTL actions
+
+From the repo root:
+
+```bash
+cd desktop
+npm install
+npm run shell
+```
+
+By default the shell connects to the same Unix socket path that `strait service start` uses locally. Override with `STRAIT_CONTROL_SOCKET=/path/to/control-service.sock` if needed.
 
 ### Understand the live-update boundary
 

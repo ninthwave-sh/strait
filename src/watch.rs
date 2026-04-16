@@ -1256,6 +1256,7 @@ mod tests {
                 version: SESSION_CONTROL_PROTOCOL_VERSION,
                 session_id: "older-live".to_string(),
                 mode: "observe".to_string(),
+                decision_timeout_secs: 30,
                 control_socket_path: older_control,
                 observation: ObservationHandle {
                     transport: "unix_socket".to_string(),
@@ -1268,6 +1269,7 @@ mod tests {
                 version: SESSION_CONTROL_PROTOCOL_VERSION,
                 session_id: "newer-dead".to_string(),
                 mode: "observe".to_string(),
+                decision_timeout_secs: 30,
                 control_socket_path: stale_control,
                 observation: ObservationHandle {
                     transport: "unix_socket".to_string(),

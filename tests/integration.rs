@@ -2010,11 +2010,11 @@ fn e2e_roundtrip_filesystem_only() {
     });
     drop(obs);
 
-    strait::generate::generate(&obs_log_path, &policy_path, &schema_path).unwrap();
-    let result = strait::replay::replay(&obs_log_path, &policy_path, None).unwrap();
-    assert!(result.mismatches.is_empty());
-    assert_eq!(result.matches, 0);
-    assert_eq!(result.skipped, 3);
+    let wildcard_count =
+        strait::generate::generate(&obs_log_path, &policy_path, &schema_path).unwrap();
+    assert_eq!(wildcard_count, 0);
+    assert!(!policy_path.exists());
+    assert!(!schema_path.exists());
 }
 
 /// Edge case: round-trip with network-only activity (no filesystem).

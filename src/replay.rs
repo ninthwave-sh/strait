@@ -14,7 +14,9 @@ use cedar_policy::{
 };
 
 use crate::observe::{read_observations, EventKind, ObservationEvent};
-use crate::policy::{build_http_context, build_http_entity_hierarchy, build_resource_id};
+use crate::policy::{
+    build_http_context, build_http_entity_hierarchy, build_resource_id, PolicyEngine,
+};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -65,6 +67,9 @@ pub fn replay(
             policy_path.display()
         )
     })?;
+
+    PolicyEngine::from_text(&policy_text, None, Some(&policy_path.display().to_string()))
+        .map_err(|e| anyhow::anyhow!("invalid Cedar policy '{}': {e}", policy_path.display()))?;
 
     let policy_set = PolicySet::from_str(&policy_text)
         .map_err(|e| anyhow::anyhow!("invalid Cedar policy '{}': {e}", policy_path.display()))?;
@@ -509,6 +514,30 @@ permit(
         );
     }
 
+    #[test]
+    fn removed_action_domains_fail_replay_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = vec![make_network_event(
+            "GET",
+            "api.github.com",
+            "/repos",
+            "allow",
+        )];
+        let obs_path = write_observations(&dir, &events);
+        let policy_path = write_policy(
+            &dir,
+            &format!(
+                "permit(\n  principal,\n  action == Action::\"{}:{}\",\n  resource\n);\n",
+                "fs", "read"
+            ),
+        );
+
+        let result = replay(&obs_path, &policy_path, None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("removed action domains"), "got: {err}");
+    }
+
     // -- Container lifecycle events are skipped gracefully --------------------
 
     #[test]
@@ -679,10 +708,10 @@ permit(
         );
     }
 
-    // -- FsAccess events are evaluated ----------------------------------------
+    // -- FsAccess events are rejected -----------------------------------------
 
     #[test]
-    fn fs_access_event_evaluated() {
+    fn fs_access_event_rejected_by_policy_loader() {
         let dir = tempfile::tempdir().unwrap();
 
         let events = vec![ObservationEvent {
@@ -705,16 +734,16 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path, None).unwrap();
-        assert_eq!(result.matches, 0);
-        assert_eq!(result.skipped, 1);
-        assert!(result.mismatches.is_empty());
+        let err = replay(&obs_path, &policy_path, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("removed action domains"), "got: {err}");
     }
 
-    // -- ProcExec events are evaluated ----------------------------------------
+    // -- ProcExec events are rejected -----------------------------------------
 
     #[test]
-    fn proc_exec_event_evaluated() {
+    fn proc_exec_event_rejected_by_policy_loader() {
         let dir = tempfile::tempdir().unwrap();
 
         let events = vec![ObservationEvent {
@@ -737,16 +766,16 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path, None).unwrap();
-        assert_eq!(result.matches, 0);
-        assert_eq!(result.skipped, 1);
-        assert!(result.mismatches.is_empty());
+        let err = replay(&obs_path, &policy_path, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("removed action domains"), "got: {err}");
     }
 
-    // -- Mount events are evaluated -------------------------------------------
+    // -- Mount events are rejected --------------------------------------------
 
     #[test]
-    fn mount_event_evaluated() {
+    fn mount_event_rejected_by_policy_loader() {
         let dir = tempfile::tempdir().unwrap();
 
         let events = vec![ObservationEvent {
@@ -769,10 +798,10 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path, None).unwrap();
-        assert_eq!(result.matches, 0);
-        assert_eq!(result.skipped, 1);
-        assert!(result.mismatches.is_empty());
+        let err = replay(&obs_path, &policy_path, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("removed action domains"), "got: {err}");
     }
 
     // -- Empty observation log ------------------------------------------------
@@ -945,10 +974,10 @@ permit(
         assert!(result.mismatches.is_empty());
     }
 
-    // -- FS context: path condition -------------------------------------------
+    // -- FS context policies are rejected -------------------------------------
 
     #[test]
-    fn fs_context_path_condition_evaluated() {
+    fn fs_context_path_condition_rejected_by_policy_loader() {
         let dir = tempfile::tempdir().unwrap();
 
         let events = vec![
@@ -983,19 +1012,16 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path, None).unwrap();
-        assert_eq!(result.matches, 0);
-        assert_eq!(result.mismatches.len(), 0);
-        assert_eq!(
-            result.skipped, 2,
-            "filesystem events are skipped in network-only replay"
-        );
+        let err = replay(&obs_path, &policy_path, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("removed action domains"), "got: {err}");
     }
 
-    // -- Proc context: command condition ---------------------------------------
+    // -- Proc context policies are rejected -----------------------------------
 
     #[test]
-    fn proc_context_command_condition_evaluated() {
+    fn proc_context_command_condition_rejected_by_policy_loader() {
         let dir = tempfile::tempdir().unwrap();
 
         let events = vec![
@@ -1030,13 +1056,10 @@ permit(
 "#;
         let policy_path = write_policy(&dir, policy);
 
-        let result = replay(&obs_path, &policy_path, None).unwrap();
-        assert_eq!(result.matches, 0);
-        assert_eq!(result.mismatches.len(), 0);
-        assert_eq!(
-            result.skipped, 2,
-            "process events are skipped in network-only replay"
-        );
+        let err = replay(&obs_path, &policy_path, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("removed action domains"), "got: {err}");
     }
 
     // -- Warn decision treated as allowed ---------------------------------------

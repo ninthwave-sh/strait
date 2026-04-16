@@ -454,7 +454,7 @@ where
                         path = path.as_str(),
                         agent = agent_id.as_str(),
                         policy = policy_display.as_str(),
-                        decision_scope = "session",
+                        decision_scope = ctx.pending_decisions.decision_scope(&match_key),
                         credential_injected = credential_injected,
                         "ALLOW: cached live decision override matched blocked request"
                     );

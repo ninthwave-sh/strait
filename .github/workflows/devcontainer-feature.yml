@@ -82,10 +82,20 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Persist cargo-zigbuild between runs so we don't recompile it
+          # from source on every CI invocation (several minutes).
+          cache-directories: |
+            ~/.cargo/bin
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
 
       - name: Install cargo-zigbuild
-        run: cargo install --locked cargo-zigbuild
+        run: |
+          if ! command -v cargo-zigbuild > /dev/null 2>&1; then
+            cargo install --locked cargo-zigbuild
+          else
+            echo "cargo-zigbuild already cached at $(command -v cargo-zigbuild)"
+          fi
 
       - name: Build gateway binary (static musl)
         run: cargo zigbuild --release --package strait-gateway --target x86_64-unknown-linux-musl
@@ -186,6 +196,11 @@ jobs:
           SOCAT_PID=$!
           sleep 1
 
+          # The outer docker run must fail the CI step when the gateway
+          # fails to start or the CA bundle is not created. Only the inner
+          # `nc` probe is allowed to fail (gateway echoes on any bytes and
+          # the connection may close early).
+          set +e
           docker run --rm \
             -v "$PWD/.devcontainer/feature:/feature:ro" \
             -v "$PWD/target/x86_64-unknown-linux-musl/release/strait-gateway:/usr/local/bin/strait-gateway" \
@@ -209,9 +224,16 @@ jobs:
                 echo \"hello\" | timeout 2 nc 127.0.0.1 3128 || true
                 echo \"PASS: gateway is listening on 127.0.0.1:3128\"
               "
-            ' || true
+            '
+          RC=$?
+          set -e
 
           # Clean up.
           kill $SOCAT_PID 2>/dev/null || true
           rm -rf "${SOCKET_DIR}"
+
+          if [ "${RC}" -ne 0 ]; then
+            echo "::error::end-to-end test failed (rc=${RC})"
+            exit "${RC}"
+          fi
           echo "End-to-end test completed."

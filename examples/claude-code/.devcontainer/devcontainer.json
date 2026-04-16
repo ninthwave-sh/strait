@@ -18,9 +18,9 @@
     "name": "Claude Code with Strait",
     "image": "ubuntu:24.04",
     "features": {
-        "ghcr.io/ninthwave-io/strait:latest": {
-            "version": "latest"
-        }
+        // Pin a specific feature version by changing the image tag, e.g.
+        // "ghcr.io/ninthwave-io/strait:0.1.0": {}
+        "ghcr.io/ninthwave-io/strait:latest": {}
     },
     "remoteUser": "root",
     "containerEnv": {

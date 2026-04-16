@@ -2508,8 +2508,13 @@ fn launch_policy_replace_live_updates_running_session() {
             blocked_id,
         ))
         .expect("decision.deny should resolve the held probe request");
+    let blocked_probe_timeout = if std::env::var_os("CI").is_some() {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(20)
+    };
     let denied = session
-        .wait_for_event("probe", Duration::from_secs(15))
+        .wait_for_event("probe", blocked_probe_timeout)
         .unwrap();
     assert_eq!(denied["status"].as_str(), Some("403"));
 

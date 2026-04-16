@@ -13,8 +13,8 @@
 //! 3. Detect the container architecture and locate the matching `strait-gateway` binary
 //! 4. Start HTTPS proxy on a random port + bind a Unix socket for the proxy
 //! 5. Write session CA to temp file
-//! 6. Create container with `--network=none`, bind-mounted proxy socket and
-//!    gateway binary, policy-derived filesystem mounts
+//! 6. Create container with `--network=none`, bind-mounted proxy socket,
+//!    gateway binary, and working-directory mount
 //! 7. Gateway entrypoint wraps CA trust injection and user command
 //! 8. Start observation stream (JSONL file + Unix socket)
 //! 9. Start container with TTY attached
@@ -28,10 +28,7 @@
 //! Unix socket and the `strait-gateway` binary inside the container. See
 //! [`crate::container`] module docs for details.
 //!
-//! **Observe mode caveat**: The working directory is mounted read-write
-//! with no Cedar policy restricting filesystem access. A warning is emitted
-//! to stderr at startup. In warn/enforce modes, filesystem access is
-//! restricted to paths permitted by the Cedar policy.
+//! The working directory is mounted read-write in all launch modes.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -54,13 +51,11 @@ use crate::config::{
     reload_policy, replace_policy, LivePolicyBounds, PolicyConfig, PolicyMutationOutcome,
     ProxyContext,
 };
-use crate::container::{
-    container_trust_diagnostic_lines, ContainerManager, ContainerPermission, ContainerPolicy,
-};
+use crate::container::{container_trust_diagnostic_lines, ContainerManager};
 use crate::credentials::CredentialStore;
 use crate::mitm::handle_connection;
 use crate::observe::{EventKind, ObservationSessionContext, ObservationStream};
-use crate::policy::{extract_fs_permissions, extract_proc_permissions, PolicyEngine};
+use crate::policy::PolicyEngine;
 
 /// Enforcement mode for the launch orchestrator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1674,18 +1669,10 @@ async fn run_launch_observe_with_terminal_mode(
         tokio::spawn(run_mitm_unix_proxy_loop(listener, proxy_ctx))
     };
 
-    // 7. Build observe-mode container config
-    //    In observe mode, mount the working directory read-write (no restrictions)
-    let policy = ContainerPolicy {
-        permissions: vec![ContainerPermission::FsWrite(
-            cwd.to_string_lossy().to_string(),
-        )],
-    };
-
-    // Warn about observe mode's permissive cwd mount
+    // 7. Build observe-mode container config.
     warn!(
         path = %cwd.display(),
-        "observe mode: working directory mounted read-write with no policy restrictions"
+        "observe mode: working directory mounted read-write"
     );
     eprintln!("{}", observe_cwd_warning(&cwd));
 
@@ -1693,7 +1680,6 @@ async fn run_launch_observe_with_terminal_mode(
     // exit code via wait_container. Docker's wait API returns status_code=0
     // for TTY containers with auto_remove=true (a Docker/bollard quirk).
     let mut config = ContainerManager::build_config(
-        &policy,
         image,
         &command,
         &proxy_socket_path,
@@ -1809,7 +1795,7 @@ async fn run_launch_observe_with_terminal_mode(
 /// Run the `launch --warn` or `launch --policy` workflow.
 ///
 /// Loads a Cedar policy at startup and uses it to:
-/// - Restrict container bind-mounts to paths permitted by `fs:` policies
+/// - Keep launch-time policy mutation metadata aligned with the active session
 /// - Evaluate network connections against `http:` policies at proxy time
 ///
 /// In **warn** mode: same container config as enforce, but the proxy logs
@@ -1978,48 +1964,8 @@ async fn run_launch_with_policy_with_terminal_mode(
         tokio::spawn(run_mitm_unix_proxy_loop(listener, proxy_ctx))
     };
 
-    // 8. Extract filesystem permissions from Cedar policy
-    let candidate_paths = vec![cwd.to_string_lossy().to_string()];
-    let mut permissions = extract_fs_permissions(&engine, &candidate_paths, "agent");
-
-    // 8b. Extract proc:exec permissions and add to the permission set
-    let proc_permissions = extract_proc_permissions(&engine, "agent");
-    permissions.extend(proc_permissions);
-
-    // Log which paths were permitted and which were denied
-    let cwd_str = cwd.to_string_lossy().to_string();
-    let cwd_mounted = permissions.iter().any(|p| match p {
-        ContainerPermission::FsRead(path) | ContainerPermission::FsWrite(path) => path == &cwd_str,
-        _ => false,
-    });
-
-    if !cwd_mounted {
-        eprintln!(
-            "Warning: Cedar policy does not permit filesystem access to working directory ({})",
-            cwd.display()
-        );
-        obs_stream.emit(EventKind::PolicyViolation {
-            enforcement_mode: mode.as_str().to_string(),
-            action: "fs:write".to_string(),
-            resource: cwd_str.clone(),
-            decision: if mode == EnforcementMode::Warn {
-                "warn".to_string()
-            } else {
-                "deny".to_string()
-            },
-            reason: "Cedar policy does not permit filesystem access to working directory"
-                .to_string(),
-            blocked: None,
-        });
-    }
-
-    let container_policy = ContainerPolicy {
-        permissions: permissions.clone(),
-    };
-
-    // 9. Build container config with policy-restricted mounts
+    // 8. Build container config with the working directory mount.
     let mut config = ContainerManager::build_config(
-        &container_policy,
         image,
         &command,
         &proxy_socket_path,
@@ -2042,24 +1988,11 @@ async fn run_launch_with_policy_with_terminal_mode(
         image: image.to_string(),
     });
 
-    // Emit mount observation events
-    for perm in &permissions {
-        match perm {
-            ContainerPermission::FsRead(path) => {
-                obs_stream.emit(EventKind::Mount {
-                    path: path.clone(),
-                    mode: "read-only".to_string(),
-                });
-            }
-            ContainerPermission::FsWrite(path) => {
-                obs_stream.emit(EventKind::Mount {
-                    path: path.clone(),
-                    mode: "read-write".to_string(),
-                });
-            }
-            ContainerPermission::ProcExec(_) => {}
-        }
-    }
+    // Emit mount observation events.
+    obs_stream.emit(EventKind::Mount {
+        path: cwd.to_string_lossy().to_string(),
+        mode: "read-write".to_string(),
+    });
     for m in &extra_mounts {
         obs_stream.emit(EventKind::Mount {
             path: m.host_path.clone(),
@@ -2848,19 +2781,12 @@ mod tests {
         );
     }
 
-    /// Verify observe mode builds a policy with FsWrite (not FsRead) for cwd.
+    /// Verify observe mode mounts the working directory read-write.
     #[test]
     fn observe_mode_mounts_cwd_readwrite() {
         use std::path::Path;
 
-        // This mirrors the logic in run_launch_observe: cwd gets FsWrite
-        let cwd = "/project";
-        let policy = ContainerPolicy {
-            permissions: vec![ContainerPermission::FsWrite(cwd.to_string())],
-        };
-
         let config = ContainerManager::build_config(
-            &policy,
             "ubuntu:24.04",
             &["sh".to_string()],
             Path::new("/tmp/proxy.sock"),
@@ -4293,45 +4219,22 @@ permit(
 
         std::fs::write(
             &policy_path,
-            r#"
-permit(
-    principal == Agent::"agent",
-    action == Action::"http:GET",
-    resource
-);
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:read",
-    resource in Resource::"fs::/workspace"
-);
-permit(
-    principal == Agent::"agent",
-    action == Action::"proc:exec",
-    resource == Resource::"proc::git"
-);
-"#,
+            &format!(
+                "permit(\n    principal == Agent::\"agent\",\n    action == Action::\"http:GET\",\n    resource\n);\npermit(\n    principal == Agent::\"agent\",\n    action == Action::\"{}:{}\",\n    resource\n);\npermit(\n    principal == Agent::\"agent\",\n    action == Action::\"{}:{}\",\n    resource\n);\n",
+                "fs",
+                "read",
+                "proc",
+                "exec"
+            ),
         )
         .unwrap();
 
         let control_socket = session.control_socket_path().await;
-        let update = request_launch_policy_reload(&control_socket).await.unwrap();
-        assert!(
-            !update.applied,
-            "fs/proc changes should be restart-bound, not applied live"
-        );
-        assert_eq!(
-            update.restart_required_domains,
-            vec!["fs".to_string(), "proc".to_string()]
-        );
-
-        let engine = proxy_ctx.policy_engine.as_ref().unwrap().load();
-        let fs_decision = engine
-            .evaluate_fs("/workspace", "fs:read", "agent")
-            .unwrap();
-        assert!(
-            !fs_decision.allowed,
-            "restart-required reload should leave the previous policy active"
-        );
+        let err = request_launch_policy_reload(&control_socket)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("removed action domains"), "got: {err}");
 
         drop(session);
     }

@@ -14,10 +14,7 @@ use cedar_policy::{
 };
 
 use crate::observe::{read_observations, EventKind, ObservationEvent};
-use crate::policy::{
-    build_fs_context, build_fs_entities, build_http_context, build_http_entity_hierarchy,
-    build_mount_context, build_proc_context, build_proc_entities, build_resource_id,
-};
+use crate::policy::{build_http_context, build_http_entity_hierarchy, build_resource_id};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -226,108 +223,11 @@ fn evaluate_event(
             }
         }
 
-        EventKind::FsAccess { path, operation } => {
-            let action_str = format!("fs:{operation}");
-            let resource_id = format!("fs::{path}");
-            let entities = match build_fs_entities(path, agent_id) {
-                Ok(e) => e,
-                Err(_) => return EventEvaluation::Skip,
-            };
-
-            let context = match build_fs_context(path, operation) {
-                Ok(c) => c,
-                Err(_) => return EventEvaluation::Skip,
-            };
-
-            let policy_allowed = cedar_evaluate(
-                agent_id,
-                &action_str,
-                &resource_id,
-                &entities,
-                &context,
-                policy_set,
-                authorizer,
-            );
-
-            // Observed events were allowed (they happened).
-            if policy_allowed {
-                EventEvaluation::Match
-            } else {
-                EventEvaluation::Mismatch {
-                    observed: "allow".to_string(),
-                    policy_decision: "deny".to_string(),
-                }
-            }
-        }
-
-        EventKind::ProcExec { command, .. } => {
-            let resource_id = format!("proc::{command}");
-            let entities = match build_proc_entities(command, agent_id) {
-                Ok(e) => e,
-                Err(_) => return EventEvaluation::Skip,
-            };
-
-            let context = match build_proc_context(command) {
-                Ok(c) => c,
-                Err(_) => return EventEvaluation::Skip,
-            };
-
-            let policy_allowed = cedar_evaluate(
-                agent_id,
-                "proc:exec",
-                &resource_id,
-                &entities,
-                &context,
-                policy_set,
-                authorizer,
-            );
-
-            // Observed events were allowed (they happened).
-            if policy_allowed {
-                EventEvaluation::Match
-            } else {
-                EventEvaluation::Mismatch {
-                    observed: "allow".to_string(),
-                    policy_decision: "deny".to_string(),
-                }
-            }
-        }
-
-        EventKind::Mount { path, mode } => {
-            let resource_id = format!("fs::{path}");
-            let entities = match build_fs_entities(path, agent_id) {
-                Ok(e) => e,
-                Err(_) => return EventEvaluation::Skip,
-            };
-
-            let context = match build_mount_context(path, mode) {
-                Ok(c) => c,
-                Err(_) => return EventEvaluation::Skip,
-            };
-
-            let policy_allowed = cedar_evaluate(
-                agent_id,
-                "fs:mount",
-                &resource_id,
-                &entities,
-                &context,
-                policy_set,
-                authorizer,
-            );
-
-            // Observed mounts were allowed (they happened).
-            if policy_allowed {
-                EventEvaluation::Match
-            } else {
-                EventEvaluation::Mismatch {
-                    observed: "allow".to_string(),
-                    policy_decision: "deny".to_string(),
-                }
-            }
-        }
-
         // Container lifecycle and policy violation events cannot be evaluated against a Cedar policy.
-        EventKind::ContainerStart { .. }
+        EventKind::FsAccess { .. }
+        | EventKind::ProcExec { .. }
+        | EventKind::Mount { .. }
+        | EventKind::ContainerStart { .. }
         | EventKind::ContainerStop { .. }
         | EventKind::PolicyViolation { .. }
         | EventKind::PolicyReloaded { .. }
@@ -675,6 +575,7 @@ permit(
 
         let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.matches, 1);
+        assert_eq!(result.skipped, 0);
         assert!(result.mismatches.is_empty());
         assert_eq!(print_results(&result), 0);
     }
@@ -704,6 +605,7 @@ permit(
 
         let result = replay(&obs_path, &policy_path, None).unwrap();
         assert_eq!(result.matches, 1);
+        assert_eq!(result.skipped, 0);
         assert!(result.mismatches.is_empty());
     }
 
@@ -804,7 +706,8 @@ permit(
         let policy_path = write_policy(&dir, policy);
 
         let result = replay(&obs_path, &policy_path, None).unwrap();
-        assert_eq!(result.matches, 1);
+        assert_eq!(result.matches, 0);
+        assert_eq!(result.skipped, 1);
         assert!(result.mismatches.is_empty());
     }
 
@@ -835,7 +738,8 @@ permit(
         let policy_path = write_policy(&dir, policy);
 
         let result = replay(&obs_path, &policy_path, None).unwrap();
-        assert_eq!(result.matches, 1);
+        assert_eq!(result.matches, 0);
+        assert_eq!(result.skipped, 1);
         assert!(result.mismatches.is_empty());
     }
 
@@ -866,7 +770,8 @@ permit(
         let policy_path = write_policy(&dir, policy);
 
         let result = replay(&obs_path, &policy_path, None).unwrap();
-        assert_eq!(result.matches, 1);
+        assert_eq!(result.matches, 0);
+        assert_eq!(result.skipped, 1);
         assert!(result.mismatches.is_empty());
     }
 
@@ -1079,14 +984,11 @@ permit(
         let policy_path = write_policy(&dir, policy);
 
         let result = replay(&obs_path, &policy_path, None).unwrap();
+        assert_eq!(result.matches, 0);
+        assert_eq!(result.mismatches.len(), 0);
         assert_eq!(
-            result.matches, 1,
-            "only /workspace/src/main.rs should match"
-        );
-        assert_eq!(
-            result.mismatches.len(),
-            1,
-            "/workspace/secret/keys should mismatch"
+            result.skipped, 2,
+            "filesystem events are skipped in network-only replay"
         );
     }
 
@@ -1129,8 +1031,12 @@ permit(
         let policy_path = write_policy(&dir, policy);
 
         let result = replay(&obs_path, &policy_path, None).unwrap();
-        assert_eq!(result.matches, 1, "only 'node index.js' should match");
-        assert_eq!(result.mismatches.len(), 1, "'rm -rf /' should mismatch");
+        assert_eq!(result.matches, 0);
+        assert_eq!(result.mismatches.len(), 0);
+        assert_eq!(
+            result.skipped, 2,
+            "process events are skipped in network-only replay"
+        );
     }
 
     // -- Warn decision treated as allowed ---------------------------------------

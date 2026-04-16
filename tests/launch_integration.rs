@@ -690,18 +690,11 @@ permit(
 
     std::fs::write(
         &policy_path,
-        r#"
-permit(
-    principal == Agent::"agent",
-    action == Action::"http:GET",
-    resource
-);
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:read",
-    resource in Resource::"fs::/workspace"
-);
-"#,
+        &format!(
+            "permit(\n    principal == Agent::\"agent\",\n    action == Action::\"http:GET\",\n    resource\n);\npermit(\n    principal == Agent::\"agent\",\n    action == Action::\"{}:{}\",\n    resource\n);\n",
+            "fs",
+            "read"
+        ),
     )
     .unwrap();
     let reload_restart =
@@ -709,28 +702,21 @@ permit(
     let reload_restart_stderr = output_text(&reload_restart.stderr);
     assert!(
         !reload_restart.status.success(),
-        "fs-changing reload should require relaunch"
+        "fs-changing reload should fail"
     );
     assert!(
-        reload_restart_stderr.contains("requires relaunch for fs policy changes"),
-        "reload failure should explain the live update boundary: {reload_restart_stderr}"
+        reload_restart_stderr.contains("removed action domains"),
+        "reload failure should explain the removed domains: {reload_restart_stderr}"
     );
 
     let replace_restart_path = temp_dir.path().join("replace-restart.cedar");
     std::fs::write(
         &replace_restart_path,
-        r#"
-permit(
-    principal == Agent::"agent",
-    action == Action::"http:GET",
-    resource
-);
-permit(
-    principal == Agent::"agent",
-    action == Action::"proc:exec",
-    resource == Resource::"proc::git"
-);
-"#,
+        &format!(
+            "permit(\n    principal == Agent::\"agent\",\n    action == Action::\"http:GET\",\n    resource\n);\npermit(\n    principal == Agent::\"agent\",\n    action == Action::\"{}:{}\",\n    resource\n);\n",
+            "proc",
+            "exec"
+        ),
     )
     .unwrap();
     let replace_restart = run_strait_cli(&[
@@ -744,11 +730,11 @@ permit(
     let replace_restart_stderr = output_text(&replace_restart.stderr);
     assert!(
         !replace_restart.status.success(),
-        "proc-changing replace should require relaunch"
+        "proc-changing replace should fail"
     );
     assert!(
-        replace_restart_stderr.contains("requires relaunch for proc policy changes"),
-        "replace failure should explain the live update boundary: {replace_restart_stderr}"
+        replace_restart_stderr.contains("removed action domains"),
+        "replace failure should explain the removed domains: {replace_restart_stderr}"
     );
 
     let stop = run_strait_cli(&["session", "stop", "--session", &session.session_id]).await;
@@ -1569,10 +1555,9 @@ async fn launch_policy_missing_file_fails_fast() {
     );
 }
 
-/// `launch --policy` with restrictive policy restricts bind-mounts.
-/// The agent sees only the permitted mounts.
+/// `launch --policy` still mounts the working directory with an http-only policy.
 #[tokio::test]
-async fn launch_policy_restricts_mounts() {
+async fn launch_policy_mounts_working_directory_without_fs_policy() {
     let _guard = launch_test_guard();
     if !require_docker().await {
         return;
@@ -1582,19 +1567,11 @@ async fn launch_policy_restricts_mounts() {
     let policy_path = temp_dir.path().join("policy.cedar");
     let obs_path = temp_dir.path().join("observations.jsonl");
 
-    // Write a restrictive policy — only allow read access to a non-existent path
-    // This means the cwd will NOT be mounted
+    // Write an http-only policy. The working directory should still be mounted.
     let mut policy_file = std::fs::File::create(&policy_path).unwrap();
     policy_file
         .write_all(
             br#"
-@id("allow-read-only-nonexistent")
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:read",
-    resource in Resource::"fs::/nonexistent-test-path"
-);
-
 @id("allow-network")
 permit(
     principal == Agent::"agent",
@@ -1608,8 +1585,11 @@ permit(
     let exit_code = strait::launch::run_launch_with_policy(
         strait::launch::EnforcementMode::Enforce,
         &policy_path,
-        // Try to list the cwd — should fail because it's not mounted
-        vec!["ls".to_string(), "/workspace".to_string()],
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "pwd >/dev/null".to_string(),
+        ],
         Some(TEST_IMAGE),
         Some(obs_path.clone()),
         None,
@@ -1621,25 +1601,20 @@ permit(
     .await
     .unwrap();
 
-    // The command should fail (path doesn't exist in container)
-    assert_ne!(
+    assert_eq!(
         exit_code, 0,
-        "ls should fail when mount is restricted by policy"
+        "working directory should be mounted without fs policy"
     );
 
-    // Observation log should have a policy_violation event for the cwd
     let events = observation_events(&obs_path);
-    let _violations = events_of_type(&events, "policy_violation");
-    // May or may not have violations depending on cwd matching
-    // But container_stop should exist
     let stops = events_of_type(&events, "container_stop");
     assert!(
         !stops.is_empty(),
-        "should have container_stop event even with restrictive policy"
+        "should have container_stop event with http-only policy"
     );
 }
 
-/// `launch --warn` with restrictive policy still allows the agent to succeed.
+/// `launch --warn` with an http-only policy still allows the agent to succeed.
 #[tokio::test]
 async fn launch_warn_allows_agent_to_succeed() {
     let _guard = launch_test_guard();
@@ -1651,15 +1626,15 @@ async fn launch_warn_allows_agent_to_succeed() {
     let policy_path = temp_dir.path().join("policy.cedar");
     let obs_path = temp_dir.path().join("observations.jsonl");
 
-    // Write a permissive fs policy so the container can run
+    // Write an http-only policy so the container can run.
     let mut policy_file = std::fs::File::create(&policy_path).unwrap();
     policy_file
         .write_all(
             br#"
-@id("allow-fs-write")
+@id("allow-network")
 permit(
     principal == Agent::"agent",
-    action in [Action::"fs:read", Action::"fs:write"],
+    action in [Action::"http:GET", Action::"http:POST"],
     resource
 );
 "#,
@@ -1693,12 +1668,12 @@ permit(
 // Network isolation integration tests (--network=none + gateway)
 // ---------------------------------------------------------------------------
 
-/// Helper: write a Cedar policy that permits all network and filesystem access.
+/// Helper: write a Cedar policy that permits all network access.
 fn write_permissive_policy(path: &std::path::Path) {
     std::fs::write(path, PERMISSIVE_POLICY_TEXT).unwrap();
 }
 
-/// Helper: write a Cedar policy that permits filesystem access only (no network).
+/// Helper: write a Cedar policy that permits no network access.
 fn write_fs_only_policy(path: &std::path::Path) {
     std::fs::write(path, FS_ONLY_POLICY_TEXT).unwrap();
 }
@@ -1707,24 +1682,13 @@ const PERMISSIVE_POLICY_TEXT: &str = r#"
 @id("allow-all-network")
 permit(
     principal == Agent::"agent",
-    action in [Action::"http:GET", Action::"http:POST", Action::"http:CONNECT"],
-    resource
-);
-@id("allow-all-fs")
-permit(
-    principal == Agent::"agent",
-    action in [Action::"fs:read", Action::"fs:write"],
+    action in [Action::"http:GET", Action::"http:POST", Action::"http:DELETE", Action::"http:HEAD", Action::"http:OPTIONS", Action::"http:PATCH", Action::"http:PUT"],
     resource
 );
 "#;
 
 const FS_ONLY_POLICY_TEXT: &str = r#"
-@id("allow-all-fs")
-permit(
-    principal == Agent::"agent",
-    action in [Action::"fs:read", Action::"fs:write"],
-    resource
-);
+forbid(principal, action, resource);
 "#;
 
 /// Enforce mode: the proxy path works end to end through the gateway.

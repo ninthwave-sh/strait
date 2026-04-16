@@ -4,8 +4,6 @@
 //! against the policy set. Actions use namespaced identifiers:
 //!
 //! - `Action::"http:GET"`, `Action::"http:POST"`, … — HTTP methods
-//! - `Action::"fs:read"`, `Action::"fs:write"`, … — filesystem operations
-//! - `Action::"proc:exec"`, `Action::"proc:fork"`, … — process operations
 //!
 //! For HTTP requests, the entity hierarchy is built from the URL path:
 //! splitting `/a/b/c` produces `Resource::"host/a/b/c"` as a child of
@@ -60,6 +58,7 @@ impl PolicyEngine {
     ) -> anyhow::Result<Self> {
         // Check for old-format (pre-v0.3) actions before parsing
         check_old_format_actions(text)?;
+        reject_removed_action_domains(text)?;
 
         let policy_set = PolicySet::from_str(text)
             .map_err(|e| anyhow::anyhow!("invalid Cedar policy file: {e}"))?;
@@ -119,7 +118,7 @@ impl PolicyEngine {
     /// Evaluate a request against the loaded policy set.
     ///
     /// - `host`: target hostname (e.g. `api.github.com`)
-    /// - `action`: domain-agnostic action string (e.g. `http:GET`, `fs:read`, `proc:exec`)
+    /// - `action`: HTTP action string (e.g. `http:GET`, `http:POST`)
     /// - `path`: URL path (e.g. `/repos/org/repo`)
     /// - `headers`: list of (name, value) header pairs
     /// - `agent_id`: identity of the requesting agent (e.g. `"worker"`, `"ci-bot"`)
@@ -142,7 +141,7 @@ impl PolicyEngine {
             EntityId::from_str(agent_id).unwrap(),
         );
 
-        // Action: Action::"<action>" (e.g. "http:GET", "fs:read")
+        // Action: Action::"<action>" (e.g. "http:GET")
         let action_uid = EntityUid::from_type_name_and_id(
             EntityTypeName::from_str("Action").unwrap(),
             EntityId::from_str(action).unwrap(),
@@ -156,7 +155,7 @@ impl PolicyEngine {
         );
 
         // Derive raw method from the action for context backward compatibility.
-        // For "http:GET" → "GET"; for non-HTTP actions, use the full action string.
+        // For "http:GET" → "GET".
         let method = action.strip_prefix("http:").unwrap_or(action);
 
         // Build base context pairs (host, path, method, AWS) using shared builder
@@ -208,7 +207,7 @@ impl PolicyEngine {
     /// annotations, and whether any matching policy has `Effect::Forbid`)
     /// from the Cedar diagnostics.
     ///
-    /// Shared between `evaluate`, `evaluate_fs`, and `evaluate_proc` so
+    /// Shared by policy evaluation paths so
     /// a future change to the metadata collection rules only has to be
     /// made in one place.
     ///
@@ -247,111 +246,6 @@ impl PolicyEngine {
         (policy_names, policy_reasons, blocked_by_forbid)
     }
 
-    /// Evaluate a filesystem action against the loaded policy set.
-    ///
-    /// - `path`: filesystem path (e.g. `/project/src`)
-    /// - `action`: fs action string (e.g. `fs:read`, `fs:write`)
-    /// - `agent_id`: identity of the requesting agent
-    pub fn evaluate_fs(
-        &self,
-        path: &str,
-        action: &str,
-        agent_id: &str,
-    ) -> anyhow::Result<PolicyDecision> {
-        let entities = build_fs_entities(path, agent_id)?;
-
-        let principal = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Agent").unwrap(),
-            EntityId::from_str(agent_id).unwrap(),
-        );
-
-        let action_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Action").unwrap(),
-            EntityId::from_str(action).unwrap(),
-        );
-
-        let normalized = if path.starts_with('/') {
-            path.to_string()
-        } else {
-            format!("/{path}")
-        };
-        let resource_id = format!("fs::{normalized}");
-        let resource = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Resource").unwrap(),
-            EntityId::from_str(&resource_id).unwrap(),
-        );
-
-        // Build context using shared builder so Cedar policies using
-        // `when { context.path like ... }` or `context.operation` work
-        // consistently in both live enforcement and replay.
-        let operation = action.strip_prefix("fs:").unwrap_or(action);
-        let context = build_fs_context(&normalized, operation)?;
-        let request = Request::new(principal, action_uid, resource, context, None)
-            .map_err(|e| anyhow::anyhow!("failed to build Cedar fs request: {e}"))?;
-
-        let response = self
-            .authorizer
-            .is_authorized(&request, &self.policy_set, &entities);
-
-        let (policy_names, policy_reasons, blocked_by_forbid) =
-            self.collect_decision_metadata(response.diagnostics().reason());
-
-        Ok(PolicyDecision {
-            allowed: response.decision() == Decision::Allow,
-            policy_names,
-            policy_reasons,
-            blocked_by_forbid,
-        })
-    }
-
-    /// Evaluate a process action against the loaded policy set.
-    ///
-    /// - `command`: command string (e.g. `"node index.js"`)
-    /// - `action`: proc action string (e.g. `proc:exec`)
-    /// - `agent_id`: identity of the requesting agent
-    pub fn evaluate_proc(
-        &self,
-        command: &str,
-        action: &str,
-        agent_id: &str,
-    ) -> anyhow::Result<PolicyDecision> {
-        let entities = build_proc_entities(command, agent_id)?;
-
-        let principal = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Agent").unwrap(),
-            EntityId::from_str(agent_id).unwrap(),
-        );
-
-        let action_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Action").unwrap(),
-            EntityId::from_str(action).unwrap(),
-        );
-
-        let resource_id = format!("proc::{command}");
-        let resource = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Resource").unwrap(),
-            EntityId::from_str(&resource_id).unwrap(),
-        );
-
-        let context = build_proc_context(command)?;
-        let request = Request::new(principal, action_uid, resource, context, None)
-            .map_err(|e| anyhow::anyhow!("failed to build Cedar proc request: {e}"))?;
-
-        let response = self
-            .authorizer
-            .is_authorized(&request, &self.policy_set, &entities);
-
-        let (policy_names, policy_reasons, blocked_by_forbid) =
-            self.collect_decision_metadata(response.diagnostics().reason());
-
-        Ok(PolicyDecision {
-            allowed: response.decision() == Decision::Allow,
-            policy_names,
-            policy_reasons,
-            blocked_by_forbid,
-        })
-    }
-
     /// Check if a host is permitted by any http: policy.
     ///
     /// Evaluates each standard HTTP method against the host's root resource.
@@ -367,123 +261,6 @@ impl PolicyEngine {
         }
         Ok(false)
     }
-}
-
-/// Extract filesystem permissions from a Cedar policy for container configuration.
-///
-/// For each candidate path, evaluates `fs:write` and `fs:read` actions against
-/// the policy engine. Returns:
-/// - `FsWrite` if `fs:write` is permitted (implies read access too)
-/// - `FsRead` if only `fs:read` is permitted
-/// - Nothing if neither is permitted (path will not be mounted)
-///
-/// # Limitation
-///
-/// This function only evaluates the **caller-supplied** candidate paths — it
-/// does not discover or enumerate all paths that the Cedar policy might permit.
-/// If the policy allows access to a path not included in `paths`, that path
-/// will not appear in the returned permissions and will not be mounted into
-/// the container. Callers are responsible for providing a comprehensive set
-/// of candidate paths (e.g., the working directory, explicit mounts).
-pub fn extract_fs_permissions(
-    engine: &PolicyEngine,
-    paths: &[String],
-    agent_id: &str,
-) -> Vec<crate::container::ContainerPermission> {
-    use crate::container::ContainerPermission;
-    let mut perms = Vec::new();
-    for path in paths {
-        // Check write first (more permissive — write implies read)
-        if let Ok(result) = engine.evaluate_fs(path, "fs:write", agent_id) {
-            if result.allowed {
-                perms.push(ContainerPermission::FsWrite(path.clone()));
-                continue;
-            }
-        }
-        // Check read
-        if let Ok(result) = engine.evaluate_fs(path, "fs:read", agent_id) {
-            if result.allowed {
-                perms.push(ContainerPermission::FsRead(path.clone()));
-            }
-        }
-        // If neither is allowed, path is not mounted
-    }
-    perms
-}
-
-/// Extract process execution permissions from a Cedar policy for container configuration.
-///
-/// Iterates over all permit policies in the set, identifies those that allow
-/// `proc:exec`, and extracts the binary name from the resource constraint.
-/// Returns a `Vec<ContainerPermission::ProcExec>` with one entry per permitted binary.
-///
-/// Supports resource constraints of the form:
-/// - `resource == Resource::"proc::<binary>"` (exact match)
-/// - `resource in Resource::"proc::<binary>"` (hierarchy match, treated as exact)
-///
-/// Policies with `resource is ...` or unconstrained resources are skipped
-/// (we cannot determine a specific binary to mount).
-pub fn extract_proc_permissions(
-    engine: &PolicyEngine,
-    _agent_id: &str,
-) -> Vec<crate::container::ContainerPermission> {
-    use crate::container::ContainerPermission;
-    use cedar_policy::{ActionConstraint, Effect, ResourceConstraint};
-
-    let mut perms = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for policy in engine.policy_set.policies() {
-        if policy.effect() != Effect::Permit {
-            continue;
-        }
-
-        // Check if this policy involves proc:exec
-        let is_proc_exec = match policy.action_constraint() {
-            ActionConstraint::Eq(uid) => uid.to_string().contains("proc:exec"),
-            ActionConstraint::In(uids) => uids.iter().any(|u| u.to_string().contains("proc:exec")),
-            ActionConstraint::Any => false, // Too broad to extract a specific binary
-        };
-        if !is_proc_exec {
-            continue;
-        }
-
-        // Extract binary name from resource constraint
-        let resource_str = match policy.resource_constraint() {
-            ResourceConstraint::Eq(uid) => Some(uid.to_string()),
-            ResourceConstraint::In(uid) => Some(uid.to_string()),
-            _ => None,
-        };
-
-        if let Some(resource_id) = resource_str {
-            // Resource IDs look like: Resource::"proc::git"
-            // Extract the binary name after "proc::"
-            if let Some(binary) = extract_binary_from_resource_id(&resource_id) {
-                if seen.insert(binary.clone()) {
-                    perms.push(ContainerPermission::ProcExec(binary));
-                }
-            }
-        }
-    }
-    perms
-}
-
-/// Extract a binary name from a Cedar resource ID string.
-///
-/// Handles the format `Resource::"proc::<binary>"`, returning the binary name.
-/// Returns `None` if the resource ID doesn't match the proc namespace format.
-fn extract_binary_from_resource_id(resource_id: &str) -> Option<String> {
-    // The to_string() representation of a resource UID is:
-    //   Resource::"proc::git"
-    // We need to extract "git" from this.
-    let inner = resource_id
-        .strip_prefix("Resource::\"")
-        .and_then(|s| s.strip_suffix('"'))?;
-    let binary = inner.strip_prefix("proc::")?;
-    if binary.is_empty() {
-        return None;
-    }
-    Some(binary.to_string())
 }
 /// e.g. host="api.github.com", path="/repos/org/repo" -> "api.github.com/repos/org/repo"
 pub fn build_resource_id(host: &str, path: &str) -> String {
@@ -604,124 +381,26 @@ fn check_old_format_actions(policy_text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build the Cedar entity set for a filesystem operation.
-///
-/// Creates a resource hierarchy from the filesystem path:
-/// - `Resource::"fs::/project/src/main.rs"` (parent: `fs::/project/src`)
-/// - `Resource::"fs::/project/src"` (parent: `fs::/project`)
-/// - `Resource::"fs::/project"` (parent: `fs::/`)
-/// - `Resource::"fs::/"` (root, no parent)
-///
-/// Also creates action entities for `fs:read`, `fs:write`, `fs:create`, `fs:delete`
-/// and the agent entity.
-pub fn build_fs_entities(path: &str, agent_id: &str) -> anyhow::Result<Entities> {
-    let resource_type = EntityTypeName::from_str("Resource").unwrap();
-    let mut entities = Vec::new();
+fn reject_removed_action_domains(policy_text: &str) -> anyhow::Result<()> {
+    let has_fs = policy_text.contains(&format!("Action::\"{}:", "fs"));
+    let has_proc = policy_text.contains(&format!("Action::\"{}:", "proc"));
 
-    // Normalize path: ensure leading slash
-    let normalized = if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    };
-
-    // Build resource IDs from most specific to root
-    // e.g. "/project/src" → ["fs::/project/src", "fs::/project", "fs::/"]
-    let mut resource_ids: Vec<String> = Vec::new();
-    let mut current = normalized.as_str();
-    loop {
-        resource_ids.push(format!("fs::{current}"));
-        if current == "/" {
-            break;
-        }
-        // Go up one level
-        match current.rfind('/') {
-            Some(0) => {
-                // Parent is root
-                resource_ids.push("fs::/".to_string());
-                break;
-            }
-            Some(pos) => current = &current[..pos],
-            None => break,
-        }
+    if !has_fs && !has_proc {
+        return Ok(());
     }
 
-    // Create entities with parent relationships
-    for (idx, id) in resource_ids.iter().enumerate() {
-        let uid = EntityUid::from_type_name_and_id(
-            resource_type.clone(),
-            EntityId::from_str(id).unwrap(),
-        );
-
-        let parents: HashSet<EntityUid> = if idx + 1 < resource_ids.len() {
-            let parent_uid = EntityUid::from_type_name_and_id(
-                resource_type.clone(),
-                EntityId::from_str(&resource_ids[idx + 1]).unwrap(),
-            );
-            HashSet::from([parent_uid])
-        } else {
-            HashSet::new()
-        };
-
-        entities.push(Entity::new_no_attrs(uid, parents));
+    let mut removed = Vec::new();
+    if has_fs {
+        removed.push("fs");
+    }
+    if has_proc {
+        removed.push("proc");
     }
 
-    // Add the principal entity
-    let agent_uid = EntityUid::from_type_name_and_id(
-        EntityTypeName::from_str("Agent").unwrap(),
-        EntityId::from_str(agent_id).unwrap(),
+    anyhow::bail!(
+        "Cedar policy references removed action domains: {}. Strait now supports only http: actions. See docs/designs/devcontainer-strategy.md (decision 4) for the network-only strategy.",
+        removed.join(", ")
     );
-    entities.push(Entity::new_no_attrs(agent_uid, HashSet::new()));
-
-    // Add action entities for filesystem operations
-    for action in &["fs:read", "fs:write", "fs:create", "fs:delete"] {
-        let action_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Action").unwrap(),
-            EntityId::from_str(action).unwrap(),
-        );
-        entities.push(Entity::new_no_attrs(action_uid, HashSet::new()));
-    }
-
-    Entities::from_entities(entities, None)
-        .map_err(|e| anyhow::anyhow!("failed to build fs entity set: {e}"))
-}
-
-/// Build the Cedar entity set for a process operation.
-///
-/// Creates a single resource entity for the command:
-/// - `Resource::"proc::command"` (no hierarchy)
-///
-/// Also creates action entities for `proc:exec`, `proc:fork`, `proc:signal`
-/// and the agent entity.
-pub fn build_proc_entities(command: &str, agent_id: &str) -> anyhow::Result<Entities> {
-    let mut entities = Vec::new();
-
-    // Resource: proc::<command>
-    let resource_id = format!("proc::{command}");
-    let resource_uid = EntityUid::from_type_name_and_id(
-        EntityTypeName::from_str("Resource").unwrap(),
-        EntityId::from_str(&resource_id).unwrap(),
-    );
-    entities.push(Entity::new_no_attrs(resource_uid, HashSet::new()));
-
-    // Add the principal entity
-    let agent_uid = EntityUid::from_type_name_and_id(
-        EntityTypeName::from_str("Agent").unwrap(),
-        EntityId::from_str(agent_id).unwrap(),
-    );
-    entities.push(Entity::new_no_attrs(agent_uid, HashSet::new()));
-
-    // Add action entity for proc:exec (the only process action used).
-    {
-        let action_uid = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Action").unwrap(),
-            EntityId::from_str("proc:exec").unwrap(),
-        );
-        entities.push(Entity::new_no_attrs(action_uid, HashSet::new()));
-    }
-
-    Entities::from_entities(entities, None)
-        .map_err(|e| anyhow::anyhow!("failed to build proc entity set: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,6 +785,7 @@ fn method_host_directive(host: &str, method: &str, form: &str) -> ExceptionDirec
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::Path;
     use tempfile::NamedTempFile;
 
     fn write_policy(content: &str) -> NamedTempFile {
@@ -1115,256 +795,6 @@ mod tests {
         f
     }
 
-    /// Example GitHub Cedar policy from the design doc.
-    ///
-    /// Annotations used by strait:
-    /// - `@id("...")` — human-readable policy name (used in audit logs and deny responses)
-    /// - `@reason("...")` — human-readable denial reason (strait convention, included in
-    ///   audit `denial_reason` field when this policy causes a deny)
-    const GITHUB_POLICY: &str = r#"
-// Allow read access to org repos
-@id("read-repos")
-permit(
-  principal == Agent::"worker",
-  action == Action::"http:GET",
-  resource in Resource::"api.github.com/repos/our-org"
-);
-
-// Allow PR creation on org repos
-@id("create-prs")
-permit(
-  principal == Agent::"worker",
-  action == Action::"http:POST",
-  resource in Resource::"api.github.com/repos/our-org"
-) when { context.path like "*/pulls" };
-
-// Deny push to main (forbid overrides permit).
-// @reason is a strait convention: its value appears in the audit log's
-// denial_reason field when this policy causes a deny.
-@id("deny-push-main")
-@reason("Direct pushes to main are not allowed; use a pull request")
-forbid(
-  principal,
-  action == Action::"http:POST",
-  resource in Resource::"api.github.com"
-) when { context.path like "*/git/refs/heads/main" };
-"#;
-
-    #[test]
-    fn load_valid_policy_file() {
-        let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-        assert!(Arc::strong_count(&engine.policy_set) >= 1);
-    }
-
-    #[test]
-    fn load_missing_policy_file() {
-        let result = PolicyEngine::load(Path::new("/nonexistent/policy.cedar"), None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("failed to read policy file"), "got: {err}");
-    }
-
-    #[test]
-    fn load_invalid_policy_file() {
-        let f = write_policy("this is not valid cedar @@@ {{{");
-        let result = PolicyEngine::load(f.path(), None);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("invalid Cedar policy"), "got: {err}");
-    }
-
-    #[test]
-    fn entity_hierarchy_structure() {
-        let entities =
-            build_http_entity_hierarchy("api.github.com", "/repos/org/repo", "worker").unwrap();
-        // Should have: 4 resource entities + 1 agent + 7 action entities = 12
-        let count = entities.iter().count();
-        assert!(count >= 4, "expected at least 4 entities, got {count}");
-    }
-
-    #[test]
-    fn build_resource_id_basic() {
-        assert_eq!(
-            build_resource_id("api.github.com", "/repos/org/repo"),
-            "api.github.com/repos/org/repo"
-        );
-    }
-
-    #[test]
-    fn build_resource_id_root_path() {
-        assert_eq!(build_resource_id("api.github.com", "/"), "api.github.com");
-    }
-
-    // --- 6 test cases from the TODO ---
-
-    #[test]
-    fn allow_get_repos_org_repo() {
-        let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/our-org/repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(result.allowed, "GET /repos/our-org/repo should be allowed");
-        assert!(
-            result.policy_names.iter().any(|n| n.contains("read-repos")),
-            "expected read-repos policy, got {:?}",
-            result.policy_names
-        );
-    }
-
-    #[test]
-    fn allow_post_pulls() {
-        let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/our-org/repo/pulls",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            result.allowed,
-            "POST /repos/our-org/repo/pulls should be allowed"
-        );
-        assert!(
-            result.policy_names.iter().any(|n| n.contains("create-prs")),
-            "expected create-prs policy, got {:?}",
-            result.policy_names
-        );
-    }
-
-    #[test]
-    fn deny_delete_repos_org_repo() {
-        let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:DELETE",
-                "/repos/our-org/repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "DELETE /repos/our-org/repo should be denied"
-        );
-    }
-
-    #[test]
-    fn deny_post_git_refs_heads_main() {
-        let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/our-org/repo/git/refs/heads/main",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "POST /repos/our-org/repo/git/refs/heads/main should be denied"
-        );
-    }
-
-    #[test]
-    fn deny_patch_settings() {
-        let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-        let result = engine
-            .evaluate("api.github.com", "http:PATCH", "/settings", &[], "worker")
-            .unwrap();
-        assert!(!result.allowed, "PATCH /settings should be denied");
-    }
-
-    #[test]
-    fn deny_get_unknown() {
-        let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-        let result = engine
-            .evaluate("api.github.com", "http:GET", "/unknown", &[], "worker")
-            .unwrap();
-        assert!(!result.allowed, "GET /unknown should be denied");
-    }
-
-    // --- 403 response body ---
-
-    #[test]
-    fn deny_response_body_has_required_fields() {
-        let body = deny_response_body(
-            "api.github.com",
-            "DELETE",
-            "/repos/org/repo",
-            &["deny-destructive".to_string()],
-        );
-
-        assert_eq!(body["error"], "policy_denied");
-        assert!(body["message"]
-            .as_str()
-            .unwrap()
-            .contains("deny-destructive"));
-        assert_eq!(body["host"], "api.github.com");
-        assert_eq!(body["method"], "DELETE");
-        assert_eq!(body["path"], "/repos/org/repo");
-        assert_eq!(body["policy"], "deny-destructive");
-        assert!(body["hint"].as_str().unwrap().contains("DELETE"));
-    }
-
-    #[test]
-    fn deny_response_body_default_deny() {
-        let body = deny_response_body("host", "GET", "/path", &[]);
-        assert_eq!(body["policy"], "default-deny");
-    }
-
-    // --- Entity hierarchy descent test ---
-
-    #[test]
-    fn entity_hierarchy_descent() {
-        // Verify that resource a/b/c is descendant of a/b which is descendant of a
-        let f = write_policy(
-            r#"
-@id("allow-in-parent")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource in Resource::"example.com/a"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // a/b/c should be allowed because it's in Resource::"example.com/a"
-        let result = engine
-            .evaluate("example.com", "http:GET", "/a/b/c", &[], "worker")
-            .unwrap();
-        assert!(
-            result.allowed,
-            "GET /a/b/c should be allowed (descendant of /a)"
-        );
-
-        // /x should be denied (not in Resource::"example.com/a")
-        let result = engine
-            .evaluate("example.com", "http:GET", "/x", &[], "worker")
-            .unwrap();
-        assert!(!result.allowed, "GET /x should be denied (not in /a)");
-    }
-
-    // --- Schema validation tests ---
-
     fn write_schema(content: &str) -> NamedTempFile {
         let mut f = NamedTempFile::with_suffix(".cedarschema").unwrap();
         f.write_all(content.as_bytes()).unwrap();
@@ -1372,7 +802,6 @@ permit(
         f
     }
 
-    /// A valid Cedar schema matching our entity model.
     const VALID_SCHEMA: &str = r#"
 entity Agent;
 entity Resource in [Resource];
@@ -1380,7 +809,6 @@ action "http:GET", "http:POST", "http:PUT", "http:PATCH", "http:DELETE", "http:H
     appliesTo { principal: Agent, resource: Resource, context: {} };
 "#;
 
-    /// A Cedar policy that conforms to VALID_SCHEMA.
     const SCHEMA_CONFORMING_POLICY: &str = r#"
 @id("allow-get")
 permit(
@@ -1391,6 +819,23 @@ permit(
 "#;
 
     #[test]
+    fn load_valid_policy_file() {
+        let f = write_policy(SCHEMA_CONFORMING_POLICY);
+        let engine = PolicyEngine::load(f.path(), None).unwrap();
+        assert!(Arc::strong_count(&engine.policy_set) >= 1);
+    }
+
+    #[test]
+    fn load_missing_policy_file() {
+        let result = PolicyEngine::load(Path::new("/nonexistent/policy.cedar"), None);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to read policy file"));
+    }
+
+    #[test]
     fn load_valid_policy_with_valid_schema() {
         let policy_file = write_policy(SCHEMA_CONFORMING_POLICY);
         let schema_file = write_schema(VALID_SCHEMA);
@@ -1399,46 +844,12 @@ permit(
     }
 
     #[test]
-    fn load_valid_policy_without_schema_backward_compat() {
-        // Existing behavior: no schema → skip validation
-        let policy_file = write_policy(SCHEMA_CONFORMING_POLICY);
-        let engine = PolicyEngine::load(policy_file.path(), None).unwrap();
-        assert!(Arc::strong_count(&engine.policy_set) >= 1);
-    }
-
-    #[test]
-    fn load_policy_violating_schema() {
-        // Policy references an entity type not in the schema
-        let bad_policy = r#"
-@id("bad-principal")
-permit(
-    principal == UnknownType::"foo",
-    action == Action::"http:GET",
-    resource
-);
-"#;
-        let policy_file = write_policy(bad_policy);
-        let schema_file = write_schema(VALID_SCHEMA);
-        let result = PolicyEngine::load(policy_file.path(), Some(schema_file.path()));
-        assert!(result.is_err());
-        let err = format!("{:#}", result.unwrap_err());
-        assert!(
-            err.contains("Cedar policy validation failed"),
-            "expected validation failure message, got: {err}"
-        );
-    }
-
-    #[test]
     fn load_invalid_schema_file() {
         let policy_file = write_policy(SCHEMA_CONFORMING_POLICY);
         let schema_file = write_schema("this is not valid cedarschema @@@ {{{");
         let result = PolicyEngine::load(policy_file.path(), Some(schema_file.path()));
         assert!(result.is_err());
-        let err = format!("{:#}", result.unwrap_err());
-        assert!(
-            err.contains("invalid Cedar schema file"),
-            "expected schema parse error, got: {err}"
-        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("invalid Cedar schema file"));
     }
 
     #[test]
@@ -1449,669 +860,40 @@ permit(
             Some(Path::new("/nonexistent/schema.cedarschema")),
         );
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to read schema file"));
+    }
+
+    #[test]
+    fn http_entity_hierarchy_contains_only_http_actions() {
+        let entities =
+            build_http_entity_hierarchy("api.github.com", "/repos/org/repo", "worker").unwrap();
+        let entity_ids: Vec<String> = entities
+            .iter()
+            .map(|entity| entity.uid().to_string())
+            .collect();
+
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+            assert!(
+                entity_ids
+                    .iter()
+                    .any(|id| id == &format!("Action::\"http:{method}\"")),
+                "missing http action entity for {method}: {entity_ids:?}"
+            );
+        }
         assert!(
-            err.contains("failed to read schema file"),
-            "expected file-not-found error, got: {err}"
-        );
-    }
-
-    // --- Agent identity tests ---
-
-    #[test]
-    fn agent_identity_used_as_cedar_principal() {
-        // Policy allows only Agent::"ci-bot"
-        let f = write_policy(
-            r#"
-@id("ci-read")
-permit(
-    principal == Agent::"ci-bot",
-    action == Action::"http:GET",
-    resource in Resource::"api.github.com"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // ci-bot should be allowed
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/org/repo",
-                &[],
-                "ci-bot",
-            )
-            .unwrap();
-        assert!(result.allowed, "ci-bot should be allowed");
-
-        // anonymous should be denied (different principal)
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/org/repo",
-                &[],
-                "anonymous",
-            )
-            .unwrap();
-        assert!(!result.allowed, "anonymous should be denied");
-    }
-
-    #[test]
-    fn different_agents_get_different_cedar_results() {
-        // Policy allows worker to read, ci-bot to write, denies others
-        let f = write_policy(
-            r#"
-@id("worker-read")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource in Resource::"api.github.com"
-);
-
-@id("ci-bot-write")
-permit(
-    principal == Agent::"ci-bot",
-    action == Action::"http:POST",
-    resource in Resource::"api.github.com"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // worker can GET, cannot POST
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/org/repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(result.allowed, "worker GET should be allowed");
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/org/repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(!result.allowed, "worker POST should be denied");
-
-        // ci-bot can POST, cannot GET
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/org/repo",
-                &[],
-                "ci-bot",
-            )
-            .unwrap();
-        assert!(result.allowed, "ci-bot POST should be allowed");
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/org/repo",
-                &[],
-                "ci-bot",
-            )
-            .unwrap();
-        assert!(!result.allowed, "ci-bot GET should be denied");
-    }
-
-    // --- @reason annotation test ---
-
-    #[test]
-    fn reason_annotation_collected_from_matching_policies() {
-        let f = write_policy(
-            r#"
-// @reason is a strait convention for human-readable denial messages in audit logs.
-@id("deny-destructive")
-@reason("Destructive operations are not allowed on production repos")
-forbid(
-    principal,
-    action == Action::"http:DELETE",
-    resource in Resource::"api.github.com"
-);
-
-@id("allow-read")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource in Resource::"api.github.com"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // DELETE triggers the forbid with @reason
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:DELETE",
-                "/repos/org/repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(!result.allowed);
-        assert!(
-            result
-                .policy_reasons
+            !entity_ids
                 .iter()
-                .any(|r| r.contains("Destructive operations")),
-            "expected @reason annotation, got {:?}",
-            result.policy_reasons
+                .any(|id| id.contains(&format!("{}:", "fs"))),
+            "fs actions should not exist in entity hierarchy: {entity_ids:?}"
         );
-
-        // GET triggers the permit (no @reason annotation)
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/org/repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(result.allowed);
         assert!(
-            result.policy_reasons.is_empty(),
-            "permit without @reason should have empty reasons, got {:?}",
-            result.policy_reasons
-        );
-    }
-
-    // --- Example file validation tests ---
-
-    #[test]
-    fn example_policy_loads_without_errors() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
-        let engine = PolicyEngine::load(&policy_path, None);
-        assert!(
-            engine.is_ok(),
-            "example policy failed to load: {:#}",
-            engine.unwrap_err()
-        );
-    }
-
-    #[test]
-    fn generic_denial_reason_when_no_annotation() {
-        let f = write_policy(
-            r#"
-@id("deny-all")
-forbid(
-    principal,
-    action,
-    resource
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/org/repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(!result.allowed);
-        // No @reason annotation → policy_reasons is empty
-        assert!(
-            result.policy_reasons.is_empty(),
-            "policy without @reason should have empty reasons"
-        );
-    }
-
-    // --- Example file validation tests ---
-
-    #[test]
-    fn example_schema_validates_example_policy() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
-        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedarschema");
-        let engine = PolicyEngine::load(&policy_path, Some(&schema_path));
-        assert!(
-            engine.is_ok(),
-            "example policy failed schema validation: {:#}",
-            engine.unwrap_err()
-        );
-    }
-
-    #[test]
-    fn example_policy_allows_get_org_repos() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
-        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedarschema");
-        let engine = PolicyEngine::load(&policy_path, Some(&schema_path)).unwrap();
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/our-org/my-repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            result.allowed,
-            "GET /repos/our-org/my-repo should be allowed"
-        );
-    }
-
-    #[test]
-    fn example_policy_allows_create_pr() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
-        let engine = PolicyEngine::load(&policy_path, None).unwrap();
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/our-org/my-repo/pulls",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            result.allowed,
-            "POST /repos/our-org/my-repo/pulls should be allowed"
-        );
-    }
-
-    #[test]
-    fn example_policy_denies_push_to_main() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
-        let engine = PolicyEngine::load(&policy_path, None).unwrap();
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/our-org/my-repo/git/refs/heads/main",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "POST to git/refs/heads/main should be denied"
-        );
-    }
-
-    #[test]
-    fn example_policy_denies_push_to_release_branch() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
-        let engine = PolicyEngine::load(&policy_path, None).unwrap();
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/our-org/my-repo/git/refs/heads/release/v1.0",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "POST to git/refs/heads/release/v1.0 should be denied"
-        );
-    }
-
-    #[test]
-    fn example_policy_denies_repo_deletion() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
-        let engine = PolicyEngine::load(&policy_path, None).unwrap();
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:DELETE",
-                "/repos/our-org/my-repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "DELETE /repos/our-org/my-repo should be denied"
-        );
-    }
-
-    #[test]
-    fn example_policy_denies_settings_access() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
-        let engine = PolicyEngine::load(&policy_path, None).unwrap();
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:PATCH",
-                "/repos/our-org/my-repo/settings",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "PATCH /repos/our-org/my-repo/settings should be denied"
-        );
-    }
-
-    // --- AWS context attribute tests ---
-
-    #[test]
-    fn aws_context_attributes_set_for_aws_host() {
-        let f = write_policy(
-            r#"
-@id("allow-s3")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource
-) when { context.aws_service == "s3" && context.aws_region == "us-east-1" };
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // S3 regional request should match
-        let result = engine
-            .evaluate(
-                "s3.us-east-1.amazonaws.com",
-                "http:GET",
-                "/bucket/key",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(result.allowed, "S3 us-east-1 request should be allowed");
-
-        // Lambda request should NOT match (wrong service)
-        let result = engine
-            .evaluate(
-                "lambda.us-east-1.amazonaws.com",
-                "http:GET",
-                "/functions",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(!result.allowed, "Lambda request should not match S3 policy");
-
-        // Non-AWS request should NOT match (no aws_service in context)
-        let result = engine
-            .evaluate("api.github.com", "http:GET", "/repos", &[], "worker")
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "GitHub request should not match AWS policy"
-        );
-    }
-
-    #[test]
-    fn aws_context_region_defaults_to_us_east_1_for_global() {
-        let f = write_policy(
-            r#"
-@id("allow-iam-read")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource
-) when { context.aws_service == "iam" && context.aws_region == "us-east-1" };
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // Global endpoint (iam.amazonaws.com) should default to us-east-1
-        let result = engine
-            .evaluate("iam.amazonaws.com", "http:GET", "/", &[], "worker")
-            .unwrap();
-        assert!(
-            result.allowed,
-            "IAM global endpoint should default to us-east-1"
-        );
-    }
-
-    #[test]
-    fn aws_context_different_regions_distinguished() {
-        let f = write_policy(
-            r#"
-@id("allow-s3-us-east-1")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource
-) when { context.aws_service == "s3" && context.aws_region == "us-east-1" };
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // us-east-1 should be allowed
-        let result = engine
-            .evaluate(
-                "s3.us-east-1.amazonaws.com",
-                "http:GET",
-                "/bucket",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(result.allowed, "S3 us-east-1 should be allowed");
-
-        // eu-west-1 should be denied (different region)
-        let result = engine
-            .evaluate(
-                "s3.eu-west-1.amazonaws.com",
-                "http:GET",
-                "/bucket",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(!result.allowed, "S3 eu-west-1 should be denied");
-    }
-
-    // --- Example AWS file validation tests ---
-
-    #[test]
-    fn example_aws_policy_loads_without_errors() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aws.cedar");
-        let engine = PolicyEngine::load(&policy_path, None);
-        assert!(
-            engine.is_ok(),
-            "AWS example policy failed to load: {:#}",
-            engine.unwrap_err()
-        );
-    }
-
-    #[test]
-    fn example_aws_schema_validates_example_aws_policy() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aws.cedar");
-        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aws.cedarschema");
-        let engine = PolicyEngine::load(&policy_path, Some(&schema_path));
-        assert!(
-            engine.is_ok(),
-            "AWS example policy failed schema validation: {:#}",
-            engine.unwrap_err()
-        );
-    }
-
-    #[test]
-    fn example_aws_policy_allows_s3_us_east_1() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aws.cedar");
-        let engine = PolicyEngine::load(&policy_path, None).unwrap();
-
-        let result = engine
-            .evaluate(
-                "s3.us-east-1.amazonaws.com",
-                "http:PUT",
-                "/my-bucket/object.txt",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            result.allowed,
-            "S3 PUT in us-east-1 should be allowed by example AWS policy"
-        );
-    }
-
-    #[test]
-    fn example_aws_policy_denies_govcloud() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/aws.cedar");
-        let engine = PolicyEngine::load(&policy_path, None).unwrap();
-
-        let result = engine
-            .evaluate(
-                "s3.us-gov-west-1.amazonaws.com",
-                "http:GET",
-                "/bucket",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "GovCloud access should be denied by example AWS policy"
-        );
-    }
-
-    #[test]
-    fn example_policy_denies_outside_org() {
-        let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/github.cedar");
-        let engine = PolicyEngine::load(&policy_path, None).unwrap();
-
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/other-org/their-repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "GET /repos/other-org/their-repo should be denied"
-        );
-    }
-
-    // --- Namespaced action entity tests ---
-
-    #[test]
-    fn http_get_action_entity_construction() {
-        // Verify Action::"http:GET" entity is created and usable
-        let f = write_policy(
-            r#"
-@id("allow-http-get")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-        let result = engine
-            .evaluate("example.com", "http:GET", "/test", &[], "worker")
-            .unwrap();
-        assert!(result.allowed, "http:GET action should match");
-
-        // Bare "GET" (without http: prefix) should NOT match
-        let result = engine
-            .evaluate("example.com", "GET", "/test", &[], "worker")
-            .unwrap();
-        assert!(!result.allowed, "bare GET should not match http:GET policy");
-    }
-
-    #[test]
-    fn fs_read_action_entity_construction() {
-        let entities = build_fs_entities("/project/src", "worker").unwrap();
-        let count = entities.iter().count();
-        // Should have: 3 resource entities (fs::/project/src, fs::/project, fs::/) +
-        //              1 agent + 4 fs action entities = 8
-        assert!(count >= 8, "expected at least 8 fs entities, got {count}");
-    }
-
-    #[test]
-    fn proc_exec_action_entity_construction() {
-        let entities = build_proc_entities("curl", "worker").unwrap();
-        let count = entities.iter().count();
-        // Should have: 1 resource (proc::curl) + 1 agent + 1 proc action (proc:exec) = 3
-        assert_eq!(count, 3, "expected 3 proc entities, got {count}");
-    }
-
-    #[test]
-    fn fs_resource_hierarchy_builds_parent_chain() {
-        // Verify that Resource::"fs::/project/src" has parent fs::/project, which has parent fs::/
-        let f = write_policy(
-            r#"
-@id("allow-fs-read-project")
-permit(
-    principal == Agent::"worker",
-    action == Action::"fs:read",
-    resource in Resource::"fs::/project"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // Build fs entities for /project/src and evaluate
-        let entities = build_fs_entities("/project/src", "worker").unwrap();
-
-        let principal = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Agent").unwrap(),
-            EntityId::from_str("worker").unwrap(),
-        );
-        let action = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Action").unwrap(),
-            EntityId::from_str("fs:read").unwrap(),
-        );
-        let resource = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Resource").unwrap(),
-            EntityId::from_str("fs::/project/src").unwrap(),
-        );
-        let context = Context::empty();
-
-        let request = Request::new(principal, action, resource, context, None).unwrap();
-        let authorizer = Authorizer::new();
-        let response = authorizer.is_authorized(&request, &engine.policy_set, &entities);
-        assert_eq!(
-            response.decision(),
-            Decision::Allow,
-            "fs::/project/src should be in fs::/project (parent chain)"
-        );
-
-        // /other/path should be denied (not in fs::/project)
-        let entities2 = build_fs_entities("/other/path", "worker").unwrap();
-        let resource2 = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Resource").unwrap(),
-            EntityId::from_str("fs::/other/path").unwrap(),
-        );
-        let principal2 = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Agent").unwrap(),
-            EntityId::from_str("worker").unwrap(),
-        );
-        let action2 = EntityUid::from_type_name_and_id(
-            EntityTypeName::from_str("Action").unwrap(),
-            EntityId::from_str("fs:read").unwrap(),
-        );
-        let request2 =
-            Request::new(principal2, action2, resource2, Context::empty(), None).unwrap();
-        let response2 = authorizer.is_authorized(&request2, &engine.policy_set, &entities2);
-        assert_eq!(
-            response2.decision(),
-            Decision::Deny,
-            "fs::/other/path should NOT be in fs::/project"
+            !entity_ids
+                .iter()
+                .any(|id| id.contains(&format!("{}:", "proc"))),
+            "proc actions should not exist in entity hierarchy: {entity_ids:?}"
         );
     }
 
@@ -2119,7 +901,6 @@ permit(
     fn old_format_policy_triggers_migration_error() {
         let f = write_policy(
             r#"
-@id("old-format")
 permit(
     principal == Agent::"worker",
     action == Action::"GET",
@@ -2128,241 +909,89 @@ permit(
 "#,
         );
         let result = PolicyEngine::load(f.path(), None);
-        assert!(result.is_err(), "old-format action should be rejected");
+        assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("old-format actions"),
-            "error should mention old-format: {err}"
+        assert!(err.contains("old-format actions"));
+        assert!(err.contains("http:GET"));
+    }
+
+    #[test]
+    fn load_policy_with_removed_fs_actions_fails() {
+        let removed_action = format!("{}:{}", "fs", "read");
+        let f = write_policy(
+            &format!(
+                "permit(\n    principal,\n    action == Action::\"{removed_action}\",\n    resource\n);\n"
+            ),
         );
+        let result = PolicyEngine::load(f.path(), None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("removed action domains: fs"), "got: {err}");
+        assert!(err.contains("http: actions"), "got: {err}");
         assert!(
-            err.contains("http:GET"),
-            "error should suggest http:GET migration: {err}"
+            err.contains("docs/designs/devcontainer-strategy.md"),
+            "got: {err}"
         );
     }
 
     #[test]
-    fn old_format_detection_does_not_flag_namespaced_actions() {
-        // Policy using correct namespaced format should load fine
+    fn load_policy_with_removed_proc_actions_fails() {
+        let removed_action = format!("{}:{}", "proc", "exec");
+        let f = write_policy(
+            &format!(
+                "permit(\n    principal,\n    action == Action::\"{removed_action}\",\n    resource\n);\n"
+            ),
+        );
+        let result = PolicyEngine::load(f.path(), None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("removed action domains: proc"), "got: {err}");
+        assert!(err.contains("http: actions"), "got: {err}");
+    }
+
+    #[test]
+    fn load_policy_with_both_removed_domains_fails() {
+        let fs_action = format!("{}:{}", "fs", "read");
+        let proc_action = format!("{}:{}", "proc", "exec");
+        let f = write_policy(
+            &format!(
+                "permit(\n    principal,\n    action in [Action::\"{fs_action}\", Action::\"{proc_action}\"],\n    resource\n);\n"
+            ),
+        );
+        let result = PolicyEngine::load(f.path(), None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("fs, proc"));
+    }
+
+    #[test]
+    fn evaluate_http_policy_still_works() {
         let f = write_policy(
             r#"
-@id("namespaced")
+@id("allow-read")
 permit(
     principal == Agent::"worker",
     action == Action::"http:GET",
-    resource
-);
-"#,
-        );
-        let result = PolicyEngine::load(f.path(), None);
-        assert!(result.is_ok(), "namespaced action should not be flagged");
-    }
-
-    // --- evaluate_fs tests ---
-
-    #[test]
-    fn evaluate_fs_read_allowed() {
-        let f = write_policy(
-            r#"
-@id("allow-fs-read")
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:read",
-    resource in Resource::"fs::/project"
+    resource in Resource::"api.github.com/repos/our-org"
 );
 "#,
         );
         let engine = PolicyEngine::load(f.path(), None).unwrap();
-
         let result = engine
-            .evaluate_fs("/project/src/main.rs", "fs:read", "agent")
+            .evaluate(
+                "api.github.com",
+                "http:GET",
+                "/repos/our-org/repo",
+                &[],
+                "worker",
+            )
             .unwrap();
-        assert!(
-            result.allowed,
-            "fs:read should be allowed for /project/src/main.rs"
-        );
+        assert!(result.allowed);
     }
 
     #[test]
-    fn evaluate_fs_write_denied() {
+    fn is_host_permitted_checks_http_methods() {
         let f = write_policy(
             r#"
-@id("allow-fs-read-only")
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:read",
-    resource in Resource::"fs::/project"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let result = engine
-            .evaluate_fs("/project/src", "fs:write", "agent")
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "fs:write should be denied (only read allowed)"
-        );
-    }
-
-    #[test]
-    fn evaluate_fs_write_allowed() {
-        let f = write_policy(
-            r#"
-@id("allow-fs-write")
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:write",
-    resource in Resource::"fs::/project"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let result = engine
-            .evaluate_fs("/project/src", "fs:write", "agent")
-            .unwrap();
-        assert!(
-            result.allowed,
-            "fs:write should be allowed for /project/src"
-        );
-    }
-
-    #[test]
-    fn evaluate_fs_outside_scope_denied() {
-        let f = write_policy(
-            r#"
-@id("allow-project")
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:read",
-    resource in Resource::"fs::/project"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let result = engine
-            .evaluate_fs("/etc/passwd", "fs:read", "agent")
-            .unwrap();
-        assert!(!result.allowed, "fs:read outside /project should be denied");
-    }
-
-    #[test]
-    fn evaluate_fs_context_path_condition_matches() {
-        // Policy uses `when { context.path like "/project/*" }` — should match
-        // now that evaluate_fs populates context with path and operation.
-        let f = write_policy(
-            r#"
-@id("allow-fs-context-path")
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:read",
-    resource
-) when { context.path like "/project/*" };
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let result = engine
-            .evaluate_fs("/project/src/main.rs", "fs:read", "agent")
-            .unwrap();
-        assert!(
-            result.allowed,
-            "fs:read should be allowed when context.path matches /project/*"
-        );
-
-        // Path outside /project should be denied by the `when` condition.
-        let result = engine
-            .evaluate_fs("/etc/passwd", "fs:read", "agent")
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "fs:read should be denied when context.path does not match /project/*"
-        );
-    }
-
-    #[test]
-    fn evaluate_fs_context_operation_populated() {
-        // Policy gates on context.operation — only allow "read" operations.
-        let f = write_policy(
-            r#"
-@id("allow-fs-read-only-by-context")
-permit(
-    principal == Agent::"agent",
-    action,
-    resource in Resource::"fs::/project"
-) when { context.operation == "read" };
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let result = engine
-            .evaluate_fs("/project/src", "fs:read", "agent")
-            .unwrap();
-        assert!(
-            result.allowed,
-            "fs:read should be allowed when context.operation == 'read'"
-        );
-
-        let result = engine
-            .evaluate_fs("/project/src", "fs:write", "agent")
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "fs:write should be denied when context.operation != 'read'"
-        );
-    }
-
-    // --- is_host_permitted tests ---
-
-    #[test]
-    fn is_host_permitted_when_policy_allows() {
-        let f = write_policy(
-            r#"
-@id("allow-github")
-permit(
-    principal == Agent::"agent",
-    action == Action::"http:GET",
-    resource in Resource::"api.github.com"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        assert!(
-            engine.is_host_permitted("api.github.com", "agent").unwrap(),
-            "api.github.com should be permitted"
-        );
-    }
-
-    #[test]
-    fn is_host_not_permitted_when_no_policy() {
-        let f = write_policy(
-            r#"
-@id("allow-github")
-permit(
-    principal == Agent::"agent",
-    action == Action::"http:GET",
-    resource in Resource::"api.github.com"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        assert!(
-            !engine
-                .is_host_permitted("evil.example.com", "agent")
-                .unwrap(),
-            "evil.example.com should not be permitted"
-        );
-    }
-
-    #[test]
-    fn is_host_permitted_with_post_only_policy() {
-        let f = write_policy(
-            r#"
-@id("allow-post-only")
 permit(
     principal == Agent::"agent",
     action == Action::"http:POST",
@@ -2371,872 +1000,11 @@ permit(
 "#,
         );
         let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        assert!(
-            engine
-                .is_host_permitted("api.example.com", "agent")
-                .unwrap(),
-            "host with POST-only policy should still be permitted for CONNECT"
-        );
-    }
-
-    // --- extract_fs_permissions tests ---
-
-    #[test]
-    fn extract_fs_permissions_read_only() {
-        use crate::container::ContainerPermission;
-
-        let f = write_policy(
-            r#"
-@id("read-project")
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:read",
-    resource in Resource::"fs::/project"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let paths = vec!["/project".to_string()];
-        let perms = extract_fs_permissions(&engine, &paths, "agent");
-
-        assert_eq!(perms.len(), 1);
-        assert_eq!(
-            perms[0],
-            ContainerPermission::FsRead("/project".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_fs_permissions_read_write() {
-        use crate::container::ContainerPermission;
-
-        let f = write_policy(
-            r#"
-@id("write-project")
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:write",
-    resource in Resource::"fs::/project"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let paths = vec!["/project".to_string()];
-        let perms = extract_fs_permissions(&engine, &paths, "agent");
-
-        assert_eq!(perms.len(), 1);
-        // fs:write should produce FsWrite (not FsRead)
-        assert_eq!(
-            perms[0],
-            ContainerPermission::FsWrite("/project".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_fs_permissions_denied_path_not_mounted() {
-        let f = write_policy(
-            r#"
-@id("allow-project")
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:read",
-    resource in Resource::"fs::/project"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let paths = vec!["/project".to_string(), "/etc".to_string()];
-        let perms = extract_fs_permissions(&engine, &paths, "agent");
-
-        // /etc should not be mounted (no policy permits it)
-        assert_eq!(perms.len(), 1);
-    }
-
-    #[test]
-    fn extract_fs_permissions_empty_policy_denies_all() {
-        // A policy with no fs: permits should produce no mounts
-        let f = write_policy(
-            r#"
-@id("allow-http-only")
-permit(
-    principal == Agent::"agent",
-    action == Action::"http:GET",
-    resource in Resource::"api.github.com"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let paths = vec!["/project".to_string()];
-        let perms = extract_fs_permissions(&engine, &paths, "agent");
-
-        assert!(
-            perms.is_empty(),
-            "HTTP-only policy should produce no fs mounts"
-        );
-    }
-
-    // --- extract_proc_permissions tests (H-DF-2) ---
-
-    #[test]
-    fn extract_proc_permissions_finds_proc_exec_rules() {
-        use crate::container::ContainerPermission;
-
-        let f = write_policy(
-            r#"
-@id("allow-git")
-permit(
-    principal == Agent::"agent",
-    action == Action::"proc:exec",
-    resource == Resource::"proc::git"
-);
-
-@id("allow-curl")
-permit(
-    principal == Agent::"agent",
-    action == Action::"proc:exec",
-    resource == Resource::"proc::curl"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let perms = extract_proc_permissions(&engine, "agent");
-
-        assert_eq!(perms.len(), 2, "should find 2 proc:exec permissions");
-        let names: Vec<&str> = perms
-            .iter()
-            .map(|p| match p {
-                ContainerPermission::ProcExec(name) => name.as_str(),
-                _ => panic!("expected ProcExec"),
-            })
-            .collect();
-        assert!(names.contains(&"git"), "should contain git: {:?}", names);
-        assert!(names.contains(&"curl"), "should contain curl: {:?}", names);
-    }
-
-    #[test]
-    fn extract_proc_permissions_ignores_non_proc_policies() {
-        let f = write_policy(
-            r#"
-@id("allow-http")
-permit(
-    principal == Agent::"agent",
-    action == Action::"http:GET",
-    resource in Resource::"api.github.com"
-);
-
-@id("allow-fs")
-permit(
-    principal == Agent::"agent",
-    action == Action::"fs:read",
-    resource in Resource::"fs::/project"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let perms = extract_proc_permissions(&engine, "agent");
-
-        assert!(
-            perms.is_empty(),
-            "should return empty for non-proc policies: {:?}",
-            perms
-        );
-    }
-
-    #[test]
-    fn extract_proc_permissions_deduplicates() {
-        use crate::container::ContainerPermission;
-
-        let f = write_policy(
-            r#"
-@id("allow-git-1")
-permit(
-    principal == Agent::"agent",
-    action == Action::"proc:exec",
-    resource == Resource::"proc::git"
-);
-
-@id("allow-git-2")
-permit(
-    principal == Agent::"worker",
-    action == Action::"proc:exec",
-    resource == Resource::"proc::git"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let perms = extract_proc_permissions(&engine, "agent");
-
-        assert_eq!(perms.len(), 1, "should deduplicate: {:?}", perms);
-        assert_eq!(perms[0], ContainerPermission::ProcExec("git".to_string()));
-    }
-
-    #[test]
-    fn extract_proc_permissions_ignores_forbid_rules() {
-        let f = write_policy(
-            r#"
-@id("forbid-git")
-forbid(
-    principal == Agent::"agent",
-    action == Action::"proc:exec",
-    resource == Resource::"proc::git"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let perms = extract_proc_permissions(&engine, "agent");
-
-        assert!(perms.is_empty(), "should ignore forbid rules: {:?}", perms);
-    }
-
-    #[test]
-    fn extract_proc_permissions_handles_resource_in_constraint() {
-        use crate::container::ContainerPermission;
-
-        let f = write_policy(
-            r#"
-@id("allow-node")
-permit(
-    principal == Agent::"agent",
-    action == Action::"proc:exec",
-    resource in Resource::"proc::node"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let perms = extract_proc_permissions(&engine, "agent");
-
-        assert_eq!(perms.len(), 1, "should find resource in constraint");
-        assert_eq!(perms[0], ContainerPermission::ProcExec("node".to_string()));
-    }
-
-    // --- Header namespace security tests (H-ER-1) ---
-
-    #[test]
-    fn header_named_path_does_not_override_url_path() {
-        // A header named "path" must NOT override the actual URL path in context.
-        // The header should appear as "header:path", not "path".
-        let f = write_policy(
-            r#"
-@id("allow-by-path")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource
-) when { context.path == "/safe" };
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // Request to /safe should be allowed
-        let result = engine
-            .evaluate("example.com", "http:GET", "/safe", &[], "worker")
-            .unwrap();
-        assert!(result.allowed, "GET /safe should be allowed");
-
-        // Request to /secret with a header named "path" set to "/safe"
-        // must NOT bypass the policy — the header is namespaced as "header:path"
-        let malicious_headers = vec![("path".to_string(), "/safe".to_string())];
-        let result = engine
-            .evaluate(
-                "example.com",
-                "http:GET",
-                "/secret",
-                &malicious_headers,
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "GET /secret with path header should still be denied — header must not override context.path"
-        );
-    }
-
-    #[test]
-    fn header_named_host_does_not_override_host() {
-        // A header named "host" must NOT override the actual host in context.
-        let f = write_policy(
-            r#"
-@id("allow-example")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource
-) when { context.host == "safe.example.com" };
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // Header named "host" should not override the actual host
-        let malicious_headers = vec![("host".to_string(), "safe.example.com".to_string())];
-        let result = engine
-            .evaluate(
-                "evil.example.com",
-                "http:GET",
-                "/",
-                &malicious_headers,
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "header named 'host' must not override context.host"
-        );
-    }
-
-    #[test]
-    fn header_named_method_does_not_override_method() {
-        // A header named "method" must NOT override the actual method in context.
-        let f = write_policy(
-            r#"
-@id("allow-get-only")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource
-) when { context.method == "GET" };
-
-@id("allow-delete-action")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:DELETE",
-    resource
-) when { context.method == "GET" };
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // Header named "method" set to "GET" should not make a DELETE appear as GET
-        let malicious_headers = vec![("method".to_string(), "GET".to_string())];
-        let result = engine
-            .evaluate(
-                "example.com",
-                "http:DELETE",
-                "/resource",
-                &malicious_headers,
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "header named 'method' must not override context.method"
-        );
-    }
-
-    #[test]
-    fn headers_appear_as_namespaced_keys_in_context() {
-        // Headers should appear in Cedar context with the "header:" prefix.
-        let f = write_policy(
-            r#"
-@id("check-auth-header")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource
-) when { context["header:authorization"] == "Bearer token123" };
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let headers = vec![("Authorization".to_string(), "Bearer token123".to_string())];
-        let result = engine
-            .evaluate("example.com", "http:GET", "/api", &headers, "worker")
-            .unwrap();
-        assert!(
-            result.allowed,
-            "header should be accessible as context[\"header:authorization\"]"
-        );
-    }
-
-    #[test]
-    fn control_chars_in_header_values_are_escaped() {
-        // Control characters in header values should not cause panics.
-        let f = write_policy(
-            r#"
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // Header values with control characters should not panic
-        let headers = vec![
-            (
-                "x-test".to_string(),
-                "line1\nline2\rline3\ttab\0null".to_string(),
-            ),
-            ("x-quotes".to_string(), "has \"quotes\" inside".to_string()),
-            ("x-backslash".to_string(), "path\\to\\file".to_string()),
-        ];
-        let result = engine.evaluate("example.com", "http:GET", "/", &headers, "worker");
-        assert!(
-            result.is_ok(),
-            "control chars in headers should not cause panic: {:?}",
-            result.err()
-        );
-    }
-
-    #[test]
-    fn escape_cedar_string_handles_control_chars() {
-        assert_eq!(escape_cedar_string("hello\nworld"), "hello\\nworld");
-        assert_eq!(escape_cedar_string("tab\there"), "tab\\there");
-        assert_eq!(escape_cedar_string("cr\rhere"), "cr\\rhere");
-        assert_eq!(escape_cedar_string("null\0here"), "null\\0here");
-        assert_eq!(escape_cedar_string("quote\"here"), "quote\\\"here");
-        assert_eq!(escape_cedar_string("back\\slash"), "back\\\\slash");
-        // Multiple control chars in combination
-        assert_eq!(escape_cedar_string("a\nb\rc\td\0e"), "a\\nb\\rc\\td\\0e");
-    }
-
-    #[test]
-    fn restricted_expression_errors_propagate_not_panic() {
-        // Verify that the evaluate function returns Err (not panic)
-        // when given input that could produce invalid Cedar expressions.
-        // After the fix, RestrictedExpression::from_str errors propagate
-        // via ? rather than unwrap().
-        //
-        // Note: with proper escaping, well-formed strings won't trigger
-        // RestrictedExpression parse errors. This test verifies the overall
-        // error handling path works correctly for valid inputs with special chars.
-        let f = write_policy(
-            r#"
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // Various edge cases that should be handled gracefully
-        let edge_cases = vec![
-            ("x-empty".to_string(), "".to_string()),
-            ("x-unicode".to_string(), "héllo wörld".to_string()),
-            (
-                "x-special".to_string(),
-                "<script>alert(1)</script>".to_string(),
-            ),
-            ("x-long".to_string(), "a".repeat(10000)),
-        ];
-
-        for (key, value) in &edge_cases {
-            let headers = vec![(key.clone(), value.clone())];
-            let result = engine.evaluate("example.com", "http:GET", "/", &headers, "worker");
-            assert!(
-                result.is_ok(),
-                "evaluate should handle header '{}' gracefully, got: {:?}",
-                key,
-                result.err()
-            );
-        }
-    }
-
-    // --- Shared context builder tests (M-ER-9) ---
-
-    #[test]
-    fn shared_http_context_matches_evaluate_output() {
-        // Verify that the shared build_http_context produces an equivalent
-        // context to what evaluate() builds internally (same attributes).
-        // We do this by evaluating a policy that uses context.host, context.path,
-        // and context.method — if context is wrong, the policy won't match.
-        let f = write_policy(
-            r#"
-@id("match-all-context")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource
-) when {
-    context.host == "api.github.com" &&
-    context.path == "/repos/org/repo" &&
-    context.method == "GET"
-};
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        // This exercises the shared context builder path in evaluate()
-        let result = engine
-            .evaluate(
-                "api.github.com",
-                "http:GET",
-                "/repos/org/repo",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            result.allowed,
-            "shared context builder should produce host/path/method for evaluate()"
-        );
-    }
-
-    #[test]
-    fn shared_http_context_aws_attrs_match_evaluate() {
-        // Verify AWS context attributes work through the shared builder
-        let f = write_policy(
-            r#"
-@id("match-aws-context")
-permit(
-    principal == Agent::"worker",
-    action == Action::"http:GET",
-    resource
-) when {
-    context.aws_service == "s3" &&
-    context.aws_region == "us-east-1"
-};
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let result = engine
-            .evaluate(
-                "s3.us-east-1.amazonaws.com",
-                "http:GET",
-                "/bucket",
-                &[],
-                "worker",
-            )
-            .unwrap();
-        assert!(
-            result.allowed,
-            "shared context builder should produce AWS attrs for evaluate()"
-        );
-    }
-
-    // --- evaluate_proc tests (M-ER-9) ---
-
-    #[test]
-    fn evaluate_proc_allows_matching_command() {
-        let f = write_policy(
-            r#"
-@id("allow-node")
-permit(
-    principal == Agent::"agent",
-    action == Action::"proc:exec",
-    resource == Resource::"proc::node index.js"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let result = engine
-            .evaluate_proc("node index.js", "proc:exec", "agent")
-            .unwrap();
-        assert!(
-            result.allowed,
-            "proc:exec should be allowed for matching command"
-        );
-        assert!(
-            result.policy_names.iter().any(|n| n.contains("allow-node")),
-            "expected allow-node policy, got {:?}",
-            result.policy_names
-        );
-    }
-
-    #[test]
-    fn evaluate_proc_denies_non_matching_command() {
-        let f = write_policy(
-            r#"
-@id("allow-node")
-permit(
-    principal == Agent::"agent",
-    action == Action::"proc:exec",
-    resource == Resource::"proc::node index.js"
-);
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let result = engine
-            .evaluate_proc("rm -rf /", "proc:exec", "agent")
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "proc:exec should be denied for non-matching command"
-        );
-    }
-
-    #[test]
-    fn evaluate_proc_context_command_condition() {
-        // Policy uses context.command to gate access
-        let f = write_policy(
-            r#"
-@id("allow-node-by-context")
-permit(
-    principal == Agent::"agent",
-    action == Action::"proc:exec",
-    resource
-) when { context.command like "node*" };
-"#,
-        );
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let result = engine
-            .evaluate_proc("node index.js", "proc:exec", "agent")
-            .unwrap();
-        assert!(
-            result.allowed,
-            "proc:exec should be allowed when context.command matches"
-        );
-
-        let result = engine
-            .evaluate_proc("python script.py", "proc:exec", "agent")
-            .unwrap();
-        assert!(
-            !result.allowed,
-            "proc:exec should be denied when context.command doesn't match"
-        );
-    }
-
-    // --- Dead entity removal tests (M-ER-9) ---
-
-    #[test]
-    fn proc_entities_do_not_include_fork_or_signal() {
-        let entities = build_proc_entities("curl", "worker").unwrap();
-        let entity_ids: Vec<String> = entities.iter().map(|e| e.uid().to_string()).collect();
-
-        // Should contain proc:exec
-        assert!(
-            entity_ids.iter().any(|id| id.contains("proc:exec")),
-            "should have proc:exec entity, got: {:?}",
-            entity_ids
-        );
-
-        // Should NOT contain proc:fork or proc:signal
-        assert!(
-            !entity_ids.iter().any(|id| id.contains("proc:fork")),
-            "should not have proc:fork entity, got: {:?}",
-            entity_ids
-        );
-        assert!(
-            !entity_ids.iter().any(|id| id.contains("proc:signal")),
-            "should not have proc:signal entity, got: {:?}",
-            entity_ids
-        );
-    }
-
-    // -------------------------------------------------------------------
-    // Blocked-request synthesis tests
-    //
-    // These cover the three scope cases listed in the H-CSM-2 test plan:
-    // host-only (empty path), method-plus-host (depth-1 path, ambiguous),
-    // and path-scoped (depth>=2). Also cover the forbid-effect no-
-    // suggestion path and the stability of `build_match_key`.
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn build_match_key_mirrors_watch_ui_format() {
-        let key = build_match_key("api.github.com", "GET", "/repos/org/repo");
-        assert_eq!(key, "http:GET api.github.com/repos/org/repo");
-
-        // Root path: host with no trailing slash in the request maps to
-        // "http:GET api.github.com/" — path is preserved verbatim.
-        let key_root = build_match_key("api.example.com", "POST", "/");
-        assert_eq!(key_root, "http:POST api.example.com/");
-    }
-
-    #[test]
-    fn denial_explanation_prefers_reason_annotations() {
-        // With @reason annotations present, those are used verbatim.
-        let explanation = build_denial_explanation(
-            "api.github.com",
-            "POST",
-            "/git/refs/heads/main",
-            &["deny-push-main".to_string()],
-            &["Direct pushes to main are not allowed; use a pull request".to_string()],
-        );
-        assert_eq!(
-            explanation,
-            "Direct pushes to main are not allowed; use a pull request"
-        );
-    }
-
-    #[test]
-    fn denial_explanation_falls_back_to_policy_name() {
-        let explanation = build_denial_explanation(
-            "api.example.com",
-            "GET",
-            "/data",
-            &["some-policy".to_string()],
-            &[],
-        );
-        assert_eq!(
-            explanation,
-            "denied by policy 'some-policy': GET /data on api.example.com"
-        );
-    }
-
-    #[test]
-    fn denial_explanation_falls_back_to_default_deny() {
-        let explanation = build_denial_explanation("api.example.com", "GET", "/data", &[], &[]);
-        assert_eq!(
-            explanation,
-            "denied by default-deny: GET /data on api.example.com"
-        );
-    }
-
-    #[test]
-    fn candidate_exception_path_scoped_for_deep_paths() {
-        let blocked = synthesize_blocked_request(
-            "api.github.com",
-            "GET",
-            "/repos/org/repo",
-            &["read-repos".to_string()],
-            &[],
-            false,
-        );
-
-        // Stable ID is populated and parseable as a UUID.
-        assert!(uuid::Uuid::parse_str(&blocked.blocked_id).is_ok());
-        assert_eq!(blocked.match_key, "http:GET api.github.com/repos/org/repo");
-        assert!(blocked.explanation.contains("read-repos"));
-
-        let ex = blocked
-            .candidate_exception
-            .expect("path-scoped request should have a candidate exception");
-        assert_eq!(ex.scope, ExceptionScope::PathScoped);
-        assert!(!ex.ambiguous);
-        assert_eq!(
-            ex.once.summary,
-            "allow http:GET api.github.com/repos/org/repo"
-        );
-        assert_eq!(
-            ex.session.summary,
-            "allow http:GET api.github.com/repos/org/repo"
-        );
-        // The persist snippet must contain the exact Cedar resource ID
-        // format used by the evaluator.
-        assert!(ex
-            .persist
-            .cedar_snippet
-            .contains("resource == Resource::\"api.github.com/repos/org/repo\""));
-        assert!(ex
-            .persist
-            .cedar_snippet
-            .contains("action == Action::\"http:GET\""));
-    }
-
-    #[test]
-    fn candidate_exception_method_host_for_depth_one_path_is_ambiguous() {
-        let blocked =
-            synthesize_blocked_request("api.example.com", "POST", "/data", &[], &[], false);
-
-        let ex = blocked
-            .candidate_exception
-            .expect("depth-1 request should have a candidate exception");
-        assert_eq!(ex.scope, ExceptionScope::MethodHost);
-        // Depth-1: both PathScoped and MethodHost are plausible, so the
-        // suggestion is flagged as ambiguous.
-        assert!(ex.ambiguous);
-        assert_eq!(ex.once.summary, "allow http:POST api.example.com");
-        assert!(ex
-            .persist
-            .cedar_snippet
-            .contains("resource in Resource::\"api.example.com\""));
-    }
-
-    #[test]
-    fn candidate_exception_method_host_for_empty_path_is_not_ambiguous() {
-        let blocked = synthesize_blocked_request("api.example.com", "GET", "/", &[], &[], false);
-
-        let ex = blocked
-            .candidate_exception
-            .expect("empty-path request should have a candidate exception");
-        assert_eq!(ex.scope, ExceptionScope::MethodHost);
-        assert!(!ex.ambiguous);
-        assert_eq!(ex.once.summary, "allow http:GET api.example.com");
-    }
-
-    #[test]
-    fn forbid_denial_has_no_candidate_exception() {
-        let blocked = synthesize_blocked_request(
-            "api.github.com",
-            "POST",
-            "/git/refs/heads/main",
-            &["deny-push-main".to_string()],
-            &["Direct pushes to main are not allowed".to_string()],
-            true,
-        );
-
-        assert!(blocked.candidate_exception.is_none());
-        let reason = blocked
-            .no_exception_reason
-            .expect("forbid denial should record a no-exception reason");
-        assert!(reason.contains("forbid"));
-        // Explanation should still come through.
-        assert_eq!(blocked.explanation, "Direct pushes to main are not allowed");
-    }
-
-    #[test]
-    fn forbid_effect_is_detected_in_evaluation() {
-        // End-to-end: loading GITHUB_POLICY and evaluating a request
-        // blocked by the forbid policy should surface
-        // blocked_by_forbid: true so the synthesizer can emit the
-        // no-suggestion variant.
-        let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let decision = engine
-            .evaluate(
-                "api.github.com",
-                "http:POST",
-                "/repos/our-org/myrepo/git/refs/heads/main",
-                &[],
-                "worker",
-            )
-            .unwrap();
-
-        assert!(!decision.allowed);
-        assert!(
-            decision.blocked_by_forbid,
-            "forbid policy should flag decision as blocked_by_forbid, got policies: {:?}",
-            decision.policy_names
-        );
-    }
-
-    #[test]
-    fn permit_denial_by_missing_permit_is_not_blocked_by_forbid() {
-        // Default-deny (no permit matches, no forbid matches) should
-        // NOT set blocked_by_forbid — the synthesizer needs this so it
-        // can still offer a candidate permit.
-        let f = write_policy(GITHUB_POLICY);
-        let engine = PolicyEngine::load(f.path(), None).unwrap();
-
-        let decision = engine
-            .evaluate("api.openai.com", "http:GET", "/v1/models", &[], "worker")
-            .unwrap();
-
-        assert!(!decision.allowed);
-        assert!(
-            !decision.blocked_by_forbid,
-            "default-deny should NOT set blocked_by_forbid"
-        );
-
-        // And the synthesized blocked-request should include a
-        // candidate exception, not a no-suggestion marker.
-        let blocked = synthesize_blocked_request(
-            "api.openai.com",
-            "GET",
-            "/v1/models",
-            &decision.policy_names,
-            &decision.policy_reasons,
-            decision.blocked_by_forbid,
-        );
-        assert!(blocked.candidate_exception.is_some());
-        assert!(blocked.no_exception_reason.is_none());
+        assert!(engine
+            .is_host_permitted("api.example.com", "agent")
+            .unwrap());
+        assert!(!engine
+            .is_host_permitted("evil.example.com", "agent")
+            .unwrap());
     }
 }

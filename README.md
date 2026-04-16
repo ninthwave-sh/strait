@@ -2,13 +2,15 @@
 
 > **Early development.** Strait is pre-v1, under active development, and not yet distributed or stable. APIs, config formats, and CLI flags will change. Not recommended for production use.
 
-Policy platform for AI agents. Strait uses a container-scoped MITM proxy plus Cedar policy over network, filesystem, and process access. That owned runtime boundary is deliberate: request-level visibility without machine-wide CA trust needs a boundary we control.
+strait is the network policy layer for devcontainers. Replace your iptables allowlist with a Cedar policy engine, live request-level decisions, and a desktop control plane.
+
+Strait uses a container-scoped MITM proxy and Cedar to control outbound HTTP access from a devcontainer-style runtime. That owned runtime boundary is deliberate: request-level visibility without machine-wide CA trust needs a boundary we control.
 
 ## The problem
 
-Security teams need to answer one question: *what should this agent be allowed to do?* But today's tools split that answer across separate network proxies, filesystem sandboxes, and process monitors, each with its own policy format and its own blind spots.
+Security teams need to answer one question: *what should this agent be allowed to do over the network?* The devcontainer spec already answers image, mounts, users, and editor settings. What it does not answer is request-level egress policy for the agent running inside it.
 
-Strait unifies all three under Cedar. Observe what an agent actually does, auto-generate a policy from that behavior, then enforce it.
+Strait replaces coarse iptables allowlists with Cedar. Observe what an agent actually does, generate a network policy from that behavior, then enforce it.
 
 We explored a host-scoped pivot after looking closely at `nono`. The learning was useful, but it reinforced the original architecture: if you want MITM-level request control across everything the agent does, without mandating machine-wide CA trust, you need a runtime boundary you own. For Strait, that boundary is still the container.
 
@@ -23,11 +25,6 @@ We explored a host-scoped pivot after looking closely at `nono`. The learning wa
   │  │ (your cmd)   │     │ Cedar eval + creds   │       │
   │  │ [full TTY]   │     └──────────────────────┘       │
   │  └──────────────┘                                    │
-  │                                                      │
-  │  Filesystem from Cedar policy:                       │
-  │    fs:read  /project/src  -> read-only mount         │
-  │    fs:write /project/out  -> read-write mount        │
-  │    (no policy = not mounted = invisible)             │
   └──────────────────────┬───────────────────────────────┘
                          │ observations
   ┌──────────────────────▼───────────────────────────────┐
@@ -41,13 +38,13 @@ We explored a host-scoped pivot after looking closely at `nono`. The learning wa
   └──────────────────────────────────────────────────────┘
 ```
 
-Cedar policies control three domains:
+Cedar policies control network egress:
 
-- **Network** - HTTPS MITM proxy with request-level policy (`http:GET`, `http:POST`, `http:DELETE`). Credential injection on allow. The agent never sees real API tokens.
-- **Filesystem** - Cedar `fs:read` / `fs:write` rules translate to container bind-mounts. No rule = not mounted = invisible to the agent.
-- **Process** - Cedar `proc:exec` rules control which binaries are available in the container.
+- **Network** - HTTPS MITM proxy with request-level policy (`http:GET`, `http:POST`, `http:DELETE`). Credential injection happens on allow. The agent never sees real API tokens.
+- **Identity-aware rules** - Use Cedar to scope requests by method, host, path, and agent identity instead of maintaining a shell-script allowlist.
+- **Devcontainer fit** - Keep image build, mounts, users, and editor settings in `devcontainer.json`. Use strait for outbound HTTP policy.
 
-Standalone proxy sessions still exist as a secondary mode for debugging and integrations, and they publish the same session control surfaces. They are useful infrastructure, but they are not the primary product wedge.
+Standalone proxy sessions still exist as a secondary mode for debugging and integrations, and they publish the same session control surfaces. They are useful infrastructure, but the primary product story is devcontainers plus request-level network policy.
 
 ## Trust boundary
 
@@ -101,19 +98,13 @@ strait session reload-policy --session <SESSION_ID>
 strait session replace-policy --session <SESSION_ID> ./policy.cedar
 ```
 
-These commands only apply network policy changes live. Filesystem (`fs:`) or process (`proc:`) changes still require a relaunch because those domains are enforced by container mounts and executable availability at container start.
+These commands apply network policy changes live for the running session.
 
 Supported live loop:
 
 1. Update HTTP rules in `policy.cedar`.
 2. Run `strait session replace-policy --session <SESSION_ID> ./policy.cedar`.
 3. Keep the same interactive session running while new network decisions take effect.
-
-Restart-bound loop:
-
-1. Add or remove `fs:` or `proc:` permissions.
-2. Relaunch with `strait launch --warn ...` or `strait launch --policy ...`.
-3. Do not expect `reload-policy` or `replace-policy` to mutate mounts or available binaries in place.
 
 ### Observe what an agent does
 
@@ -205,31 +196,15 @@ What to verify:
 
 ## Cedar policies
 
-A single `.cedar` file governs all three domains:
+A single `.cedar` file governs outbound HTTP policy:
 
 ```cedar
-// Network: allow GET on org repos, inject credentials automatically
+// Allow read access to org repos, inject credentials automatically
 @id("read-repos")
 permit(
   principal == Agent::"worker",
   action == Action::"http:GET",
   resource in Resource::"api.github.com/repos/our-org"
-);
-
-// Filesystem: read-only mount of project source
-@id("read-source")
-permit(
-  principal,
-  action == Action::"fs:read",
-  resource in Resource::"fs::/project/src"
-);
-
-// Process: allow git binary
-@id("allow-git")
-permit(
-  principal,
-  action == Action::"proc:exec",
-  resource == Resource::"proc::git"
 );
 
 // Hard deny: no pushes to main
@@ -281,6 +256,7 @@ This mode shares the same session publication and watch surfaces as the primary 
 ## Docs and examples
 
 - [Devcontainer comparison](docs/devcontainer.md) - where strait fits relative to the devcontainer spec and Claude Code's `init-firewall.sh` setup
+- [Devcontainer strategy](docs/designs/devcontainer-strategy.md) - architecture rationale for the network-only devcontainer framing
 - [Claude Code example](examples/claude-code/README.md) - run Claude Code inside a strait-managed container
 
 ## Policy tooling
@@ -302,17 +278,17 @@ strait watch                                       # compatibility alias for new
 
 ## Use cases
 
-- **Agent sandboxing** - run AI agents with least-privilege access to APIs, files, and tools
-- **CI/CD pipelines** - govern what builds can fetch and write, with auditable records
-- **Compliance** - immutable audit trail of every API call and file access
+- **Devcontainer network policy** - replace shell-script firewall rules with Cedar policy for outbound HTTP access
+- **CI/CD pipelines** - govern what builds and agents can call over the network, with auditable records
+- **Compliance** - immutable audit trail of every API call
 - **Credential isolation** - policy-governed API access without sharing secrets
 
 ## Known limitations
 
 - **Network enforcement requires a container runtime** - containers run with `--network=none` (no network interfaces). Traffic reaches the proxy through a gateway binary that communicates over a bind-mounted Unix socket. Direct TCP bypass is not possible inside the container, but the enforcement only applies when running under `strait launch`.
 - **Trust is container-local, not host-wide** - the session CA is only injected inside the container. Standalone `strait proxy` sessions rely on whatever trust configuration the pointing client already has; only `strait launch` gives you the "no machine-wide CA install" guarantee.
-- **Filesystem and process enforcement rely on container isolation** - standard container security model.
-- **Live mutation stops at the network boundary** - `strait session reload-policy` and `strait session replace-policy` can update HTTP policy live, but filesystem mounts and available executables are fixed for the lifetime of the launched container.
+- **Devcontainer config stays outside strait** - image build, mounts, users, editor settings, and lifecycle hooks still belong in `devcontainer.json`.
+- **Policy scope is network-only** - strait does not add separate Cedar rules for filesystem mounts or executable availability.
 
 ## Install
 

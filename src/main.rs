@@ -573,97 +573,51 @@ async fn main() -> anyhow::Result<()> {
             let extra_mounts = strait::launch::parse_extra_mounts(&mount)?;
             let exit_code = if let Some(policy_path) = policy {
                 // Enforce mode: deny disallowed access
-                if let Some(devcontainer_config) = devcontainer_config.clone() {
-                    strait::launch::run_launch_with_policy_and_devcontainer(
-                        strait::launch::EnforcementMode::Enforce,
-                        &policy_path,
-                        command,
-                        image.as_deref(),
-                        Some(output),
-                        credential_store,
-                        mitm_hosts,
-                        env,
-                        extra_mounts,
-                        tty,
-                        devcontainer_config,
-                    )
-                    .await?
-                } else {
-                    strait::launch::run_launch_with_policy(
-                        strait::launch::EnforcementMode::Enforce,
-                        &policy_path,
-                        command,
-                        image.as_deref(),
-                        Some(output),
-                        credential_store,
-                        mitm_hosts,
-                        env,
-                        extra_mounts,
-                        tty,
-                    )
-                    .await?
-                }
+                strait::launch::run_launch_with_policy(
+                    strait::launch::EnforcementMode::Enforce,
+                    &policy_path,
+                    command,
+                    image.as_deref(),
+                    Some(output),
+                    credential_store,
+                    mitm_hosts,
+                    env,
+                    extra_mounts,
+                    tty,
+                    devcontainer_config.clone(),
+                )
+                .await?
             } else if let Some(warn_path) = warn {
                 // Warn mode: allow all, log violations
-                if let Some(devcontainer_config) = devcontainer_config.clone() {
-                    strait::launch::run_launch_with_policy_and_devcontainer(
-                        strait::launch::EnforcementMode::Warn,
-                        &warn_path,
-                        command,
-                        image.as_deref(),
-                        Some(output),
-                        credential_store,
-                        mitm_hosts,
-                        env,
-                        extra_mounts,
-                        tty,
-                        devcontainer_config,
-                    )
-                    .await?
-                } else {
-                    strait::launch::run_launch_with_policy(
-                        strait::launch::EnforcementMode::Warn,
-                        &warn_path,
-                        command,
-                        image.as_deref(),
-                        Some(output),
-                        credential_store,
-                        mitm_hosts,
-                        env,
-                        extra_mounts,
-                        tty,
-                    )
-                    .await?
-                }
+                strait::launch::run_launch_with_policy(
+                    strait::launch::EnforcementMode::Warn,
+                    &warn_path,
+                    command,
+                    image.as_deref(),
+                    Some(output),
+                    credential_store,
+                    mitm_hosts,
+                    env,
+                    extra_mounts,
+                    tty,
+                    devcontainer_config.clone(),
+                )
+                .await?
             } else {
                 // Observe mode: allow all, record activity
                 debug_assert!(observe);
-                if let Some(devcontainer_config) = devcontainer_config.clone() {
-                    strait::launch::run_launch_observe_with_devcontainer(
-                        command,
-                        image.as_deref(),
-                        Some(output),
-                        credential_store,
-                        mitm_hosts,
-                        env,
-                        extra_mounts,
-                        tty,
-                        devcontainer_config,
-                    )
-                    .await?
-                } else {
-                    strait::launch::run_launch_observe(
-                        command,
-                        image.as_deref(),
-                        Some(output),
-                        credential_store,
-                        mitm_hosts,
-                        env,
-                        extra_mounts,
-                        tty,
-                    )
-                    .await?
-                }
+                strait::launch::run_launch_observe(
+                    command,
+                    image.as_deref(),
+                    Some(output),
+                    credential_store,
+                    mitm_hosts,
+                    env,
+                    extra_mounts,
+                    tty,
+                    devcontainer_config.clone(),
+                )
+                .await?
             };
             std::process::exit(exit_code);
         }

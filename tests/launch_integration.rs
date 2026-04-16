@@ -230,6 +230,7 @@ async fn start_managed_observe_launch() -> (
             vec![],
             vec![],
             false,
+            None,
         )
         .await
     });
@@ -270,6 +271,7 @@ async fn start_managed_policy_launch(
             vec![],
             vec![],
             false,
+            None,
         )
         .await
     });
@@ -407,6 +409,7 @@ async fn launch_observe_echo_hello() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .expect("launch should succeed");
@@ -915,6 +918,7 @@ async fn launch_observe_contains_lifecycle_events() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1000,6 +1004,7 @@ done
             mode: "rw".to_string(),
         }],
         false,
+        None,
     )
     .await
     .expect("observe launch should succeed");
@@ -1368,6 +1373,7 @@ async fn launch_observe_bad_command_exit_code() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1579,6 +1585,7 @@ async fn launch_session_stop_before_container_startup_completes() {
             vec![],
             vec![],
             false,
+            None,
         )
         .await
     });
@@ -1649,6 +1656,7 @@ async fn launch_policy_invalid_file_fails_fast() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await;
 
@@ -1683,6 +1691,7 @@ async fn launch_policy_missing_file_fails_fast() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await;
 
@@ -1736,6 +1745,7 @@ permit(
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1791,6 +1801,7 @@ permit(
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1874,6 +1885,7 @@ async fn enforce_proxy_path_end_to_end() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1926,6 +1938,7 @@ async fn enforce_direct_outbound_tcp_blocked() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1963,6 +1976,7 @@ async fn observe_direct_outbound_tcp_blocked() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -2009,6 +2023,7 @@ async fn observe_proxy_path_end_to_end() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -2047,6 +2062,7 @@ async fn enforce_exit_code_propagation() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -2094,6 +2110,7 @@ async fn enforce_clean_exit_zero() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -2156,6 +2173,7 @@ async fn warn_proxy_path_end_to_end() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();

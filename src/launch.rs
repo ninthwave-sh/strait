@@ -1669,6 +1669,40 @@ fn devcontainer_env(devcontainer: &DevcontainerConfig) -> Vec<String> {
         .collect()
 }
 
+struct DevcontainerRuntime {
+    options: ContainerRuntimeOptions,
+    mounts: Vec<ResolvedDevcontainerMount>,
+    env: Vec<String>,
+}
+
+fn prepare_devcontainer_runtime(
+    cwd: &Path,
+    devcontainer: Option<&DevcontainerConfig>,
+) -> anyhow::Result<DevcontainerRuntime> {
+    let Some(config) = devcontainer else {
+        return Ok(DevcontainerRuntime {
+            options: ContainerRuntimeOptions::default(),
+            mounts: Vec::new(),
+            env: Vec::new(),
+        });
+    };
+    let workspace_path = Some(resolve_devcontainer_workspace(cwd, config));
+    let mounts = resolve_devcontainer_mounts(&config.mounts, cwd)?;
+    emit_devcontainer_mount_diagnostic(&mounts);
+    let options = ContainerRuntimeOptions {
+        workspace_mount_path: workspace_path.clone(),
+        working_dir: workspace_path,
+        user: config.remote_user.clone(),
+        pre_exec_hooks: devcontainer_pre_exec_hooks(config),
+    };
+    let env = devcontainer_env(config);
+    Ok(DevcontainerRuntime {
+        options,
+        mounts,
+        env,
+    })
+}
+
 fn resolve_devcontainer_workspace(cwd: &Path, devcontainer: &DevcontainerConfig) -> String {
     devcontainer
         .workspace_folder
@@ -2039,6 +2073,7 @@ pub async fn run_launch_observe(
     extra_env: Vec<String>,
     extra_mounts: Vec<ExtraMount>,
     tty: bool,
+    devcontainer: Option<DevcontainerConfig>,
 ) -> anyhow::Result<i32> {
     run_launch_observe_with_terminal_mode(
         command,
@@ -2051,7 +2086,7 @@ pub async fn run_launch_observe(
         tty,
         LaunchTerminalMode::Host,
         None,
-        None,
+        devcontainer,
     )
     .await
 }
@@ -2083,36 +2118,6 @@ pub async fn run_launch_observe_with_ready_signal(
         LaunchTerminalMode::Host,
         Some(ready_tx),
         None,
-    )
-    .await
-}
-
-/// Observe-mode entry point that applies a parsed devcontainer configuration.
-#[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
-pub async fn run_launch_observe_with_devcontainer(
-    command: Vec<String>,
-    image: Option<&str>,
-    output: Option<PathBuf>,
-    credential_store: Option<Arc<CredentialStore>>,
-    mitm_hosts: Vec<String>,
-    extra_env: Vec<String>,
-    extra_mounts: Vec<ExtraMount>,
-    tty: bool,
-    devcontainer: DevcontainerConfig,
-) -> anyhow::Result<i32> {
-    run_launch_observe_with_terminal_mode(
-        command,
-        image,
-        output,
-        credential_store,
-        mitm_hosts,
-        extra_env,
-        extra_mounts,
-        tty,
-        LaunchTerminalMode::Host,
-        None,
-        Some(devcontainer),
     )
     .await
 }
@@ -2234,26 +2239,7 @@ async fn run_launch_observe_with_terminal_mode(
         tokio::spawn(run_mitm_unix_proxy_loop(listener, proxy_ctx))
     };
 
-    let workspace_path = devcontainer
-        .as_ref()
-        .map(|config| resolve_devcontainer_workspace(&cwd, config));
-    let devcontainer_mounts = if let Some(config) = devcontainer.as_ref() {
-        let mounts = resolve_devcontainer_mounts(&config.mounts, &cwd)?;
-        emit_devcontainer_mount_diagnostic(&mounts);
-        mounts
-    } else {
-        Vec::new()
-    };
-    let runtime_options = if let Some(config) = devcontainer.as_ref() {
-        ContainerRuntimeOptions {
-            workspace_mount_path: workspace_path.clone(),
-            working_dir: workspace_path.clone(),
-            user: config.remote_user.clone(),
-            pre_exec_hooks: devcontainer_pre_exec_hooks(config),
-        }
-    } else {
-        ContainerRuntimeOptions::default()
-    };
+    let dc_runtime = prepare_devcontainer_runtime(&cwd, devcontainer.as_ref())?;
 
     // 7. Build observe-mode container config.
     warn!(
@@ -2273,19 +2259,11 @@ async fn run_launch_observe_with_terminal_mode(
         Some(&ca_pem_path),
         &cwd,
         tty,
-        &runtime_options,
+        &dc_runtime.options,
     )?;
     config.auto_remove = false;
-    config.env = if let Some(devcontainer) = devcontainer.as_ref() {
-        merge_env_layers([
-            devcontainer_env(devcontainer),
-            extra_env,
-            config.env.clone(),
-        ])
-    } else {
-        merge_env_layers([extra_env, config.env.clone()])
-    };
-    for mount in &devcontainer_mounts {
+    config.env = merge_env_layers([dc_runtime.env, extra_env, config.env.clone()]);
+    for mount in &dc_runtime.mounts {
         config.binds.push(mount.to_bind_string());
     }
     for m in &extra_mounts {
@@ -2303,7 +2281,7 @@ async fn run_launch_observe_with_terminal_mode(
         path: cwd.to_string_lossy().to_string(),
         mode: "read-write".to_string(),
     });
-    for mount in &devcontainer_mounts {
+    for mount in &dc_runtime.mounts {
         obs_stream.emit(EventKind::Mount {
             path: mount.source.clone(),
             mode: if mount.mode == "ro" {
@@ -2424,6 +2402,7 @@ pub async fn run_launch_with_policy(
     extra_env: Vec<String>,
     extra_mounts: Vec<ExtraMount>,
     tty: bool,
+    devcontainer: Option<DevcontainerConfig>,
 ) -> anyhow::Result<i32> {
     run_launch_with_policy_with_terminal_mode(
         mode,
@@ -2438,7 +2417,7 @@ pub async fn run_launch_with_policy(
         tty,
         LaunchTerminalMode::Host,
         None,
-        None,
+        devcontainer,
     )
     .await
 }
@@ -2474,40 +2453,6 @@ pub async fn run_launch_with_policy_with_ready_signal(
         LaunchTerminalMode::Host,
         Some(ready_tx),
         None,
-    )
-    .await
-}
-
-/// Policy-mode entry point that applies a parsed devcontainer configuration.
-#[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
-pub async fn run_launch_with_policy_and_devcontainer(
-    mode: EnforcementMode,
-    policy_path: &Path,
-    command: Vec<String>,
-    image: Option<&str>,
-    output: Option<PathBuf>,
-    credential_store: Option<Arc<CredentialStore>>,
-    mitm_hosts: Vec<String>,
-    extra_env: Vec<String>,
-    extra_mounts: Vec<ExtraMount>,
-    tty: bool,
-    devcontainer: DevcontainerConfig,
-) -> anyhow::Result<i32> {
-    run_launch_with_policy_with_terminal_mode(
-        mode,
-        policy_path,
-        command,
-        image,
-        output,
-        credential_store,
-        mitm_hosts,
-        extra_env,
-        extra_mounts,
-        tty,
-        LaunchTerminalMode::Host,
-        None,
-        Some(devcontainer),
     )
     .await
 }
@@ -2656,26 +2601,7 @@ async fn run_launch_with_policy_with_terminal_mode(
         tokio::spawn(run_mitm_unix_proxy_loop(listener, proxy_ctx))
     };
 
-    let workspace_path = devcontainer
-        .as_ref()
-        .map(|config| resolve_devcontainer_workspace(&cwd, config));
-    let devcontainer_mounts = if let Some(config) = devcontainer.as_ref() {
-        let mounts = resolve_devcontainer_mounts(&config.mounts, &cwd)?;
-        emit_devcontainer_mount_diagnostic(&mounts);
-        mounts
-    } else {
-        Vec::new()
-    };
-    let runtime_options = if let Some(config) = devcontainer.as_ref() {
-        ContainerRuntimeOptions {
-            workspace_mount_path: workspace_path.clone(),
-            working_dir: workspace_path.clone(),
-            user: config.remote_user.clone(),
-            pre_exec_hooks: devcontainer_pre_exec_hooks(config),
-        }
-    } else {
-        ContainerRuntimeOptions::default()
-    };
+    let dc_runtime = prepare_devcontainer_runtime(&cwd, devcontainer.as_ref())?;
 
     // 8. Build container config with the working directory mount.
     let mut config = ContainerManager::build_config_with_options(
@@ -2686,19 +2612,11 @@ async fn run_launch_with_policy_with_terminal_mode(
         Some(&ca_pem_path),
         &cwd,
         tty,
-        &runtime_options,
+        &dc_runtime.options,
     )?;
     config.auto_remove = false;
-    config.env = if let Some(devcontainer) = devcontainer.as_ref() {
-        merge_env_layers([
-            devcontainer_env(devcontainer),
-            extra_env,
-            config.env.clone(),
-        ])
-    } else {
-        merge_env_layers([extra_env, config.env.clone()])
-    };
-    for mount in &devcontainer_mounts {
+    config.env = merge_env_layers([dc_runtime.env, extra_env, config.env.clone()]);
+    for mount in &dc_runtime.mounts {
         config.binds.push(mount.to_bind_string());
     }
     for m in &extra_mounts {
@@ -2718,7 +2636,7 @@ async fn run_launch_with_policy_with_terminal_mode(
         path: cwd.to_string_lossy().to_string(),
         mode: "read-write".to_string(),
     });
-    for mount in &devcontainer_mounts {
+    for mount in &dc_runtime.mounts {
         obs_stream.emit(EventKind::Mount {
             path: mount.source.clone(),
             mode: if mount.mode == "ro" {

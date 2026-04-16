@@ -124,3 +124,38 @@ This framing:
 2. Host-side proxy stays on the host, always. If strait ships as a devcontainer feature, the feature registers the container with an already-running host-side strait daemon; it does not run the proxy inside the container. Running the proxy inside would expose it to tampering by whatever is executing inside the container. The entire trust boundary exists to prevent that.
 3. Recommend removing iptables when adopting strait. Both can coexist without harm, but the comparison doc takes a clear position: once strait is in place, iptables plus init-firewall.sh is redundant and strictly less expressive. Remove it.
 4. Clean cut on fs/proc. No backwards compat, no migration path, no legacy references. strait is pre-v1, pre-launch, pre-users. The narrowing is a decisive rewrite: fs/proc actions are removed from the entity schema, parsers, templates, and docs. No deprecation warnings. No migration tool. No "legacy" mentions in the codebase or README.
+
+## Prior art observations (2026-04-16)
+
+Surveyed the landscape of interactive network firewalls (Linux application-level firewalls, macOS outbound firewalls) and agent-sandbox devcontainers to inform strait's decision-flow and desktop-UX design.
+
+### Market validation
+
+Existing devcontainer sandboxes already combine deny-by-default firewalls with interactive approval prompts. The common pattern: an eBPF or kernel-level firewall inside the container, a TUI or desktop prompt for each new outbound connection, and JSON rules persisted to the host for team commits.
+
+strait's architectural advantages over this pattern:
+- Proxy on host (tamper-proof) vs firewall inside container (agent can interfere)
+- Cedar policy (method/host/path/identity) vs regex rules (domain-only)
+- Desktop control plane vs terminal TUI
+- MITM at HTTP layer (request inspection) vs connection-level filtering
+- Observe-then-enforce workflow vs guess-and-iterate
+
+### Decision architecture: hold-and-resume
+
+Established application-level firewalls on both Linux and macOS use hold-and-resume for interactive decisions: the actual network flow is paused while the user is prompted. Packets are held in a kernel queue or the filter framework issues a pause verdict. The connection does not fail -- it waits. A configurable timeout (typically 15-30s) defaults to deny on expiry.
+
+The daemon-UI split uses gRPC bidirectional streaming as the IPC protocol: heartbeat, blocking decision request, registration, and a streaming channel for config updates. The daemon blocks on the decision RPC; the UI responds with a rule object (action + duration + conditions).
+
+This directly informs H-CSM-3 (hold-and-resume, not block-and-retry) and H-CSM-5 (gRPC control service).
+
+### Desktop UX: decision flow and tray integration
+
+Established macOS outbound firewalls demonstrate polished patterns:
+- Pause-controlled alerts: the alert controls whether the flow proceeds, not just informational
+- Structured request details with expandable info
+- Duration options on decision: once / session / always / custom TTL
+- Related-flow batching: multiple connections to the same destination batch into one decision
+- Light-touch status bar presence with quick-access menu
+- Countdown timer with auto-deny on expiry
+
+This directly informs M-CSM-6 (desktop control plane shell).

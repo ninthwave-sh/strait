@@ -1602,7 +1602,7 @@ fn shell_quote(arg: &str) -> String {
     {
         arg.to_string()
     } else {
-        format!("'{}'", arg.replace('\'', r#"'\"'\"'"#))
+        format!("'{}'", arg.replace('\'', r#"'"'"'"#))
     }
 }
 
@@ -5563,5 +5563,21 @@ forbid(principal, action, resource);
             err.to_string().contains("unsupported options: consistency"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("hello'world"), r#"'hello'"'"'world'"#);
+    }
+
+    #[test]
+    fn shell_quote_preserves_safe_args() {
+        assert_eq!(shell_quote("simple"), "simple");
+        assert_eq!(shell_quote("/usr/bin/env"), "/usr/bin/env");
+    }
+
+    #[test]
+    fn shell_quote_wraps_spaces() {
+        assert_eq!(shell_quote("hello world"), "'hello world'");
     }
 }

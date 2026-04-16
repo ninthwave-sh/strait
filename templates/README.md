@@ -1,6 +1,8 @@
-# Policy Templates
+# Network Policy Templates
 
-Built-in Cedar policy templates for common access patterns.
+Built-in Cedar policy templates for common outbound HTTP access patterns.
+
+These templates support strait's network-policy-for-devcontainers workflow. Keep environment shape in `devcontainer.json`, then use these templates as starting points for outbound API access rules.
 
 ## Available Templates
 
@@ -10,7 +12,7 @@ Built-in Cedar policy templates for common access patterns.
 | `github-org-contributor` | Read + PR creation, deny push to main/release branches, deny repo admin |
 | `aws-s3-readonly` | Read-only S3 access (GetObject, ListBucket) |
 | `aws-s3-readwrite` | S3 read + write, deny DeleteBucket/DeleteObject |
-| `container-sandbox` | Container sandbox: scoped HTTP access |
+| `container-sandbox` | Scoped HTTP access for a containerized agent |
 
 ## Shared Network Schema
 

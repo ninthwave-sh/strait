@@ -40,28 +40,32 @@ fi
 
 GATEWAY_PATH="/usr/local/bin/strait-gateway"
 
-echo "strait feature: installing gateway binary from ${DOWNLOAD_URL}"
-
-if command -v curl > /dev/null 2>&1; then
-    curl -fsSL -o "${GATEWAY_PATH}" "${DOWNLOAD_URL}" || {
-        echo "strait feature: download failed; gateway will not be available" >&2
-        echo "strait feature: the container will still start, but network policy is inactive" >&2
-        # Install a stub so the entrypoint can detect the missing binary.
-        rm -f "${GATEWAY_PATH}"
-    }
-elif command -v wget > /dev/null 2>&1; then
-    wget -qO "${GATEWAY_PATH}" "${DOWNLOAD_URL}" || {
-        echo "strait feature: download failed; gateway will not be available" >&2
-        rm -f "${GATEWAY_PATH}"
-    }
+# If the binary is already present (e.g. bind-mounted), skip download.
+if [ -x "${GATEWAY_PATH}" ]; then
+    echo "strait feature: gateway already present at ${GATEWAY_PATH}; skipping download"
 else
-    echo "strait feature: neither curl nor wget found; skipping gateway download" >&2
-    echo "strait feature: install curl or wget, or bind-mount the gateway binary" >&2
-fi
+    echo "strait feature: installing gateway binary from ${DOWNLOAD_URL}"
 
-if [ -f "${GATEWAY_PATH}" ]; then
-    chmod 755 "${GATEWAY_PATH}"
-    echo "strait feature: gateway installed at ${GATEWAY_PATH}"
+    if command -v curl > /dev/null 2>&1; then
+        curl -fsSL -o "${GATEWAY_PATH}" "${DOWNLOAD_URL}" || {
+            echo "strait feature: download failed; gateway will not be available" >&2
+            echo "strait feature: the container will still start, but network policy is inactive" >&2
+            rm -f "${GATEWAY_PATH}"
+        }
+    elif command -v wget > /dev/null 2>&1; then
+        wget -qO "${GATEWAY_PATH}" "${DOWNLOAD_URL}" || {
+            echo "strait feature: download failed; gateway will not be available" >&2
+            rm -f "${GATEWAY_PATH}"
+        }
+    else
+        echo "strait feature: neither curl nor wget found; skipping gateway download" >&2
+        echo "strait feature: install curl or wget, or bind-mount the gateway binary" >&2
+    fi
+
+    if [ -f "${GATEWAY_PATH}" ]; then
+        chmod 755 "${GATEWAY_PATH}"
+        echo "strait feature: gateway installed at ${GATEWAY_PATH}"
+    fi
 fi
 
 # ── Install entrypoint script ─────────────────────────────────────────

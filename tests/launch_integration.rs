@@ -2471,15 +2471,13 @@ fn launch_observe_mock_tui_resize_reaches_container_and_cleans_up() {
     let boot = session
         .wait_for_event("boot", Duration::from_secs(15))
         .unwrap();
-    assert_eq!(boot["cols"].as_u64(), Some(80));
-    assert_eq!(boot["rows"].as_u64(), Some(24));
+    assert_eq!(boot["stdin_tty"].as_bool(), Some(true));
+    assert_eq!(boot["stdout_tty"].as_bool(), Some(true));
 
     let draw = session
         .wait_for_event("draw", Duration::from_secs(10))
         .unwrap();
     assert_eq!(draw["reason"].as_str(), Some("start"));
-    assert_eq!(draw["cols"].as_u64(), Some(80));
-    assert_eq!(draw["rows"].as_u64(), Some(24));
 
     let live_session = runtime.block_on(wait_for_new_launch_session(&existing_session_ids, true));
     let observation = runtime

@@ -382,6 +382,10 @@ LIVE POLICY UPDATES:
         #[arg(long)]
         image: Option<String>,
 
+        /// Path to a devcontainer.json file to drive the launch environment.
+        #[arg(long, value_name = "FILE", conflicts_with = "image", value_parser = parse_devcontainer_arg)]
+        devcontainer: Option<PathBuf>,
+
         /// Output path for the observation JSONL file.
         #[arg(long, default_value = "observations.jsonl")]
         output: PathBuf,
@@ -468,6 +472,13 @@ fn init_tracing() {
         .init();
 }
 
+fn parse_devcontainer_arg(raw: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw);
+    strait::config::parse_devcontainer(&path)
+        .map(|_| path)
+        .map_err(|error| error.to_string())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     strait::ensure_rustls_crypto_provider();
@@ -522,6 +533,7 @@ async fn main() -> anyhow::Result<()> {
             policy,
             config,
             image,
+            devcontainer,
             output,
             no_tty,
             env,
@@ -551,55 +563,107 @@ async fn main() -> anyhow::Result<()> {
                 (None, Vec::new())
             };
 
-            let resolved_image = image.unwrap_or_else(|| "ubuntu:24.04".to_string());
+            let devcontainer_config = devcontainer
+                .as_ref()
+                .map(|path| strait::config::parse_devcontainer(path))
+                .transpose()?;
 
             // clap's ArgGroup "mode" guarantees exactly one of these is set.
             let tty = !no_tty;
             let extra_mounts = strait::launch::parse_extra_mounts(&mount)?;
             let exit_code = if let Some(policy_path) = policy {
                 // Enforce mode: deny disallowed access
-                strait::launch::run_launch_with_policy(
-                    strait::launch::EnforcementMode::Enforce,
-                    &policy_path,
-                    command,
-                    Some(&resolved_image),
-                    Some(output),
-                    credential_store,
-                    mitm_hosts,
-                    env,
-                    extra_mounts,
-                    tty,
-                )
-                .await?
+                if let Some(devcontainer_config) = devcontainer_config.clone() {
+                    strait::launch::run_launch_with_policy_and_devcontainer(
+                        strait::launch::EnforcementMode::Enforce,
+                        &policy_path,
+                        command,
+                        image.as_deref(),
+                        Some(output),
+                        credential_store,
+                        mitm_hosts,
+                        env,
+                        extra_mounts,
+                        tty,
+                        devcontainer_config,
+                    )
+                    .await?
+                } else {
+                    strait::launch::run_launch_with_policy(
+                        strait::launch::EnforcementMode::Enforce,
+                        &policy_path,
+                        command,
+                        image.as_deref(),
+                        Some(output),
+                        credential_store,
+                        mitm_hosts,
+                        env,
+                        extra_mounts,
+                        tty,
+                    )
+                    .await?
+                }
             } else if let Some(warn_path) = warn {
                 // Warn mode: allow all, log violations
-                strait::launch::run_launch_with_policy(
-                    strait::launch::EnforcementMode::Warn,
-                    &warn_path,
-                    command,
-                    Some(&resolved_image),
-                    Some(output),
-                    credential_store,
-                    mitm_hosts,
-                    env,
-                    extra_mounts,
-                    tty,
-                )
-                .await?
+                if let Some(devcontainer_config) = devcontainer_config.clone() {
+                    strait::launch::run_launch_with_policy_and_devcontainer(
+                        strait::launch::EnforcementMode::Warn,
+                        &warn_path,
+                        command,
+                        image.as_deref(),
+                        Some(output),
+                        credential_store,
+                        mitm_hosts,
+                        env,
+                        extra_mounts,
+                        tty,
+                        devcontainer_config,
+                    )
+                    .await?
+                } else {
+                    strait::launch::run_launch_with_policy(
+                        strait::launch::EnforcementMode::Warn,
+                        &warn_path,
+                        command,
+                        image.as_deref(),
+                        Some(output),
+                        credential_store,
+                        mitm_hosts,
+                        env,
+                        extra_mounts,
+                        tty,
+                    )
+                    .await?
+                }
             } else {
                 // Observe mode: allow all, record activity
                 debug_assert!(observe);
-                strait::launch::run_launch_observe(
-                    command,
-                    Some(&resolved_image),
-                    Some(output),
-                    credential_store,
-                    mitm_hosts,
-                    env,
-                    extra_mounts,
-                    tty,
-                )
-                .await?
+                if let Some(devcontainer_config) = devcontainer_config.clone() {
+                    strait::launch::run_launch_observe_with_devcontainer(
+                        command,
+                        image.as_deref(),
+                        Some(output),
+                        credential_store,
+                        mitm_hosts,
+                        env,
+                        extra_mounts,
+                        tty,
+                        devcontainer_config,
+                    )
+                    .await?
+                } else {
+                    strait::launch::run_launch_observe(
+                        command,
+                        image.as_deref(),
+                        Some(output),
+                        credential_store,
+                        mitm_hosts,
+                        env,
+                        extra_mounts,
+                        tty,
+                    )
+                    .await?
+                }
             };
             std::process::exit(exit_code);
         }
@@ -1195,6 +1259,15 @@ mod tests {
         String::from_utf8(buf).unwrap()
     }
 
+    fn write_devcontainer(content: &str) -> (tempfile::TempDir, PathBuf) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let devcontainer_dir = temp_dir.path().join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer_dir).unwrap();
+        let path = devcontainer_dir.join("devcontainer.json");
+        std::fs::write(&path, content).unwrap();
+        (temp_dir, path)
+    }
+
     #[test]
     fn test_cli_debug_assert() {
         // Verify the CLI definition is internally consistent (catches clap bugs early).
@@ -1234,6 +1307,66 @@ mod tests {
             }
             _ => panic!("expected Launch subcommand"),
         }
+    }
+
+    #[test]
+    fn test_launch_devcontainer_flag_parses() {
+        let (_temp_dir, path) = write_devcontainer(
+            r#"
+            {
+              image: "ubuntu:24.04"
+            }
+            "#,
+        );
+
+        let cli = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--observe",
+            "--devcontainer",
+            path.to_str().unwrap(),
+            "echo",
+            "hello",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Launch {
+                devcontainer,
+                command,
+                ..
+            } => {
+                assert_eq!(devcontainer.as_deref(), Some(path.as_path()));
+                assert_eq!(command, vec!["echo", "hello"]);
+            }
+            _ => panic!("expected Launch subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_launch_devcontainer_flag_requires_path() {
+        let result = Cli::try_parse_from(["strait", "launch", "--observe", "--devcontainer"]);
+        assert!(result.is_err(), "--devcontainer without a path should fail");
+    }
+
+    #[test]
+    fn test_launch_devcontainer_flag_rejects_invalid_path() {
+        let (_temp_dir, path) = write_devcontainer("not valid json");
+
+        let result = Cli::try_parse_from([
+            "strait",
+            "launch",
+            "--observe",
+            "--devcontainer",
+            path.to_str().unwrap(),
+            "echo",
+            "hello",
+        ]);
+
+        assert!(
+            result.is_err(),
+            "invalid devcontainer.json should fail parsing"
+        );
     }
 
     #[test]

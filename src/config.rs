@@ -325,6 +325,8 @@ pub struct DevcontainerConfig {
     pub build: Option<DevcontainerBuildConfig>,
     /// Environment variables injected into the container.
     pub container_env: BTreeMap<String, String>,
+    /// Mount declarations inherited from `devcontainer.json`.
+    pub mounts: Vec<String>,
     /// Lifecycle hook run before the agent command.
     pub post_create_command: Option<DevcontainerCommand>,
     /// Lifecycle hook run during container creation.
@@ -379,7 +381,7 @@ struct RawDevcontainerConfig {
     cap_add: Option<serde_json::Value>,
     run_args: Option<Vec<String>>,
     forward_ports: Option<serde_json::Value>,
-    mounts: Option<serde_json::Value>,
+    mounts: Option<RawDevcontainerMounts>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,6 +404,13 @@ enum RawDevcontainerCommand {
 enum RawDevcontainerCommandStep {
     Shell(String),
     Exec(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawDevcontainerMounts {
+    Single(String),
+    Multiple(Vec<String>),
 }
 
 impl From<RawDevcontainerCommand> for DevcontainerCommand {
@@ -449,11 +458,24 @@ pub fn parse_devcontainer(path: &Path) -> anyhow::Result<DevcontainerConfig> {
                 .map(|context| resolve_devcontainer_path(base_dir, context)),
         }),
         container_env: raw.container_env,
+        mounts: raw
+            .mounts
+            .map(RawDevcontainerMounts::into_vec)
+            .unwrap_or_default(),
         post_create_command: raw.post_create_command.map(Into::into),
         on_create_command: raw.on_create_command.map(Into::into),
         workspace_folder: raw.workspace_folder,
         remote_user: raw.remote_user,
     })
+}
+
+impl RawDevcontainerMounts {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::Single(mount) => vec![mount],
+            Self::Multiple(mounts) => mounts,
+        }
+    }
 }
 
 fn resolve_devcontainer_path(base_dir: &Path, raw_path: &str) -> PathBuf {
@@ -508,23 +530,34 @@ fn warn_on_ignored_devcontainer_fields(config: &RawDevcontainerConfig, path: &Pa
             DEVCONTAINER_STRATEGY_DOC
         );
     }
+}
 
-    if has_nonempty_value(config.mounts.as_ref()) {
-        warn!(
-            path = %path.display(),
-            "ignoring devcontainer field 'mounts' during parse; mounts are honored by the container runtime directly. See {}.",
-            DEVCONTAINER_STRATEGY_DOC
-        );
+fn has_nonempty_value(value: Option<&impl HasNonEmptyValue>) -> bool {
+    value.is_some_and(HasNonEmptyValue::has_nonempty_value)
+}
+
+trait HasNonEmptyValue {
+    fn has_nonempty_value(&self) -> bool;
+}
+
+impl HasNonEmptyValue for serde_json::Value {
+    fn has_nonempty_value(&self) -> bool {
+        match self {
+            serde_json::Value::Array(items) => !items.is_empty(),
+            serde_json::Value::Object(map) => !map.is_empty(),
+            serde_json::Value::String(text) => !text.is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        }
     }
 }
 
-fn has_nonempty_value(value: Option<&serde_json::Value>) -> bool {
-    match value {
-        Some(serde_json::Value::Array(items)) => !items.is_empty(),
-        Some(serde_json::Value::Object(map)) => !map.is_empty(),
-        Some(serde_json::Value::String(text)) => !text.is_empty(),
-        Some(serde_json::Value::Null) | None => false,
-        Some(_) => true,
+impl HasNonEmptyValue for RawDevcontainerMounts {
+    fn has_nonempty_value(&self) -> bool {
+        match self {
+            Self::Single(text) => !text.is_empty(),
+            Self::Multiple(items) => !items.is_empty(),
+        }
     }
 }
 
@@ -2846,6 +2879,7 @@ upstream_response_timeout_secs = 90
         );
         assert!(config.build.is_none());
         assert!(config.container_env.is_empty());
+        assert!(config.mounts.is_empty());
         assert!(config.post_create_command.is_none());
         assert!(config.on_create_command.is_none());
         assert!(config.workspace_folder.is_none());
@@ -2892,6 +2926,9 @@ upstream_response_timeout_secs = 90
                 RUST_LOG: "debug",
                 CI: "1",
               },
+              mounts: [
+                "source=${localWorkspaceFolder}/cache,target=/tmp/cache,type=bind,readonly",
+              ],
               postCreateCommand: ["cargo", "test"],
               onCreateCommand: {
                 bootstrap: "scripts/bootstrap.sh",
@@ -2915,6 +2952,13 @@ upstream_response_timeout_secs = 90
         assert_eq!(
             config.container_env.get("CI").map(String::as_str),
             Some("1")
+        );
+        assert_eq!(
+            config.mounts,
+            vec![
+                "source=${localWorkspaceFolder}/cache,target=/tmp/cache,type=bind,readonly"
+                    .to_string()
+            ]
         );
         assert_eq!(
             config.post_create_command,
@@ -3010,7 +3054,7 @@ upstream_response_timeout_secs = 90
     }
 
     #[test]
-    fn parse_devcontainer_warns_on_forward_ports_and_mounts() {
+    fn parse_devcontainer_warns_on_forward_ports_and_preserves_mounts() {
         let (_temp_dir, path) = write_devcontainer(
             r#"
             {
@@ -3029,6 +3073,10 @@ upstream_response_timeout_secs = 90
 
         let config = parse_devcontainer(&path).unwrap();
         assert_eq!(config.image.as_deref(), Some("ubuntu:24.04"));
+        assert_eq!(
+            config.mounts,
+            vec!["source=/tmp,target=/mnt,type=bind".to_string()]
+        );
 
         let messages = messages.lock().unwrap();
         assert!(
@@ -3039,8 +3087,8 @@ upstream_response_timeout_secs = 90
             *messages
         );
         assert!(
-            messages.iter().any(|message| message.contains("mounts")),
-            "warning should mention mounts, got: {:?}",
+            messages.iter().all(|message| !message.contains("mounts")),
+            "mounts should no longer be warned as ignored, got: {:?}",
             *messages
         );
     }

@@ -53,6 +53,8 @@ pub struct ContainerConfig {
     pub env: Vec<String>,
     /// Bind-mount strings in Docker format: `"host_path:container_path:ro"` or `":rw"`.
     pub binds: Vec<String>,
+    /// Working directory inside the container.
+    pub working_dir: Option<String>,
     /// Whether to attach a TTY.
     pub tty: bool,
     /// Entrypoint override. Always set by `build_config` to the gateway-based
@@ -66,6 +68,21 @@ pub struct ContainerConfig {
     pub auto_remove: bool,
     /// Docker network mode. Set to `"none"` for network isolation.
     pub network_mode: Option<String>,
+    /// User account to run the container entrypoint and command as.
+    pub user: Option<String>,
+}
+
+/// Optional runtime overrides layered on top of Strait's default container setup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerRuntimeOptions {
+    /// Alternate container path for the mounted workspace.
+    pub workspace_mount_path: Option<String>,
+    /// Working directory for the launched process.
+    pub working_dir: Option<String>,
+    /// Container user override.
+    pub user: Option<String>,
+    /// Shell snippets to run before the agent command.
+    pub pre_exec_hooks: Vec<String>,
 }
 
 /// Default graceful shutdown timeout (seconds) before force-killing.
@@ -155,11 +172,22 @@ pub fn container_trust_diagnostic_lines() -> Vec<String> {
 /// - **No system CA bundle**: falls back to using only the Strait CA PEM
 /// - **CA PEM not mounted**: prints a clear error and exits with code 1
 pub fn generate_ca_entrypoint_script() -> String {
-    format!(
+    generate_entrypoint_script(true, &[])
+}
+
+/// Generate the container entrypoint script that prepares CA trust, runs any
+/// pre-exec hooks, and then launches the agent command.
+pub fn generate_entrypoint_script(ca_pem_required: bool, pre_exec_hooks: &[String]) -> String {
+    let mut script = String::from(
         r#"#!/bin/sh
 set -e
 
-# Verify CA PEM is bind-mounted
+"#,
+    );
+
+    if ca_pem_required {
+        script.push_str(&format!(
+            r#"# Verify CA PEM is bind-mounted
 if [ ! -f {ca_pem} ]; then
   echo "strait: ERROR: CA certificate not found at {ca_pem}" >&2
   echo "strait: The CA PEM file must be bind-mounted into the container." >&2
@@ -182,11 +210,21 @@ else
   cp {ca_pem} {ca_bundle}
 fi
 
-exec "$@"
 "#,
-        ca_pem = CONTAINER_CA_PEM_PATH,
-        ca_bundle = CONTAINER_CA_BUNDLE_PATH,
-    )
+            ca_pem = CONTAINER_CA_PEM_PATH,
+            ca_bundle = CONTAINER_CA_BUNDLE_PATH,
+        ));
+    }
+
+    for hook in pre_exec_hooks {
+        script.push_str(hook);
+        if !hook.ends_with('\n') {
+            script.push('\n');
+        }
+    }
+
+    script.push_str("\nexec \"$@\"\n");
+    script
 }
 
 // ---------------------------------------------------------------------------
@@ -325,14 +363,41 @@ impl ContainerManager {
         working_dir_host_path: &std::path::Path,
         tty: bool,
     ) -> anyhow::Result<ContainerConfig> {
+        Self::build_config_with_options(
+            image,
+            cmd,
+            proxy_socket_host_path,
+            gateway_binary_host_path,
+            ca_pem_host_path,
+            working_dir_host_path,
+            tty,
+            &ContainerRuntimeOptions::default(),
+        )
+    }
+
+    /// Build a `ContainerConfig` with runtime overrides such as workspace path,
+    /// remote user, and lifecycle hooks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_config_with_options(
+        image: &str,
+        cmd: &[String],
+        proxy_socket_host_path: &std::path::Path,
+        gateway_binary_host_path: &std::path::Path,
+        ca_pem_host_path: Option<&std::path::Path>,
+        working_dir_host_path: &std::path::Path,
+        tty: bool,
+        options: &ContainerRuntimeOptions,
+    ) -> anyhow::Result<ContainerConfig> {
         let mut binds = Vec::new();
         let validated_working_dir = validate_bind_mount_path(
             &working_dir_host_path.to_string_lossy(),
             working_dir_host_path,
         )?;
-        binds.push(format!(
-            "{validated_working_dir}:{validated_working_dir}:rw"
-        ));
+        let workspace_mount_path = options
+            .workspace_mount_path
+            .as_deref()
+            .unwrap_or(&validated_working_dir);
+        binds.push(format!("{validated_working_dir}:{workspace_mount_path}:rw"));
 
         // Bind-mount proxy socket and gateway binary for network isolation.
         // The proxy socket connects the in-container gateway to the host proxy.
@@ -358,8 +423,9 @@ impl ContainerManager {
             .map(|var| format!("{var}={proxy_url}"))
             .collect();
 
-        // CA trust injection: bind-mount the CA PEM, set env vars
-        let ca_script = if let Some(host_path) = ca_pem_host_path {
+        // CA trust injection: bind-mount the CA PEM, set env vars.
+        let ca_required = ca_pem_host_path.is_some();
+        if let Some(host_path) = ca_pem_host_path {
             binds.push(format!(
                 "{}:{}:ro",
                 host_path.display(),
@@ -369,40 +435,37 @@ impl ContainerManager {
             for var in CONTAINER_TRUST_ENV_VARS {
                 env.push(format!("{var}={CONTAINER_CA_BUNDLE_PATH}"));
             }
-
-            Some(generate_ca_entrypoint_script())
-        } else {
-            None
-        };
+        }
 
         // Build entrypoint chain: gateway -> [CA trust injection ->] user command.
         // The gateway is always the outermost wrapper. It listens on
         // 127.0.0.1:3128, forwarding to the proxy socket, then spawns the
         // child command (everything after `--`).
-        let mut entrypoint = vec![
+        let entrypoint = vec![
             CONTAINER_GATEWAY_PATH.to_string(),
             "--socket".to_string(),
             CONTAINER_PROXY_SOCKET_PATH.to_string(),
             "--".to_string(),
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            generate_entrypoint_script(ca_required, &options.pre_exec_hooks),
+            "--".to_string(),
         ];
-        if let Some(script) = ca_script {
-            entrypoint.extend([
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                script,
-                "--".to_string(),
-            ]);
-        }
 
         Ok(ContainerConfig {
             image: image.to_string(),
             cmd: cmd.to_vec(),
             env,
             binds,
+            working_dir: options
+                .working_dir
+                .clone()
+                .or_else(|| options.workspace_mount_path.clone()),
             tty,
             entrypoint: Some(entrypoint),
             auto_remove: true,
             network_mode: Some("none".to_string()),
+            user: options.user.clone(),
         })
     }
 
@@ -495,6 +558,8 @@ impl ContainerManager {
             image: Some(config.image.clone()),
             cmd: Some(config.cmd.clone()),
             env: Some(config.env.clone()),
+            working_dir: config.working_dir.clone(),
+            user: config.user.clone(),
             tty: Some(config.tty),
             open_stdin: Some(config.tty),
             attach_stdin: Some(config.tty),
@@ -826,6 +891,47 @@ mod tests {
     }
 
     #[test]
+    fn build_config_with_runtime_options_sets_workspace_user_and_hooks() {
+        let ca_path = Path::new("/tmp/test-ca.pem");
+        let options = ContainerRuntimeOptions {
+            workspace_mount_path: Some("/workspaces/demo".to_string()),
+            working_dir: Some("/workspaces/demo".to_string()),
+            user: Some("vscode".to_string()),
+            pre_exec_hooks: vec!["printf 'hook\\n' >/tmp/hook.log".to_string()],
+        };
+
+        let config = ContainerManager::build_config_with_options(
+            "node:20",
+            &[],
+            test_proxy_socket(),
+            test_gateway_binary(),
+            Some(ca_path),
+            test_working_dir(),
+            true,
+            &options,
+        )
+        .unwrap();
+
+        assert!(config
+            .binds
+            .contains(&"/project:/workspaces/demo:rw".to_string()));
+        assert_eq!(config.working_dir.as_deref(), Some("/workspaces/demo"));
+        assert_eq!(config.user.as_deref(), Some("vscode"));
+        let script = config
+            .entrypoint
+            .as_ref()
+            .and_then(|entrypoint| entrypoint.get(6))
+            .expect("entrypoint script should be present");
+        assert!(script.contains(CONTAINER_CA_PEM_PATH));
+        assert!(script.contains("hook.log"));
+        assert!(script.contains("exec \"$@\""));
+        assert!(
+            script.find(CONTAINER_CA_PEM_PATH).unwrap() < script.find("hook.log").unwrap(),
+            "CA trust injection should run before lifecycle hooks: {script}"
+        );
+    }
+
+    #[test]
     fn build_config_has_expected_bind_count() {
         let config = build_test_config("alpine", &[], None, test_working_dir()).unwrap();
         assert_eq!(config.binds.len(), 3, "cwd + proxy socket + gateway binary");
@@ -862,6 +968,24 @@ mod tests {
         assert!(script.contains(CONTAINER_CA_PEM_PATH));
         assert!(script.contains(CONTAINER_CA_BUNDLE_PATH));
         assert!(script.contains("exec \"$@\""));
+    }
+
+    #[test]
+    fn entrypoint_script_runs_hooks_before_exec() {
+        let script = generate_entrypoint_script(
+            true,
+            &[
+                "printf 'onCreate\\n' >> /tmp/order.log".to_string(),
+                "printf 'postCreate\\n' >> /tmp/order.log".to_string(),
+            ],
+        );
+
+        assert!(script.contains("onCreate"));
+        assert!(script.contains("postCreate"));
+        assert!(
+            script.find("postCreate").unwrap() < script.find("exec \"$@\"").unwrap(),
+            "lifecycle hooks should run before exec: {script}"
+        );
     }
 
     #[test]

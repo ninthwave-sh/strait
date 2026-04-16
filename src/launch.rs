@@ -48,10 +48,13 @@ use tracing::{info, warn};
 use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
 use crate::config::{
-    persist_policy_exception, reload_policy, replace_policy, LivePolicyBounds, PolicyConfig,
+    persist_policy_exception, reload_policy, replace_policy, DevcontainerBuildConfig, DevcontainerCommand,
+    DevcontainerCommandStep, DevcontainerConfig, LivePolicyBounds, PolicyConfig,
     PolicyMutationOutcome, ProxyContext,
 };
-use crate::container::{container_trust_diagnostic_lines, ContainerManager};
+use crate::container::{
+    container_trust_diagnostic_lines, ContainerManager, ContainerRuntimeOptions,
+};
 use crate::credentials::CredentialStore;
 use crate::mitm::handle_connection;
 use crate::observe::{EventKind, ObservationSessionContext, ObservationStream};
@@ -123,19 +126,6 @@ const SESSION_OBSERVATION_SOCKET_NAME: &str = "observe.sock";
 /// Exit code returned when a launch session is stopped via the control socket.
 #[cfg(unix)]
 const SESSION_STOP_EXIT_CODE: i32 = 130;
-
-fn launch_live_policy_bounds(cwd: &Path) -> LivePolicyBounds {
-    let cwd = cwd.to_string_lossy().to_string();
-    let mut fs_candidate_paths = vec![cwd.clone()];
-    if cwd != CONTAINER_WORKSPACE_PATH {
-        fs_candidate_paths.push(CONTAINER_WORKSPACE_PATH.to_string());
-    }
-
-    LivePolicyBounds {
-        fs_candidate_paths,
-        agent_id: "agent".to_string(),
-    }
-}
 
 /// Return the proxy Unix socket path for a given session temp directory.
 ///
@@ -1561,6 +1551,293 @@ impl ExtraMount {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedDevcontainerMount {
+    source: String,
+    target: String,
+    mode: String,
+    mount_type: String,
+    raw: String,
+}
+
+impl ResolvedDevcontainerMount {
+    fn to_bind_string(&self) -> String {
+        format!("{}:{}:{}", self.source, self.target, self.mode)
+    }
+
+    fn diagnostic_line(&self) -> String {
+        let access = if self.mode == "ro" {
+            "read-only"
+        } else {
+            "read-write"
+        };
+        format!(
+            "  - {} -> {} ({}, type={}, raw='{}')",
+            self.source, self.target, access, self.mount_type, self.raw
+        )
+    }
+}
+
+fn launch_live_policy_bounds(cwd: &Path, workspace_alias: Option<&str>) -> LivePolicyBounds {
+    let cwd = cwd.to_string_lossy().to_string();
+    let workspace_alias = workspace_alias.unwrap_or(CONTAINER_WORKSPACE_PATH);
+    let mut fs_candidate_paths = vec![cwd.clone()];
+    if cwd != workspace_alias {
+        fs_candidate_paths.push(workspace_alias.to_string());
+    }
+
+    LivePolicyBounds {
+        fs_candidate_paths,
+        agent_id: "agent".to_string(),
+    }
+}
+
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.' | ':' | '@' | '=')
+        })
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r#"'\"'\"'"#))
+    }
+}
+
+fn render_devcontainer_command(command: &DevcontainerCommand) -> Vec<String> {
+    match command {
+        DevcontainerCommand::Shell(command) => vec![command.clone()],
+        DevcontainerCommand::Exec(command) => vec![command
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")],
+        DevcontainerCommand::Named(commands) => commands
+            .values()
+            .map(render_devcontainer_command_step)
+            .collect(),
+    }
+}
+
+fn render_devcontainer_command_step(step: &DevcontainerCommandStep) -> String {
+    match step {
+        DevcontainerCommandStep::Shell(command) => command.clone(),
+        DevcontainerCommandStep::Exec(command) => command
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn devcontainer_pre_exec_hooks(devcontainer: &DevcontainerConfig) -> Vec<String> {
+    let mut hooks = Vec::new();
+    if let Some(command) = devcontainer.on_create_command.as_ref() {
+        hooks.extend(render_devcontainer_command(command));
+    }
+    if let Some(command) = devcontainer.post_create_command.as_ref() {
+        hooks.extend(render_devcontainer_command(command));
+    }
+    hooks
+}
+
+fn merge_env_layers(layers: impl IntoIterator<Item = Vec<String>>) -> Vec<String> {
+    let mut merged = std::collections::BTreeMap::new();
+    for layer in layers {
+        for entry in layer {
+            let (key, value) = entry
+                .split_once('=')
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .unwrap_or_else(|| (entry.clone(), String::new()));
+            merged.insert(key, value);
+        }
+    }
+
+    merged
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
+}
+
+fn devcontainer_env(devcontainer: &DevcontainerConfig) -> Vec<String> {
+    devcontainer
+        .container_env
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
+}
+
+fn resolve_devcontainer_workspace(cwd: &Path, devcontainer: &DevcontainerConfig) -> String {
+    devcontainer
+        .workspace_folder
+        .clone()
+        .unwrap_or_else(|| cwd.to_string_lossy().to_string())
+}
+
+fn replace_devcontainer_vars(input: &str, workspace: &Path) -> String {
+    let workspace_str = workspace.to_string_lossy();
+    let basename = workspace
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    input
+        .replace("${localWorkspaceFolder}", &workspace_str)
+        .replace("${localWorkspaceFolderBasename}", &basename)
+}
+
+fn resolve_devcontainer_mounts(
+    specs: &[String],
+    workspace: &Path,
+) -> anyhow::Result<Vec<ResolvedDevcontainerMount>> {
+    let mut mounts = Vec::with_capacity(specs.len());
+
+    for raw in specs {
+        let mut source = None;
+        let mut target = None;
+        let mut mount_type = "bind".to_string();
+        let mut readonly = false;
+
+        for part in raw.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part.eq_ignore_ascii_case("readonly") || part.eq_ignore_ascii_case("ro") {
+                readonly = true;
+                continue;
+            }
+
+            let Some((key, value)) = part.split_once('=') else {
+                anyhow::bail!("invalid devcontainer mount entry: {raw}");
+            };
+            let value = replace_devcontainer_vars(value.trim(), workspace);
+            match key.trim() {
+                "source" | "src" => source = Some(value),
+                "target" | "dst" | "destination" => target = Some(value),
+                "type" => mount_type = value,
+                "readonly" => readonly = value.eq_ignore_ascii_case("true"),
+                _ => {}
+            }
+        }
+
+        let source =
+            source.with_context(|| format!("devcontainer mount is missing source: {raw}"))?;
+        let target =
+            target.with_context(|| format!("devcontainer mount is missing target: {raw}"))?;
+        if !target.starts_with('/') {
+            anyhow::bail!("devcontainer mount target must be absolute: {target}");
+        }
+
+        let source = if mount_type == "bind" {
+            let source_path = Path::new(&source);
+            let resolved = if source_path.is_absolute() {
+                source_path.to_path_buf()
+            } else {
+                workspace.join(source_path)
+            };
+            resolved.to_string_lossy().to_string()
+        } else {
+            source
+        };
+
+        mounts.push(ResolvedDevcontainerMount {
+            source,
+            target,
+            mode: if readonly {
+                "ro".to_string()
+            } else {
+                "rw".to_string()
+            },
+            mount_type,
+            raw: raw.clone(),
+        });
+    }
+
+    Ok(mounts)
+}
+
+fn emit_devcontainer_mount_diagnostic(mounts: &[ResolvedDevcontainerMount]) {
+    eprintln!("Devcontainer mounts:");
+    if mounts.is_empty() {
+        eprintln!("  - none declared in devcontainer.json");
+        return;
+    }
+
+    for mount in mounts {
+        eprintln!("{}", mount.diagnostic_line());
+    }
+}
+
+async fn resolve_launch_image(
+    image: Option<&str>,
+    devcontainer: Option<&DevcontainerConfig>,
+) -> anyhow::Result<String> {
+    let Some(devcontainer) = devcontainer else {
+        return Ok(image.unwrap_or(DEFAULT_IMAGE).to_string());
+    };
+
+    if let Some(build) = devcontainer.build.as_ref() {
+        return build_devcontainer_image(build, devcontainer.image.as_deref()).await;
+    }
+
+    Ok(devcontainer
+        .image
+        .clone()
+        .or_else(|| image.map(ToOwned::to_owned))
+        .unwrap_or_else(|| DEFAULT_IMAGE.to_string()))
+}
+
+async fn build_devcontainer_image(
+    build: &DevcontainerBuildConfig,
+    image_tag: Option<&str>,
+) -> anyhow::Result<String> {
+    let tag = image_tag
+        .filter(|tag| !tag.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("strait-devcontainer:{}", uuid::Uuid::new_v4()));
+    let context = build
+        .context
+        .clone()
+        .or_else(|| build.dockerfile.parent().map(Path::to_path_buf))
+        .context("devcontainer build requires a Docker build context")?;
+
+    eprintln!(
+        "Building devcontainer image '{}' from {} (context: {})",
+        tag,
+        build.dockerfile.display(),
+        context.display()
+    );
+
+    let output = tokio::process::Command::new("docker")
+        .arg("build")
+        .arg("--file")
+        .arg(&build.dockerfile)
+        .arg("--tag")
+        .arg(&tag)
+        .arg(&context)
+        .output()
+        .await
+        .context("failed to run docker build for devcontainer image")?;
+
+    if !output.stdout.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "docker build failed for devcontainer image '{}' with status {}",
+            tag,
+            output.status
+        );
+    }
+
+    Ok(tag)
+}
+
 /// Parse and validate `--mount` flag values.
 ///
 /// Accepts `HOST:CONTAINER` or `HOST:CONTAINER:MODE` where MODE is `ro` or
@@ -1638,6 +1915,7 @@ pub async fn run_launch_observe(
         tty,
         LaunchTerminalMode::Host,
         None,
+        None,
     )
     .await
 }
@@ -1668,6 +1946,37 @@ pub async fn run_launch_observe_with_ready_signal(
         tty,
         LaunchTerminalMode::Host,
         Some(ready_tx),
+        None,
+    )
+    .await
+}
+
+/// Observe-mode entry point that applies a parsed devcontainer configuration.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_launch_observe_with_devcontainer(
+    command: Vec<String>,
+    image: Option<&str>,
+    output: Option<PathBuf>,
+    credential_store: Option<Arc<CredentialStore>>,
+    mitm_hosts: Vec<String>,
+    extra_env: Vec<String>,
+    extra_mounts: Vec<ExtraMount>,
+    tty: bool,
+    devcontainer: DevcontainerConfig,
+) -> anyhow::Result<i32> {
+    run_launch_observe_with_terminal_mode(
+        command,
+        image,
+        output,
+        credential_store,
+        mitm_hosts,
+        extra_env,
+        extra_mounts,
+        tty,
+        LaunchTerminalMode::Host,
+        None,
+        Some(devcontainer),
     )
     .await
 }
@@ -1697,6 +2006,7 @@ pub async fn run_launch_observe_with_test_terminal(
         tty,
         LaunchTerminalMode::Test(terminal),
         None,
+        None,
     )
     .await
 }
@@ -1713,9 +2023,10 @@ async fn run_launch_observe_with_terminal_mode(
     tty: bool,
     terminal_mode: LaunchTerminalMode,
     #[cfg(unix)] ready_tx: Option<LaunchReadySender>,
+    devcontainer: Option<DevcontainerConfig>,
 ) -> anyhow::Result<i32> {
-    let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let image = resolve_launch_image(image, devcontainer.as_ref()).await?;
     let obs_log_path = output.unwrap_or_else(|| cwd.join("observations.jsonl"));
 
     // 1. Verify Docker is running early (before any other setup)
@@ -1787,6 +2098,27 @@ async fn run_launch_observe_with_terminal_mode(
         tokio::spawn(run_mitm_unix_proxy_loop(listener, proxy_ctx))
     };
 
+    let workspace_path = devcontainer
+        .as_ref()
+        .map(|config| resolve_devcontainer_workspace(&cwd, config));
+    let devcontainer_mounts = if let Some(config) = devcontainer.as_ref() {
+        let mounts = resolve_devcontainer_mounts(&config.mounts, &cwd)?;
+        emit_devcontainer_mount_diagnostic(&mounts);
+        mounts
+    } else {
+        Vec::new()
+    };
+    let runtime_options = if let Some(config) = devcontainer.as_ref() {
+        ContainerRuntimeOptions {
+            workspace_mount_path: workspace_path.clone(),
+            working_dir: workspace_path.clone(),
+            user: config.remote_user.clone(),
+            pre_exec_hooks: devcontainer_pre_exec_hooks(config),
+        }
+    } else {
+        ContainerRuntimeOptions::default()
+    };
+
     // 7. Build observe-mode container config.
     warn!(
         path = %cwd.display(),
@@ -1797,17 +2129,29 @@ async fn run_launch_observe_with_terminal_mode(
     // Build config with auto_remove=false so we can reliably capture the
     // exit code via wait_container. Docker's wait API returns status_code=0
     // for TTY containers with auto_remove=true (a Docker/bollard quirk).
-    let mut config = ContainerManager::build_config(
-        image,
+    let mut config = ContainerManager::build_config_with_options(
+        &image,
         &command,
         &proxy_socket_path,
         &gateway_binary,
         Some(&ca_pem_path),
         &cwd,
         tty,
+        &runtime_options,
     )?;
     config.auto_remove = false;
-    config.env.extend(extra_env);
+    config.env = if let Some(devcontainer) = devcontainer.as_ref() {
+        merge_env_layers([
+            devcontainer_env(devcontainer),
+            extra_env,
+            config.env.clone(),
+        ])
+    } else {
+        merge_env_layers([extra_env, config.env.clone()])
+    };
+    for mount in &devcontainer_mounts {
+        config.binds.push(mount.to_bind_string());
+    }
     for m in &extra_mounts {
         config.binds.push(m.to_bind_string());
     }
@@ -1823,6 +2167,16 @@ async fn run_launch_observe_with_terminal_mode(
         path: cwd.to_string_lossy().to_string(),
         mode: "read-write".to_string(),
     });
+    for mount in &devcontainer_mounts {
+        obs_stream.emit(EventKind::Mount {
+            path: mount.source.clone(),
+            mode: if mount.mode == "ro" {
+                "read-only".to_string()
+            } else {
+                "read-write".to_string()
+            },
+        });
+    }
     for m in &extra_mounts {
         obs_stream.emit(EventKind::Mount {
             path: m.host_path.clone(),
@@ -1948,6 +2302,7 @@ pub async fn run_launch_with_policy(
         tty,
         LaunchTerminalMode::Host,
         None,
+        None,
     )
     .await
 }
@@ -1982,6 +2337,41 @@ pub async fn run_launch_with_policy_with_ready_signal(
         tty,
         LaunchTerminalMode::Host,
         Some(ready_tx),
+        None,
+    )
+    .await
+}
+
+/// Policy-mode entry point that applies a parsed devcontainer configuration.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_launch_with_policy_and_devcontainer(
+    mode: EnforcementMode,
+    policy_path: &Path,
+    command: Vec<String>,
+    image: Option<&str>,
+    output: Option<PathBuf>,
+    credential_store: Option<Arc<CredentialStore>>,
+    mitm_hosts: Vec<String>,
+    extra_env: Vec<String>,
+    extra_mounts: Vec<ExtraMount>,
+    tty: bool,
+    devcontainer: DevcontainerConfig,
+) -> anyhow::Result<i32> {
+    run_launch_with_policy_with_terminal_mode(
+        mode,
+        policy_path,
+        command,
+        image,
+        output,
+        credential_store,
+        mitm_hosts,
+        extra_env,
+        extra_mounts,
+        tty,
+        LaunchTerminalMode::Host,
+        None,
+        Some(devcontainer),
     )
     .await
 }
@@ -2015,6 +2405,7 @@ pub async fn run_launch_with_policy_with_test_terminal(
         tty,
         LaunchTerminalMode::Test(terminal),
         None,
+        None,
     )
     .await
 }
@@ -2033,9 +2424,10 @@ async fn run_launch_with_policy_with_terminal_mode(
     tty: bool,
     terminal_mode: LaunchTerminalMode,
     #[cfg(unix)] ready_tx: Option<LaunchReadySender>,
+    devcontainer: Option<DevcontainerConfig>,
 ) -> anyhow::Result<i32> {
-    let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let image = resolve_launch_image(image, devcontainer.as_ref()).await?;
     let obs_log_path = output.unwrap_or_else(|| cwd.join("observations.jsonl"));
 
     // 1. Load and validate Cedar policy at startup (fail fast before container)
@@ -2095,7 +2487,12 @@ async fn run_launch_with_policy_with_terminal_mode(
         mode == EnforcementMode::Warn,
         credential_store,
         mitm_hosts,
-        Some(launch_live_policy_bounds(&cwd)),
+        Some(launch_live_policy_bounds(
+            &cwd,
+            devcontainer
+                .as_ref()
+                .and_then(|config| config.workspace_folder.as_deref()),
+        )),
     )?);
 
     #[cfg(unix)]
@@ -2123,18 +2520,51 @@ async fn run_launch_with_policy_with_terminal_mode(
         tokio::spawn(run_mitm_unix_proxy_loop(listener, proxy_ctx))
     };
 
+    let workspace_path = devcontainer
+        .as_ref()
+        .map(|config| resolve_devcontainer_workspace(&cwd, config));
+    let devcontainer_mounts = if let Some(config) = devcontainer.as_ref() {
+        let mounts = resolve_devcontainer_mounts(&config.mounts, &cwd)?;
+        emit_devcontainer_mount_diagnostic(&mounts);
+        mounts
+    } else {
+        Vec::new()
+    };
+    let runtime_options = if let Some(config) = devcontainer.as_ref() {
+        ContainerRuntimeOptions {
+            workspace_mount_path: workspace_path.clone(),
+            working_dir: workspace_path.clone(),
+            user: config.remote_user.clone(),
+            pre_exec_hooks: devcontainer_pre_exec_hooks(config),
+        }
+    } else {
+        ContainerRuntimeOptions::default()
+    };
+
     // 8. Build container config with the working directory mount.
-    let mut config = ContainerManager::build_config(
-        image,
+    let mut config = ContainerManager::build_config_with_options(
+        &image,
         &command,
         &proxy_socket_path,
         &gateway_binary,
         Some(&ca_pem_path),
         &cwd,
         tty,
+        &runtime_options,
     )?;
     config.auto_remove = false;
-    config.env.extend(extra_env);
+    config.env = if let Some(devcontainer) = devcontainer.as_ref() {
+        merge_env_layers([
+            devcontainer_env(devcontainer),
+            extra_env,
+            config.env.clone(),
+        ])
+    } else {
+        merge_env_layers([extra_env, config.env.clone()])
+    };
+    for mount in &devcontainer_mounts {
+        config.binds.push(mount.to_bind_string());
+    }
     for m in &extra_mounts {
         config.binds.push(m.to_bind_string());
     }
@@ -2152,6 +2582,16 @@ async fn run_launch_with_policy_with_terminal_mode(
         path: cwd.to_string_lossy().to_string(),
         mode: "read-write".to_string(),
     });
+    for mount in &devcontainer_mounts {
+        obs_stream.emit(EventKind::Mount {
+            path: mount.source.clone(),
+            mode: if mount.mode == "ro" {
+                "read-only".to_string()
+            } else {
+                "read-write".to_string()
+            },
+        });
+    }
     for m in &extra_mounts {
         obs_stream.emit(EventKind::Mount {
             path: m.host_path.clone(),
@@ -4059,7 +4499,7 @@ permit(
 
     #[test]
     fn launch_live_policy_bounds_include_workspace_alias() {
-        let bounds = launch_live_policy_bounds(Path::new("/tmp/strait-project"));
+        let bounds = launch_live_policy_bounds(Path::new("/tmp/strait-project"), None);
         assert_eq!(
             bounds.fs_candidate_paths,
             vec![
@@ -4072,10 +4512,23 @@ permit(
 
     #[test]
     fn launch_live_policy_bounds_avoid_duplicate_workspace_alias() {
-        let bounds = launch_live_policy_bounds(Path::new(CONTAINER_WORKSPACE_PATH));
+        let bounds = launch_live_policy_bounds(Path::new(CONTAINER_WORKSPACE_PATH), None);
         assert_eq!(
             bounds.fs_candidate_paths,
             vec![CONTAINER_WORKSPACE_PATH.to_string()]
+        );
+    }
+
+    #[test]
+    fn launch_live_policy_bounds_use_declared_workspace_folder() {
+        let bounds =
+            launch_live_policy_bounds(Path::new("/tmp/strait-project"), Some("/workspaces/custom"));
+        assert_eq!(
+            bounds.fs_candidate_paths,
+            vec![
+                "/tmp/strait-project".to_string(),
+                "/workspaces/custom".to_string()
+            ]
         );
     }
 

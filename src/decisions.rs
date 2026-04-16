@@ -39,6 +39,8 @@ pub enum DecisionError {
     UnknownBlockedId,
     /// The blocked-request ID existed but the held request is no longer waiting.
     Expired,
+    /// The blocked request has no durable persist suggestion.
+    NoPersistSuggestion,
 }
 
 impl DecisionError {
@@ -47,6 +49,7 @@ impl DecisionError {
         match self {
             Self::UnknownBlockedId => "unknown_blocked_id",
             Self::Expired => "expired_blocked_id",
+            Self::NoPersistSuggestion => "no_persist_suggestion",
         }
     }
 
@@ -59,6 +62,10 @@ impl DecisionError {
             }
             Self::Expired => {
                 "blocked request is no longer waiting for a live decision; retry the request to generate a fresh blocked_id"
+                    .to_string()
+            }
+            Self::NoPersistSuggestion => {
+                "blocked request does not include a persistable candidate exception"
                     .to_string()
             }
         }
@@ -75,8 +82,18 @@ enum BlockState {
 #[derive(Debug, Clone)]
 struct BlockRecord {
     match_key: String,
+    persist_snippet: Option<String>,
     observed_at: Instant,
     state: BlockState,
+}
+
+/// Durable policy payload for a blocked request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistCandidate {
+    /// Normalized match key for the blocked request.
+    pub match_key: String,
+    /// Minimal Cedar snippet to append to the durable policy source.
+    pub cedar_snippet: String,
 }
 
 #[derive(Debug, Default)]
@@ -129,13 +146,24 @@ impl PendingDecisionStore {
         blocked_id: &str,
         match_key: &str,
     ) -> oneshot::Receiver<Decision> {
-        self.register_pending_at(blocked_id, match_key, Instant::now())
+        self.register_pending_with_persist(blocked_id, match_key, None)
+    }
+
+    /// Register a blocked request and retain its persist suggestion.
+    pub fn register_pending_with_persist(
+        &self,
+        blocked_id: &str,
+        match_key: &str,
+        persist_snippet: Option<String>,
+    ) -> oneshot::Receiver<Decision> {
+        self.register_pending_at(blocked_id, match_key, persist_snippet, Instant::now())
     }
 
     fn register_pending_at(
         &self,
         blocked_id: &str,
         match_key: &str,
+        persist_snippet: Option<String>,
         now: Instant,
     ) -> oneshot::Receiver<Decision> {
         let mut inner = self.inner.lock().expect("pending decision store poisoned");
@@ -153,6 +181,7 @@ impl PendingDecisionStore {
             blocked_id.to_string(),
             BlockRecord {
                 match_key: match_key.to_string(),
+                persist_snippet,
                 observed_at: now,
                 state: BlockState::Pending,
             },
@@ -175,6 +204,43 @@ impl PendingDecisionStore {
     /// Resolve the blocked request by denying it.
     pub fn resolve_deny(&self, blocked_id: &str) -> Result<String, DecisionError> {
         self.resolve(blocked_id, Decision::Deny, Instant::now())
+    }
+
+    /// Return the durable persist suggestion for a pending blocked request.
+    pub fn persist_candidate(&self, blocked_id: &str) -> Result<PersistCandidate, DecisionError> {
+        self.persist_candidate_at(blocked_id, Instant::now())
+    }
+
+    fn persist_candidate_at(
+        &self,
+        blocked_id: &str,
+        now: Instant,
+    ) -> Result<PersistCandidate, DecisionError> {
+        let mut inner = self.inner.lock().expect("pending decision store poisoned");
+        Self::evict_expired(&mut inner, now, self.ttl);
+
+        let Some(record) = inner.blocks.get_mut(blocked_id) else {
+            return Err(DecisionError::UnknownBlockedId);
+        };
+        if now.duration_since(record.observed_at) > self.ttl {
+            record.state = BlockState::Expired;
+            inner.pending.remove(blocked_id);
+            return Err(DecisionError::Expired);
+        }
+        match record.state {
+            BlockState::Pending => {}
+            BlockState::Resolved => return Err(DecisionError::UnknownBlockedId),
+            BlockState::Expired => return Err(DecisionError::Expired),
+        }
+
+        let Some(cedar_snippet) = record.persist_snippet.clone() else {
+            return Err(DecisionError::NoPersistSuggestion);
+        };
+
+        Ok(PersistCandidate {
+            match_key: record.match_key.clone(),
+            cedar_snippet,
+        })
     }
 
     fn resolve(
@@ -343,7 +409,7 @@ mod tests {
     fn expired_blocked_id_returns_error() {
         let store = PendingDecisionStore::with_capacity_and_ttl(16, Duration::from_secs(60));
         let origin = Instant::now();
-        let _rx = store.register_pending_at("old", "http:GET example.com/stale", origin);
+        let _rx = store.register_pending_at("old", "http:GET example.com/stale", None, origin);
         store.expire_at("old", origin + Duration::from_secs(11));
 
         assert_eq!(
@@ -385,7 +451,40 @@ mod tests {
     fn decision_error_codes_are_stable() {
         assert_eq!(DecisionError::UnknownBlockedId.code(), "unknown_blocked_id");
         assert_eq!(DecisionError::Expired.code(), "expired_blocked_id");
+        assert_eq!(
+            DecisionError::NoPersistSuggestion.code(),
+            "no_persist_suggestion"
+        );
         assert!(!DecisionError::UnknownBlockedId.message().is_empty());
         assert!(!DecisionError::Expired.message().is_empty());
+        assert!(!DecisionError::NoPersistSuggestion.message().is_empty());
+    }
+
+    #[test]
+    fn persist_candidate_returns_snippet_for_pending_request() {
+        let store = PendingDecisionStore::new();
+        let _rx = store.register_pending_with_persist(
+            "id",
+            "http:GET example.com/repos/org/repo",
+            Some("permit(principal, action, resource);".to_string()),
+        );
+
+        let candidate = store.persist_candidate("id").unwrap();
+        assert_eq!(candidate.match_key, "http:GET example.com/repos/org/repo");
+        assert_eq!(
+            candidate.cedar_snippet,
+            "permit(principal, action, resource);"
+        );
+    }
+
+    #[test]
+    fn persist_candidate_rejects_requests_without_suggestion() {
+        let store = PendingDecisionStore::new();
+        let _rx = store.register_pending("id", "http:GET example.com/repos/org/repo");
+
+        assert_eq!(
+            store.persist_candidate("id").unwrap_err(),
+            DecisionError::NoPersistSuggestion
+        );
     }
 }

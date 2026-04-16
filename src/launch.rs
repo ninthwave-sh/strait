@@ -48,8 +48,8 @@ use tracing::{info, warn};
 use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
 use crate::config::{
-    reload_policy, replace_policy, LivePolicyBounds, PolicyConfig, PolicyMutationOutcome,
-    ProxyContext,
+    persist_policy_exception, reload_policy, replace_policy, LivePolicyBounds, PolicyConfig,
+    PolicyMutationOutcome, ProxyContext,
 };
 use crate::container::{container_trust_diagnostic_lines, ContainerManager};
 use crate::credentials::CredentialStore;
@@ -270,6 +270,8 @@ pub enum LaunchControlResult {
     DecisionAllowOnce { outcome: DecisionActionOutcome },
     /// Result for `decision.allow_session`.
     DecisionAllowSession { outcome: DecisionActionOutcome },
+    /// Result for `decision.persist`.
+    DecisionPersist { outcome: DecisionActionOutcome },
     /// Result for `decision.deny`.
     DecisionDeny { outcome: DecisionActionOutcome },
 }
@@ -336,6 +338,7 @@ enum ControlMethod {
     PolicyReplace,
     DecisionAllowOnce,
     DecisionAllowSession,
+    DecisionPersist,
     DecisionDeny,
 }
 
@@ -349,6 +352,7 @@ impl ControlMethod {
             Self::PolicyReplace => "policy.replace",
             Self::DecisionAllowOnce => "decision.allow_once",
             Self::DecisionAllowSession => "decision.allow_session",
+            Self::DecisionPersist => "decision.persist",
             Self::DecisionDeny => "decision.deny",
         }
     }
@@ -371,6 +375,7 @@ fn parse_control_method(request: &LaunchControlRequest) -> anyhow::Result<Contro
         "policy.replace" => Ok(ControlMethod::PolicyReplace),
         "decision.allow_once" => Ok(ControlMethod::DecisionAllowOnce),
         "decision.allow_session" => Ok(ControlMethod::DecisionAllowSession),
+        "decision.persist" => Ok(ControlMethod::DecisionPersist),
         "decision.deny" => Ok(ControlMethod::DecisionDeny),
         other => anyhow::bail!("unsupported control method '{other}'"),
     }
@@ -710,6 +715,24 @@ pub async fn request_launch_decision_allow_session(
     }
 }
 
+/// Resolve a blocked request by persisting a durable Cedar exception and
+/// reloading it into the running session.
+#[cfg(unix)]
+pub async fn request_launch_decision_persist(
+    control_socket_path: &Path,
+    blocked_id: impl Into<String>,
+) -> anyhow::Result<DecisionActionOutcome> {
+    let response = send_launch_control_request(
+        control_socket_path,
+        &LaunchControlRequest::with_blocked_id(ControlMethod::DecisionPersist, blocked_id),
+    )
+    .await?;
+    match response.result {
+        Some(LaunchControlResult::DecisionPersist { outcome }) => Ok(outcome),
+        other => anyhow::bail!("unexpected decision.persist response: {other:?}"),
+    }
+}
+
 /// Resolve a blocked request by explicitly denying it.
 #[cfg(unix)]
 pub async fn request_launch_decision_deny(
@@ -728,23 +751,35 @@ pub async fn request_launch_decision_deny(
 }
 
 #[cfg(unix)]
+fn require_blocked_id(
+    request: &LaunchControlRequest,
+    method: ControlMethod,
+) -> Result<&String, Box<LaunchControlResponse>> {
+    let Some(blocked_id) = request.blocked_id.as_ref() else {
+        return Err(Box::new(LaunchControlResponse::invalid_request(
+            "missing_blocked_id",
+            format!("{} requires a blocked_id", method.as_str()),
+        )));
+    };
+    if blocked_id.trim().is_empty() {
+        return Err(Box::new(LaunchControlResponse::invalid_request(
+            "missing_blocked_id",
+            format!("{} requires a non-empty blocked_id", method.as_str()),
+        )));
+    }
+    Ok(blocked_id)
+}
+
+#[cfg(unix)]
 fn dispatch_decision_action(
     request: &LaunchControlRequest,
     method: ControlMethod,
     proxy_ctx: &ProxyContext,
 ) -> LaunchControlResponse {
-    let Some(blocked_id) = request.blocked_id.as_ref() else {
-        return LaunchControlResponse::invalid_request(
-            "missing_blocked_id",
-            format!("{} requires a blocked_id", method.as_str()),
-        );
+    let blocked_id = match require_blocked_id(request, method) {
+        Ok(blocked_id) => blocked_id,
+        Err(response) => return *response,
     };
-    if blocked_id.trim().is_empty() {
-        return LaunchControlResponse::invalid_request(
-            "missing_blocked_id",
-            format!("{} requires a non-empty blocked_id", method.as_str()),
-        );
-    }
 
     let store = proxy_ctx.pending_decisions.as_ref();
     let apply = match method {
@@ -783,6 +818,45 @@ fn dispatch_decision_action(
 }
 
 #[cfg(unix)]
+fn dispatch_persist_action(
+    request: &LaunchControlRequest,
+    proxy_ctx: &ProxyContext,
+) -> LaunchControlResponse {
+    let blocked_id = match require_blocked_id(request, ControlMethod::DecisionPersist) {
+        Ok(blocked_id) => blocked_id,
+        Err(response) => return *response,
+    };
+
+    let store = proxy_ctx.pending_decisions.as_ref();
+    let candidate = match store.persist_candidate(blocked_id) {
+        Ok(candidate) => candidate,
+        Err(error) => return LaunchControlResponse::failure(error.code(), error.message()),
+    };
+
+    match persist_policy_exception(proxy_ctx, &candidate.match_key, &candidate.cedar_snippet) {
+        Ok(update) => match store.resolve_allow_once(blocked_id) {
+            Ok(match_key) => {
+                emit_policy_reload_event(proxy_ctx, "persist", &update);
+                emit_decision_event(
+                    proxy_ctx,
+                    ControlMethod::DecisionPersist,
+                    blocked_id,
+                    &match_key,
+                );
+                LaunchControlResponse::success(LaunchControlResult::DecisionPersist {
+                    outcome: DecisionActionOutcome {
+                        blocked_id: blocked_id.clone(),
+                        match_key,
+                    },
+                })
+            }
+            Err(error) => LaunchControlResponse::failure(error.code(), error.message()),
+        },
+        Err(error) => LaunchControlResponse::failure("policy_update_failed", error.to_string()),
+    }
+}
+
+#[cfg(unix)]
 fn emit_decision_event(
     proxy_ctx: &ProxyContext,
     method: ControlMethod,
@@ -795,6 +869,7 @@ fn emit_decision_event(
     let action = match method {
         ControlMethod::DecisionAllowOnce => "decision.allow_once",
         ControlMethod::DecisionAllowSession => "decision.allow_session",
+        ControlMethod::DecisionPersist => "decision.persist",
         ControlMethod::DecisionDeny => "decision.deny",
         _ => return,
     };
@@ -897,6 +972,9 @@ async fn handle_launch_control_client(
                 ControlMethod::DecisionAllowSession,
                 proxy_ctx.as_ref(),
             ),
+            Ok(ControlMethod::DecisionPersist) => {
+                dispatch_persist_action(&request, proxy_ctx.as_ref())
+            }
             Ok(ControlMethod::DecisionDeny) => {
                 dispatch_decision_action(&request, ControlMethod::DecisionDeny, proxy_ctx.as_ref())
             }
@@ -3590,6 +3668,16 @@ permit(
             "missing_blocked_id",
             "decision methods should reject a blank blocked_id"
         );
+
+        let persist_missing = LaunchControlRequest::new(ControlMethod::DecisionPersist);
+        let persist_missing_response =
+            dispatch_persist_action(&persist_missing, proxy_ctx.as_ref());
+        assert!(!persist_missing_response.ok);
+        assert_eq!(
+            persist_missing_response.error.unwrap().code,
+            "missing_blocked_id",
+            "persist should reject a missing blocked_id"
+        );
     }
 
     #[cfg(unix)]
@@ -3612,6 +3700,30 @@ permit(
         })
         .await
         .expect("live decision event should arrive")
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_policy_reload_event(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::observe::ObservationEvent>,
+        expected_source: &str,
+    ) -> (bool, String) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = rx.recv().await.unwrap();
+                match event.event {
+                    EventKind::PolicyReloaded {
+                        applied,
+                        source,
+                        restart_required_domains,
+                    } if source == expected_source => {
+                        return (applied, restart_required_domains.join(","));
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("policy reload event should arrive")
     }
 
     #[cfg(unix)]
@@ -3682,6 +3794,87 @@ permit(
             wait_for_live_decision_event(&mut obs_rx, "decision.deny").await;
         assert_eq!(blocked_id, "blocked-deny");
         assert_eq!(match_key, "http:GET example.com/deny");
+
+        drop(session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_control_server_persists_rule_and_emits_reload() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let policy_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            policy_file.path(),
+            "@id(\"allow-health\")\npermit(principal, action == Action::\"http:GET\", resource == Resource::\"example.com/health\");\n",
+        )
+        .unwrap();
+        let policy_engine = PolicyEngine::load(policy_file.path(), None).unwrap();
+        let policy_config = PolicyConfig {
+            file: Some(policy_file.path().to_path_buf()),
+            git_url: None,
+            git_path: None,
+            schema: None,
+            poll_interval_secs: None,
+        };
+        let proxy_ctx = test_launch_proxy_ctx(Some(policy_engine), Some(policy_config), None);
+        let mut obs_rx = proxy_ctx.observation_stream.as_ref().unwrap().subscribe();
+        let (session, _stop_rx) = LaunchSession::create_in(
+            registry_root.path(),
+            "persist-session",
+            EnforcementMode::Enforce,
+            proxy_ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let control_socket = session.control_socket_path().await;
+        let snippet = crate::policy::synthesize_blocked_request(
+            "example.com",
+            "GET",
+            "/repos/org/repo",
+            &[],
+            &[],
+            false,
+        )
+        .candidate_exception
+        .unwrap()
+        .persist
+        .cedar_snippet;
+        let pending_rx = proxy_ctx.pending_decisions.register_pending_with_persist(
+            "blocked-persist",
+            "http:GET example.com/repos/org/repo",
+            Some(snippet.clone()),
+        );
+
+        let persist = request_launch_decision_persist(&control_socket, "blocked-persist")
+            .await
+            .unwrap();
+        assert_eq!(persist.blocked_id, "blocked-persist");
+        assert_eq!(persist.match_key, "http:GET example.com/repos/org/repo");
+        assert_eq!(
+            pending_rx.await.unwrap(),
+            crate::decisions::Decision::AllowOnce
+        );
+
+        let (applied, restart_domains) = wait_for_policy_reload_event(&mut obs_rx, "persist").await;
+        assert!(applied);
+        assert!(restart_domains.is_empty());
+
+        let (blocked_id, match_key) =
+            wait_for_live_decision_event(&mut obs_rx, "decision.persist").await;
+        assert_eq!(blocked_id, "blocked-persist");
+        assert_eq!(match_key, "http:GET example.com/repos/org/repo");
+
+        let persisted_text = std::fs::read_to_string(policy_file.path()).unwrap();
+        assert!(persisted_text.contains(&snippet));
+
+        let engine = proxy_ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("example.com", "http:GET", "/repos/org/repo", &[], "agent")
+            .unwrap();
+        assert!(
+            decision.allowed,
+            "persisted rule should hot-reload into the session"
+        );
 
         drop(session);
     }

@@ -3341,6 +3341,73 @@ fn build_live_decision_context(
     (Arc::new(ctx), obs_stream)
 }
 
+fn build_persist_decision_context(
+    echo_addr: std::net::SocketAddr,
+) -> (
+    Arc<strait::config::ProxyContext>,
+    strait::observe::ObservationStream,
+    tempfile::TempDir,
+    std::path::PathBuf,
+) {
+    let obs_stream = strait::observe::ObservationStream::new();
+    let session_ca = strait::ca::SessionCa::generate().unwrap();
+    let audit_logger = Arc::new(strait::audit::AuditLogger::new(None).unwrap());
+    let tls_config = Arc::new(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(strait_test_helpers::NoVerify))
+            .with_no_client_auth(),
+    );
+    let temp_dir = tempfile::tempdir().unwrap();
+    let policy_path = temp_dir.path().join("policy.cedar");
+    std::fs::write(
+        &policy_path,
+        r#"@id("allow-health")
+permit(
+    principal,
+    action == Action::"http:GET",
+    resource == Resource::"api.github.com/health"
+);
+"#,
+    )
+    .unwrap();
+    let engine = strait::policy::PolicyEngine::load(&policy_path, None).unwrap();
+
+    let ctx = strait::config::ProxyContext {
+        session_ca,
+        policy_engine: Some(arc_swap::ArcSwap::from_pointee(engine)),
+        credential_store: None,
+        audit_logger,
+        mitm_hosts: vec!["api.github.com".to_string()],
+        max_body_size: 10 * 1024 * 1024,
+        keepalive_timeout: std::time::Duration::from_secs(5),
+        decision_timeout: std::time::Duration::from_secs(2),
+        startup_instant: std::time::Instant::now(),
+        identity_header: "X-Strait-Agent".to_string(),
+        identity_default: "anonymous".to_string(),
+        git_policy: None,
+        policy_config: Some(strait::config::PolicyConfig {
+            file: Some(policy_path.clone()),
+            git_url: None,
+            git_path: None,
+            schema: None,
+            poll_interval_secs: None,
+        }),
+        observation_stream: Some(obs_stream.clone()),
+        enforcement_mode: "enforce".to_string(),
+        mitm_all: false,
+        warn_only: false,
+        live_policy_bounds: None,
+        upstream_addr_override: Some(echo_addr),
+        upstream_tls_override: Some(tls_config),
+        upstream_connect_timeout: std::time::Duration::from_secs(30),
+        upstream_response_timeout: std::time::Duration::from_secs(60),
+        pending_decisions: Arc::new(strait::decisions::PendingDecisionStore::new()),
+    };
+
+    (Arc::new(ctx), obs_stream, temp_dir, policy_path)
+}
+
 #[tokio::test]
 async fn blocked_request_allow_once_resumes_only_current_request() {
     let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
@@ -3433,6 +3500,81 @@ async fn blocked_request_allow_session_caches_future_matches() {
         .await
         .is_err(),
         "allow-session should let the next matching request pass without a new hold"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn blocked_request_persist_reloads_live_policy_and_preauthorizes_next_session() {
+    let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
+    let (ctx, obs_stream, _temp_dir, policy_path) = build_persist_decision_context(echo_addr);
+    let mut rx = obs_stream.subscribe();
+    let proxy_addr = start_proxy_server(ctx.clone()).await;
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
+
+    let first = tokio::spawn(send_get_request_through_proxy(
+        proxy_addr,
+        ca_pem.clone(),
+        "api.github.com",
+        "/repos/org/repo",
+    ));
+    let blocked = wait_for_blocked_request(&mut rx, &[]).await;
+    let expected_snippet = blocked
+        .candidate_exception
+        .as_ref()
+        .unwrap()
+        .persist
+        .cedar_snippet
+        .clone();
+
+    let outcome =
+        strait::config::persist_policy_exception(&ctx, &blocked.match_key, &expected_snippet)
+            .unwrap();
+    assert!(outcome.applied);
+    ctx.pending_decisions
+        .resolve_allow_once(&blocked.blocked_id)
+        .unwrap();
+
+    let first_response = first.await.unwrap();
+    assert!(
+        first_response.contains("200 OK"),
+        "persist should resume the held request after writing policy: {first_response}"
+    );
+
+    let persisted_text = std::fs::read_to_string(&policy_path).unwrap();
+    assert!(persisted_text.contains(&expected_snippet));
+
+    let second_response = send_get_request_through_proxy(
+        proxy_addr,
+        ca_pem.clone(),
+        "api.github.com",
+        "/repos/org/repo",
+    )
+    .await;
+    assert!(second_response.contains("200 OK"));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            wait_for_blocked_request(&mut rx, &[&blocked.blocked_id])
+        )
+        .await
+        .is_err(),
+        "persisted live reload should allow the next matching request without a new hold"
+    );
+
+    let next_session_engine = strait::policy::PolicyEngine::load(&policy_path, None).unwrap();
+    let next_session_decision = next_session_engine
+        .evaluate(
+            "api.github.com",
+            "http:GET",
+            "/repos/org/repo",
+            &[],
+            "anonymous",
+        )
+        .unwrap();
+    assert!(
+        next_session_decision.allowed,
+        "persisted policy file should pre-authorize the next launched session"
     );
 }
 

@@ -104,6 +104,19 @@ enum SessionAction {
         policy: PathBuf,
     },
 
+    /// Persist a blocked request as durable Cedar policy and reload it live.
+    PersistDecision {
+        /// Session ID to target.
+        ///
+        /// If omitted, targets the newest active session.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+
+        /// Blocked-request identifier from the observation stream.
+        #[arg(value_name = "BLOCKED_ID")]
+        blocked_id: String,
+    },
+
     /// Stop a running strait session through the control API.
     Stop {
         /// Session ID to target.
@@ -560,6 +573,22 @@ async fn run_session_command(action: SessionAction) -> anyhow::Result<()> {
             )
             .await?;
             report_policy_update("Policy replace", &session, &update)?;
+        }
+        SessionAction::PersistDecision {
+            session,
+            blocked_id,
+        } => {
+            let session = resolve_target_session(session.as_deref()).await?;
+            let outcome = strait::launch::request_launch_decision_persist(
+                &session.control_socket_path,
+                &blocked_id,
+            )
+            .await?;
+            println!(
+                "Persisted {} for session {}.",
+                outcome.match_key, session.session_id
+            );
+            println!("{LIVE_POLICY_UPDATE_BOUNDARY_MESSAGE}");
         }
         SessionAction::Stop { session } => {
             let session = resolve_target_session(session.as_deref()).await?;
@@ -1289,6 +1318,32 @@ mod tests {
                 assert_eq!(session.as_deref(), Some("session-123"));
             }
             _ => panic!("expected Session::Stop subcommand"),
+        }
+    }
+
+    #[test]
+    fn test_session_persist_decision_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "strait",
+            "session",
+            "persist-decision",
+            "--session",
+            "session-123",
+            "blocked-456",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Session {
+                action:
+                    SessionAction::PersistDecision {
+                        session,
+                        blocked_id,
+                    },
+            } => {
+                assert_eq!(session.as_deref(), Some("session-123"));
+                assert_eq!(blocked_id, "blocked-456");
+            }
+            _ => panic!("expected Session::PersistDecision subcommand"),
         }
     }
 

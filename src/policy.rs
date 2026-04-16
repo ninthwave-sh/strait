@@ -581,6 +581,29 @@ pub fn build_match_key(host: &str, method: &str, path: &str) -> String {
     format!("http:{method} {host}{path}")
 }
 
+/// Parse a normalized blocked-request match key back into request parts.
+pub fn parse_match_key(match_key: &str) -> anyhow::Result<(String, String, String)> {
+    let (action, resource) = match_key
+        .split_once(' ')
+        .ok_or_else(|| anyhow::anyhow!("invalid match key '{match_key}': missing separator"))?;
+    let method = action.strip_prefix("http:").ok_or_else(|| {
+        anyhow::anyhow!("invalid match key '{match_key}': action must start with http:")
+    })?;
+    let slash = resource.find('/').unwrap_or(resource.len());
+    let host = &resource[..slash];
+    let path = if slash == resource.len() {
+        "/"
+    } else {
+        &resource[slash..]
+    };
+
+    if host.is_empty() {
+        anyhow::bail!("invalid match key '{match_key}': missing host");
+    }
+
+    Ok((host.to_string(), method.to_string(), path.to_string()))
+}
+
 /// Build the human-readable explanation string for a blocked request.
 ///
 /// Prefers any `@reason("...")` annotations attached to matching Cedar
@@ -817,6 +840,84 @@ permit(
     resource in Resource::"example.com/api"
 );
 "#;
+
+    #[test]
+    fn parse_match_key_round_trips_root_and_path_requests() {
+        assert_eq!(
+            parse_match_key("http:GET api.github.com/").unwrap(),
+            (
+                "api.github.com".to_string(),
+                "GET".to_string(),
+                "/".to_string()
+            )
+        );
+        assert_eq!(
+            parse_match_key("http:POST api.github.com/repos/org/repo").unwrap(),
+            (
+                "api.github.com".to_string(),
+                "POST".to_string(),
+                "/repos/org/repo".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn persist_exception_serializes_path_scoped_rule_for_deep_paths() {
+        let blocked =
+            synthesize_blocked_request("api.github.com", "GET", "/repos/org/repo", &[], &[], false);
+        let candidate = blocked.candidate_exception.unwrap();
+        assert_eq!(candidate.scope, ExceptionScope::PathScoped);
+        assert_eq!(
+            candidate.persist.cedar_snippet,
+            concat!(
+                "@id(\"allow_http_get_path_api_github_com_repos_org_repo_persist\")\n",
+                "@reason(\"strait-synthesized persist exception for GET /repos/org/repo on api.github.com\")\n",
+                "permit(\n",
+                "    principal,\n",
+                "    action == Action::\"http:GET\",\n",
+                "    resource == Resource::\"api.github.com/repos/org/repo\"\n",
+                ");"
+            )
+        );
+    }
+
+    #[test]
+    fn persist_exception_serializes_method_host_rule_for_shallow_paths() {
+        let shallow =
+            synthesize_blocked_request("api.github.com", "POST", "/graphql", &[], &[], false);
+        let shallow_candidate = shallow.candidate_exception.unwrap();
+        assert_eq!(shallow_candidate.scope, ExceptionScope::MethodHost);
+        assert!(shallow_candidate.ambiguous);
+        assert_eq!(
+            shallow_candidate.persist.cedar_snippet,
+            concat!(
+                "@id(\"allow_http_post_host_api_github_com_persist\")\n",
+                "@reason(\"strait-synthesized persist exception for POST on api.github.com\")\n",
+                "permit(\n",
+                "    principal,\n",
+                "    action == Action::\"http:POST\",\n",
+                "    resource in Resource::\"api.github.com\"\n",
+                ");"
+            )
+        );
+
+        let root = synthesize_blocked_request("api.github.com", "HEAD", "/", &[], &[], false);
+        let root_candidate = root.candidate_exception.unwrap();
+        assert_eq!(root_candidate.scope, ExceptionScope::MethodHost);
+        assert!(!root_candidate.ambiguous);
+        assert_eq!(
+            root_candidate.persist.cedar_snippet,
+            concat!(
+                "@id(\"allow_http_head_host_api_github_com_persist\")\n",
+                "@reason(\"strait-synthesized persist exception for HEAD on api.github.com\")\n",
+                "permit(\n",
+                "    principal,\n",
+                "    action == Action::\"http:HEAD\",\n",
+                "    resource in Resource::\"api.github.com\"\n",
+                ");"
+            )
+        );
+    }
 
     #[test]
     fn load_valid_policy_file() {

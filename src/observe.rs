@@ -262,13 +262,14 @@ pub enum EventKind {
     /// Live decision action applied through the launch control plane.
     ///
     /// Emitted when an external client resolves a blocked request via
-    /// `decision.allow_once`, `decision.allow_session`, or
-    /// `decision.deny`. Mirrors the blocked-request metadata on
+    /// `decision.allow_once`, `decision.allow_session`,
+    /// `decision.persist`, or `decision.deny`. Mirrors the blocked-request metadata on
     /// `NetworkRequest` emissions so downstream consumers can
     /// correlate the decision with the originating block.
     LiveDecision {
         /// Decision method applied. One of `decision.allow_once`,
-        /// `decision.allow_session`, or `decision.deny`.
+        /// `decision.allow_session`, `decision.persist`, or
+        /// `decision.deny`.
         action: String,
         /// Blocked-request identifier the decision was applied against.
         blocked_id: String,

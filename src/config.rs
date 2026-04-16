@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{fs, io::Write as _};
 
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
@@ -819,6 +820,135 @@ fn load_schema_text_for_replace(ctx: &ProxyContext) -> anyhow::Result<Option<(St
         .transpose()
 }
 
+fn durable_policy_file_path(ctx: &ProxyContext) -> anyhow::Result<&Path> {
+    let policy_config = ctx
+        .policy_config
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no policy configured, nothing to persist"))?;
+
+    if ctx.git_policy.is_some() || policy_config.git_url.is_some() {
+        anyhow::bail!(
+            "persist requires [policy].file; git-backed policy sources are read-only for durable updates"
+        );
+    }
+
+    policy_config
+        .file
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("persist requires [policy].file"))
+}
+
+fn policy_allows_request(
+    policy_text: &str,
+    schema: Option<&(String, String)>,
+    host: &str,
+    method: &str,
+    path: &str,
+    agent_id: &str,
+) -> anyhow::Result<bool> {
+    let engine = PolicyEngine::from_text(
+        policy_text,
+        schema.map(|(text, _)| text.as_str()),
+        schema.map(|(_, label)| label.as_str()),
+    )?;
+    let decision = engine.evaluate(host, &format!("http:{method}"), path, &[], agent_id)?;
+    Ok(decision.allowed)
+}
+
+fn append_policy_snippet(existing: &str, snippet: &str) -> String {
+    let snippet = snippet.trim();
+    if existing.trim().is_empty() {
+        return format!("{snippet}\n");
+    }
+
+    let mut updated = existing.to_string();
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    if !updated.ends_with("\n\n") {
+        updated.push('\n');
+    }
+    updated.push_str(snippet);
+    updated.push('\n');
+    updated
+}
+
+fn write_text_atomic(path: &Path, content: &str) -> anyhow::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!("policy file '{}' has no parent directory", path.display())
+    })?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "failed to create temporary file next to policy source '{}'",
+            path.display()
+        )
+    })?;
+    temp.write_all(content.as_bytes()).with_context(|| {
+        format!(
+            "failed to write temporary contents for policy source '{}'",
+            path.display()
+        )
+    })?;
+    temp.flush().with_context(|| {
+        format!(
+            "failed to flush temporary contents for policy source '{}'",
+            path.display()
+        )
+    })?;
+    temp.persist(path).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to replace policy source '{}': {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    Ok(())
+}
+
+/// Persist a durable Cedar exception to the configured policy file, then reload
+/// the running session from disk so the new network rule applies live.
+pub fn persist_policy_exception(
+    ctx: &ProxyContext,
+    match_key: &str,
+    cedar_snippet: &str,
+) -> anyhow::Result<PolicyMutationOutcome> {
+    let policy_path = durable_policy_file_path(ctx)?;
+    let existing = fs::read_to_string(policy_path)
+        .with_context(|| format!("failed to read policy file: {}", policy_path.display()))?;
+    let schema = load_schema_text_for_replace(ctx)?;
+    let (host, method, path) = crate::policy::parse_match_key(match_key)?;
+    let agent_id = ctx
+        .live_policy_bounds
+        .as_ref()
+        .map(|bounds| bounds.agent_id.as_str())
+        .unwrap_or(ctx.identity_default.as_str());
+
+    if policy_allows_request(&existing, schema.as_ref(), &host, &method, &path, agent_id)? {
+        return reload_policy(ctx);
+    }
+
+    let updated = append_policy_snippet(&existing, cedar_snippet);
+    PolicyEngine::from_text(
+        &updated,
+        schema.as_ref().map(|(text, _)| text.as_str()),
+        schema.as_ref().map(|(_, label)| label.as_str()),
+    )?;
+
+    write_text_atomic(policy_path, &updated)?;
+    match reload_policy(ctx) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            let rollback = write_text_atomic(policy_path, &existing)
+                .and_then(|_| reload_policy(ctx).map(|_| ()))
+                .map_err(|rollback_error| {
+                    anyhow::anyhow!("{}; rollback failed: {rollback_error}", error)
+                });
+            rollback?;
+            Err(error)
+        }
+    }
+}
+
 fn restart_required_domains(
     ctx: &ProxyContext,
     _current_engine: &PolicyEngine,
@@ -996,6 +1126,14 @@ mod tests {
         f.write_all(content.as_bytes()).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    fn persist_snippet_for(host: &str, method: &str, path: &str) -> String {
+        crate::policy::synthesize_blocked_request(host, method, path, &[], &[], false)
+            .candidate_exception
+            .unwrap()
+            .persist
+            .cedar_snippet
     }
 
     #[test]
@@ -1951,6 +2089,108 @@ permit(
             decision.allowed,
             "old policy should be retained when replace fails"
         );
+    }
+
+    #[test]
+    fn persist_policy_exception_appends_rule_and_reloads_live_engine() {
+        let initial_policy = r#"
+@id("allow-health")
+permit(
+    principal,
+    action == Action::"http:GET",
+    resource == Resource::"api.github.com/health"
+);
+"#;
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(initial_policy.as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"",
+            pf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+        let snippet = persist_snippet_for("api.github.com", "GET", "/repos/org/repo");
+
+        let outcome =
+            persist_policy_exception(&ctx, "http:GET api.github.com/repos/org/repo", &snippet)
+                .unwrap();
+
+        assert!(outcome.applied);
+        let persisted = std::fs::read_to_string(pf.path()).unwrap();
+        assert!(persisted.contains(&snippet));
+
+        let engine = ctx.policy_engine.as_ref().unwrap().load();
+        let decision = engine
+            .evaluate("api.github.com", "http:GET", "/repos/org/repo", &[], "test")
+            .unwrap();
+        assert!(
+            decision.allowed,
+            "persisted rule should apply live after reload"
+        );
+    }
+
+    #[test]
+    fn persist_policy_exception_skips_duplicate_rule_churn() {
+        let snippet = persist_snippet_for("api.github.com", "GET", "/repos/org/repo");
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(format!("{snippet}\n").as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"",
+            pf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+        let before = std::fs::read_to_string(pf.path()).unwrap();
+
+        let outcome =
+            persist_policy_exception(&ctx, "http:GET api.github.com/repos/org/repo", &snippet)
+                .unwrap();
+
+        assert!(outcome.applied);
+        let after = std::fs::read_to_string(pf.path()).unwrap();
+        assert_eq!(
+            after, before,
+            "duplicate persist should not rewrite policy text"
+        );
+    }
+
+    #[test]
+    fn persist_policy_exception_skips_when_broader_rule_already_exists() {
+        let broader = r#"
+@id("allow-get-host")
+permit(
+    principal,
+    action == Action::"http:GET",
+    resource in Resource::"api.github.com"
+);
+"#;
+        let mut pf = NamedTempFile::new().unwrap();
+        pf.write_all(broader.as_bytes()).unwrap();
+        pf.flush().unwrap();
+
+        let config_str = format!(
+            "ca_cert_path = \"/tmp/ca.pem\"\n[policy]\nfile = \"{}\"",
+            pf.path().display()
+        );
+        let cf = write_config(&config_str);
+        let config = StraitConfig::load(cf.path()).unwrap();
+        let ctx = ProxyContext::from_config(&config).unwrap();
+        let snippet = persist_snippet_for("api.github.com", "GET", "/repos/org/repo");
+        let before = std::fs::read_to_string(pf.path()).unwrap();
+
+        let outcome =
+            persist_policy_exception(&ctx, "http:GET api.github.com/repos/org/repo", &snippet)
+                .unwrap();
+
+        assert!(outcome.applied);
+        let after = std::fs::read_to_string(pf.path()).unwrap();
+        assert_eq!(after, before, "broader rule should prevent append churn");
     }
 
     #[test]

@@ -488,9 +488,15 @@ where
                         });
                     }
 
-                    let decision_rx = ctx
-                        .pending_decisions
-                        .register_pending(&blocked.blocked_id, &blocked.match_key);
+                    let persist_snippet = blocked
+                        .candidate_exception
+                        .as_ref()
+                        .map(|candidate| candidate.persist.cedar_snippet.clone());
+                    let decision_rx = ctx.pending_decisions.register_pending_with_persist(
+                        &blocked.blocked_id,
+                        &blocked.match_key,
+                        persist_snippet,
+                    );
 
                     match tokio::time::timeout(ctx.decision_timeout, decision_rx).await {
                         Ok(Ok(crate::decisions::Decision::AllowOnce))

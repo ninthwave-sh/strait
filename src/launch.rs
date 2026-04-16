@@ -190,6 +190,14 @@ pub struct LaunchControlRequest {
     /// Inline Cedar policy source for `policy.replace`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
+    /// Blocked-request identifier for `decision.*` methods.
+    ///
+    /// Mirrors `observe::BlockedRequest::blocked_id`. Clients obtain
+    /// this value from a live observation stream or watch attach
+    /// handle and pass it back into the control protocol to resolve
+    /// the matching request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_id: Option<String>,
 }
 
 impl LaunchControlRequest {
@@ -198,6 +206,7 @@ impl LaunchControlRequest {
             version: SESSION_CONTROL_PROTOCOL_VERSION,
             method: method.as_str().to_string(),
             policy: None,
+            blocked_id: None,
         }
     }
 
@@ -206,6 +215,16 @@ impl LaunchControlRequest {
             version: SESSION_CONTROL_PROTOCOL_VERSION,
             method: method.as_str().to_string(),
             policy: Some(policy.into()),
+            blocked_id: None,
+        }
+    }
+
+    fn with_blocked_id(method: ControlMethod, blocked_id: impl Into<String>) -> Self {
+        Self {
+            version: SESSION_CONTROL_PROTOCOL_VERSION,
+            method: method.as_str().to_string(),
+            policy: None,
+            blocked_id: Some(blocked_id.into()),
         }
     }
 }
@@ -252,6 +271,23 @@ pub enum LaunchControlResult {
     PolicyReload { update: LaunchPolicyMutationResult },
     /// Result for `policy.replace`.
     PolicyReplace { update: LaunchPolicyMutationResult },
+    /// Result for `decision.allow_once`.
+    DecisionAllowOnce { outcome: DecisionActionOutcome },
+    /// Result for `decision.allow_session`.
+    DecisionAllowSession { outcome: DecisionActionOutcome },
+    /// Result for `decision.deny`.
+    DecisionDeny { outcome: DecisionActionOutcome },
+}
+
+/// Structured outcome of a successful live decision action.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DecisionActionOutcome {
+    /// Blocked-request identifier the decision was applied against.
+    pub blocked_id: String,
+    /// Normalized match key the decision will affect. Mirrors
+    /// `observe::BlockedRequest::match_key` so clients can correlate
+    /// the decision with the originating block event.
+    pub match_key: String,
 }
 
 /// Response envelope for the local launch control protocol.
@@ -303,6 +339,9 @@ enum ControlMethod {
     SessionStop,
     PolicyReload,
     PolicyReplace,
+    DecisionAllowOnce,
+    DecisionAllowSession,
+    DecisionDeny,
 }
 
 impl ControlMethod {
@@ -313,6 +352,9 @@ impl ControlMethod {
             Self::SessionStop => "session.stop",
             Self::PolicyReload => "policy.reload",
             Self::PolicyReplace => "policy.replace",
+            Self::DecisionAllowOnce => "decision.allow_once",
+            Self::DecisionAllowSession => "decision.allow_session",
+            Self::DecisionDeny => "decision.deny",
         }
     }
 }
@@ -332,6 +374,9 @@ fn parse_control_method(request: &LaunchControlRequest) -> anyhow::Result<Contro
         "session.stop" => Ok(ControlMethod::SessionStop),
         "policy.reload" => Ok(ControlMethod::PolicyReload),
         "policy.replace" => Ok(ControlMethod::PolicyReplace),
+        "decision.allow_once" => Ok(ControlMethod::DecisionAllowOnce),
+        "decision.allow_session" => Ok(ControlMethod::DecisionAllowSession),
+        "decision.deny" => Ok(ControlMethod::DecisionDeny),
         other => anyhow::bail!("unsupported control method '{other}'"),
     }
 }
@@ -636,6 +681,135 @@ pub async fn request_launch_policy_replace(
     }
 }
 
+/// Resolve a blocked request by allowing the currently held request once.
+#[cfg(unix)]
+pub async fn request_launch_decision_allow_once(
+    control_socket_path: &Path,
+    blocked_id: impl Into<String>,
+) -> anyhow::Result<DecisionActionOutcome> {
+    let response = send_launch_control_request(
+        control_socket_path,
+        &LaunchControlRequest::with_blocked_id(ControlMethod::DecisionAllowOnce, blocked_id),
+    )
+    .await?;
+    match response.result {
+        Some(LaunchControlResult::DecisionAllowOnce { outcome }) => Ok(outcome),
+        other => anyhow::bail!("unexpected decision.allow_once response: {other:?}"),
+    }
+}
+
+/// Resolve a blocked request and allow equivalent requests for the session.
+#[cfg(unix)]
+pub async fn request_launch_decision_allow_session(
+    control_socket_path: &Path,
+    blocked_id: impl Into<String>,
+) -> anyhow::Result<DecisionActionOutcome> {
+    let response = send_launch_control_request(
+        control_socket_path,
+        &LaunchControlRequest::with_blocked_id(ControlMethod::DecisionAllowSession, blocked_id),
+    )
+    .await?;
+    match response.result {
+        Some(LaunchControlResult::DecisionAllowSession { outcome }) => Ok(outcome),
+        other => anyhow::bail!("unexpected decision.allow_session response: {other:?}"),
+    }
+}
+
+/// Resolve a blocked request by explicitly denying it.
+#[cfg(unix)]
+pub async fn request_launch_decision_deny(
+    control_socket_path: &Path,
+    blocked_id: impl Into<String>,
+) -> anyhow::Result<DecisionActionOutcome> {
+    let response = send_launch_control_request(
+        control_socket_path,
+        &LaunchControlRequest::with_blocked_id(ControlMethod::DecisionDeny, blocked_id),
+    )
+    .await?;
+    match response.result {
+        Some(LaunchControlResult::DecisionDeny { outcome }) => Ok(outcome),
+        other => anyhow::bail!("unexpected decision.deny response: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+fn dispatch_decision_action(
+    request: &LaunchControlRequest,
+    method: ControlMethod,
+    proxy_ctx: &ProxyContext,
+) -> LaunchControlResponse {
+    let Some(blocked_id) = request.blocked_id.as_ref() else {
+        return LaunchControlResponse::invalid_request(
+            "missing_blocked_id",
+            format!("{} requires a blocked_id", method.as_str()),
+        );
+    };
+    if blocked_id.trim().is_empty() {
+        return LaunchControlResponse::invalid_request(
+            "missing_blocked_id",
+            format!("{} requires a non-empty blocked_id", method.as_str()),
+        );
+    }
+
+    let store = proxy_ctx.pending_decisions.as_ref();
+    let apply = match method {
+        ControlMethod::DecisionAllowOnce => store.resolve_allow_once(blocked_id),
+        ControlMethod::DecisionAllowSession => store.resolve_allow_session(blocked_id),
+        ControlMethod::DecisionDeny => store.resolve_deny(blocked_id),
+        other => {
+            return LaunchControlResponse::invalid_request(
+                "invalid_method",
+                format!("{} is not a decision method", other.as_str()),
+            );
+        }
+    };
+
+    match apply {
+        Ok(match_key) => {
+            emit_decision_event(proxy_ctx, method, blocked_id, &match_key);
+            let outcome = DecisionActionOutcome {
+                blocked_id: blocked_id.clone(),
+                match_key,
+            };
+            let result = match method {
+                ControlMethod::DecisionAllowOnce => {
+                    LaunchControlResult::DecisionAllowOnce { outcome }
+                }
+                ControlMethod::DecisionAllowSession => {
+                    LaunchControlResult::DecisionAllowSession { outcome }
+                }
+                ControlMethod::DecisionDeny => LaunchControlResult::DecisionDeny { outcome },
+                _ => unreachable!("decision dispatch on non-decision method"),
+            };
+            LaunchControlResponse::success(result)
+        }
+        Err(error) => LaunchControlResponse::failure(error.code(), error.message()),
+    }
+}
+
+#[cfg(unix)]
+fn emit_decision_event(
+    proxy_ctx: &ProxyContext,
+    method: ControlMethod,
+    blocked_id: &str,
+    match_key: &str,
+) {
+    let Some(obs_stream) = proxy_ctx.observation_stream.as_ref() else {
+        return;
+    };
+    let action = match method {
+        ControlMethod::DecisionAllowOnce => "decision.allow_once",
+        ControlMethod::DecisionAllowSession => "decision.allow_session",
+        ControlMethod::DecisionDeny => "decision.deny",
+        _ => return,
+    };
+    obs_stream.emit(EventKind::LiveDecision {
+        action: action.to_string(),
+        blocked_id: blocked_id.to_string(),
+        match_key: match_key.to_string(),
+    });
+}
+
 #[cfg(unix)]
 async fn handle_launch_control_client(
     stream: tokio::net::UnixStream,
@@ -718,6 +892,19 @@ async fn handle_launch_control_client(
                     "policy.replace requires inline Cedar policy text",
                 ),
             },
+            Ok(ControlMethod::DecisionAllowOnce) => dispatch_decision_action(
+                &request,
+                ControlMethod::DecisionAllowOnce,
+                proxy_ctx.as_ref(),
+            ),
+            Ok(ControlMethod::DecisionAllowSession) => dispatch_decision_action(
+                &request,
+                ControlMethod::DecisionAllowSession,
+                proxy_ctx.as_ref(),
+            ),
+            Ok(ControlMethod::DecisionDeny) => {
+                dispatch_decision_action(&request, ControlMethod::DecisionDeny, proxy_ctx.as_ref())
+            }
             Err(error) => {
                 LaunchControlResponse::invalid_request("invalid_method", error.to_string())
             }
@@ -2078,6 +2265,7 @@ pub fn build_launch_proxy_context(
         mitm_hosts,
         max_body_size: 10 * 1024 * 1024, // 10 MB default
         keepalive_timeout: std::time::Duration::from_secs(30),
+        decision_timeout: std::time::Duration::from_secs(30),
         startup_instant: Instant::now(),
         identity_header: "X-Strait-Agent".to_string(),
         identity_default: "agent".to_string(),
@@ -2092,6 +2280,7 @@ pub fn build_launch_proxy_context(
         upstream_tls_override: None,
         upstream_connect_timeout: std::time::Duration::from_secs(30),
         upstream_response_timeout: std::time::Duration::from_secs(60),
+        pending_decisions: Arc::new(crate::decisions::PendingDecisionStore::new()),
     })
 }
 
@@ -3210,6 +3399,7 @@ permit(
             mitm_hosts: Vec::new(),
             max_body_size: 10 * 1024 * 1024,
             keepalive_timeout: std::time::Duration::from_secs(5),
+            decision_timeout: std::time::Duration::from_secs(30),
             startup_instant: Instant::now(),
             identity_header: "X-Strait-Agent".to_string(),
             identity_default: "anonymous".to_string(),
@@ -3224,6 +3414,7 @@ permit(
             upstream_tls_override: None,
             upstream_connect_timeout: std::time::Duration::from_secs(30),
             upstream_response_timeout: std::time::Duration::from_secs(60),
+            pending_decisions: Arc::new(crate::decisions::PendingDecisionStore::new()),
         });
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3424,6 +3615,7 @@ permit(
             version: 99,
             method: "session.info".to_string(),
             policy: None,
+            blocked_id: None,
         };
         let err = parse_control_method(&wrong_version).unwrap_err();
         assert!(
@@ -3436,12 +3628,136 @@ permit(
             version: SESSION_CONTROL_PROTOCOL_VERSION,
             method: "session.nope".to_string(),
             policy: None,
+            blocked_id: None,
         };
         let err = parse_control_method(&wrong_method).unwrap_err();
         assert!(
             err.to_string().contains("unsupported control method"),
             "unknown method should be rejected: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decision_actions_require_a_non_empty_blocked_id() {
+        let proxy_ctx = test_launch_proxy_ctx(None, None, None);
+
+        let missing = LaunchControlRequest::new(ControlMethod::DecisionAllowOnce);
+        let missing_response = dispatch_decision_action(
+            &missing,
+            ControlMethod::DecisionAllowOnce,
+            proxy_ctx.as_ref(),
+        );
+        assert!(!missing_response.ok);
+        assert_eq!(
+            missing_response.error.unwrap().code,
+            "missing_blocked_id",
+            "decision methods should reject a missing blocked_id"
+        );
+
+        let blank = LaunchControlRequest::with_blocked_id(ControlMethod::DecisionDeny, "   ");
+        let blank_response =
+            dispatch_decision_action(&blank, ControlMethod::DecisionDeny, proxy_ctx.as_ref());
+        assert!(!blank_response.ok);
+        assert_eq!(
+            blank_response.error.unwrap().code,
+            "missing_blocked_id",
+            "decision methods should reject a blank blocked_id"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_live_decision_event(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::observe::ObservationEvent>,
+        expected_action: &str,
+    ) -> (String, String) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = rx.recv().await.unwrap();
+                match event.event {
+                    EventKind::LiveDecision {
+                        action,
+                        blocked_id,
+                        match_key,
+                    } if action == expected_action => return (blocked_id, match_key),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("live decision event should arrive")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_control_server_resolves_live_decision_methods() {
+        let registry_root = tempfile::tempdir().unwrap();
+        let proxy_ctx = test_launch_proxy_ctx(None, None, None);
+        let mut obs_rx = proxy_ctx.observation_stream.as_ref().unwrap().subscribe();
+        let (session, _stop_rx) = LaunchSession::create_in(
+            registry_root.path(),
+            "test-session",
+            EnforcementMode::Enforce,
+            proxy_ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let control_socket = session.control_socket_path().await;
+
+        let once_rx = proxy_ctx
+            .pending_decisions
+            .register_pending("blocked-once", "http:GET example.com/once");
+        let once = request_launch_decision_allow_once(&control_socket, "blocked-once")
+            .await
+            .unwrap();
+        assert_eq!(once.blocked_id, "blocked-once");
+        assert_eq!(once.match_key, "http:GET example.com/once");
+        assert_eq!(
+            once_rx.await.unwrap(),
+            crate::decisions::Decision::AllowOnce
+        );
+        let (blocked_id, match_key) =
+            wait_for_live_decision_event(&mut obs_rx, "decision.allow_once").await;
+        assert_eq!(blocked_id, "blocked-once");
+        assert_eq!(match_key, "http:GET example.com/once");
+
+        let session_rx = proxy_ctx
+            .pending_decisions
+            .register_pending("blocked-session", "http:GET example.com/session");
+        let allow_session =
+            request_launch_decision_allow_session(&control_socket, "blocked-session")
+                .await
+                .unwrap();
+        assert_eq!(allow_session.match_key, "http:GET example.com/session");
+        assert_eq!(
+            session_rx.await.unwrap(),
+            crate::decisions::Decision::AllowSession
+        );
+        assert!(
+            proxy_ctx
+                .pending_decisions
+                .is_session_allowed("http:GET example.com/session"),
+            "allow-session should cache the match key on the running session"
+        );
+        let (blocked_id, match_key) =
+            wait_for_live_decision_event(&mut obs_rx, "decision.allow_session").await;
+        assert_eq!(blocked_id, "blocked-session");
+        assert_eq!(match_key, "http:GET example.com/session");
+
+        let deny_rx = proxy_ctx
+            .pending_decisions
+            .register_pending("blocked-deny", "http:GET example.com/deny");
+        let deny = request_launch_decision_deny(&control_socket, "blocked-deny")
+            .await
+            .unwrap();
+        assert_eq!(deny.match_key, "http:GET example.com/deny");
+        assert_eq!(deny_rx.await.unwrap(), crate::decisions::Decision::Deny);
+        let (blocked_id, match_key) =
+            wait_for_live_decision_event(&mut obs_rx, "decision.deny").await;
+        assert_eq!(blocked_id, "blocked-deny");
+        assert_eq!(match_key, "http:GET example.com/deny");
+
+        drop(session);
     }
 
     #[cfg(unix)]

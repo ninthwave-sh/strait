@@ -424,62 +424,240 @@ where
             };
 
             if !decision.allowed && !ctx.warn_only {
-                // Build a human-readable denial reason. If the matching policy has
-                // a @reason("...") annotation, use that; otherwise use a generic format.
-                let denial_reason = if !decision.policy_reasons.is_empty() {
-                    decision.policy_reasons.join("; ")
+                let match_key = crate::policy::build_match_key(host, &method, &path);
+                if ctx.pending_decisions.is_session_allowed(&match_key) {
+                    let credential_injected = inject_credential(
+                        host,
+                        &method,
+                        &path,
+                        &mut headers,
+                        body.as_deref(),
+                        credentials,
+                    );
+
+                    audit.log_decision(
+                        host,
+                        port,
+                        &method,
+                        &path,
+                        &agent_id,
+                        "allow",
+                        &decision.policy_names,
+                        credential_injected,
+                        None,
+                        eval_start,
+                    );
+
+                    info!(
+                        host = host,
+                        method = method.as_str(),
+                        path = path.as_str(),
+                        agent = agent_id.as_str(),
+                        policy = policy_display.as_str(),
+                        decision_scope = "session",
+                        credential_injected = credential_injected,
+                        "ALLOW: cached live decision override matched blocked request"
+                    );
                 } else {
-                    format!(
-                        "Request denied by policy '{}': {} {} on {}",
-                        policy_display, method, path, host
-                    )
-                };
+                    let denial_reason = if !decision.policy_reasons.is_empty() {
+                        decision.policy_reasons.join("; ")
+                    } else {
+                        format!(
+                            "Request denied by policy '{}': {} {} on {}",
+                            policy_display, method, path, host
+                        )
+                    };
+                    let blocked = crate::policy::synthesize_blocked_request(
+                        host,
+                        &method,
+                        &path,
+                        &decision.policy_names,
+                        &decision.policy_reasons,
+                        decision.blocked_by_forbid,
+                    );
+                    blocked_info = Some(blocked.clone());
 
-                // Log DENY audit event — no credential injected
-                audit.log_decision(
-                    host,
-                    port,
-                    &method,
-                    &path,
-                    &agent_id,
-                    "deny",
-                    &decision.policy_names,
-                    false,
-                    Some(&denial_reason),
-                    eval_start,
-                );
+                    if let Some(ref obs) = ctx.observation_stream {
+                        obs.emit(crate::observe::EventKind::PolicyViolation {
+                            enforcement_mode: ctx.enforcement_mode.clone(),
+                            action: format!("http:{method}"),
+                            resource: format!("{host}{path}"),
+                            decision: "deny".to_string(),
+                            reason: denial_reason.clone(),
+                            blocked: Some(blocked.clone()),
+                        });
+                    }
 
-                warn!(
-                    host = host,
-                    method = method.as_str(),
-                    path = path.as_str(),
-                    agent = agent_id.as_str(),
-                    policy = policy_display.as_str(),
-                    "DENY: request blocked by Cedar policy"
-                );
+                    let decision_rx = ctx
+                        .pending_decisions
+                        .register_pending(&blocked.blocked_id, &blocked.match_key);
 
-                // Synthesize blocked-request metadata so the emitted
-                // NetworkRequest event can identify the request, explain
-                // why it was blocked, and provide a concrete candidate
-                // exception that could unblock it.
-                blocked_info = Some(crate::policy::synthesize_blocked_request(
-                    host,
-                    &method,
-                    &path,
-                    &decision.policy_names,
-                    &decision.policy_reasons,
-                    decision.blocked_by_forbid,
-                ));
+                    match tokio::time::timeout(ctx.decision_timeout, decision_rx).await {
+                        Ok(Ok(crate::decisions::Decision::AllowOnce))
+                        | Ok(Ok(crate::decisions::Decision::AllowSession)) => {
+                            let decision_scope =
+                                if ctx.pending_decisions.is_session_allowed(&blocked.match_key) {
+                                    "session"
+                                } else {
+                                    "once"
+                                };
 
-                // Return 403 with structured JSON body
-                let body_json =
-                    crate::policy::deny_response_body(host, &method, &path, &decision.policy_names);
-                let body_bytes = serde_json::to_string(&body_json)?;
-                let response = build_deny_response(&body_bytes);
-                write_half.write_all(response.as_bytes()).await?;
-                write_half.flush().await?;
+                            let credential_injected = inject_credential(
+                                host,
+                                &method,
+                                &path,
+                                &mut headers,
+                                body.as_deref(),
+                                credentials,
+                            );
 
-                denied = true;
+                            audit.log_decision(
+                                host,
+                                port,
+                                &method,
+                                &path,
+                                &agent_id,
+                                "allow",
+                                &decision.policy_names,
+                                credential_injected,
+                                None,
+                                eval_start,
+                            );
+
+                            info!(
+                                host = host,
+                                method = method.as_str(),
+                                path = path.as_str(),
+                                agent = agent_id.as_str(),
+                                policy = policy_display.as_str(),
+                                decision_scope = decision_scope,
+                                credential_injected = credential_injected,
+                                "ALLOW: live decision override resolved blocked request"
+                            );
+                        }
+                        Ok(Ok(crate::decisions::Decision::Deny)) => {
+                            audit.log_decision(
+                                host,
+                                port,
+                                &method,
+                                &path,
+                                &agent_id,
+                                "deny",
+                                &decision.policy_names,
+                                false,
+                                Some(&denial_reason),
+                                eval_start,
+                            );
+
+                            warn!(
+                                host = host,
+                                method = method.as_str(),
+                                path = path.as_str(),
+                                agent = agent_id.as_str(),
+                                policy = policy_display.as_str(),
+                                "DENY: request blocked by Cedar policy"
+                            );
+
+                            let body_json = crate::policy::deny_response_body(
+                                host,
+                                &method,
+                                &path,
+                                &decision.policy_names,
+                            );
+                            let body_bytes = serde_json::to_string(&body_json)?;
+                            let response = build_deny_response(&body_bytes);
+                            write_half.write_all(response.as_bytes()).await?;
+                            write_half.flush().await?;
+
+                            denied = true;
+                        }
+                        Ok(Err(_)) => {
+                            ctx.pending_decisions.expire(&blocked.blocked_id);
+                            let final_reason = format!(
+                                "{denial_reason}; live decision channel closed before a decision arrived"
+                            );
+
+                            audit.log_decision(
+                                host,
+                                port,
+                                &method,
+                                &path,
+                                &agent_id,
+                                "deny",
+                                &decision.policy_names,
+                                false,
+                                Some(&final_reason),
+                                eval_start,
+                            );
+
+                            warn!(
+                                host = host,
+                                method = method.as_str(),
+                                path = path.as_str(),
+                                agent = agent_id.as_str(),
+                                policy = policy_display.as_str(),
+                                timeout_secs = ctx.decision_timeout.as_secs(),
+                                "DENY: blocked request expired before a live decision arrived"
+                            );
+
+                            let body_json = crate::policy::deny_response_body(
+                                host,
+                                &method,
+                                &path,
+                                &decision.policy_names,
+                            );
+                            let body_bytes = serde_json::to_string(&body_json)?;
+                            let response = build_deny_response(&body_bytes);
+                            write_half.write_all(response.as_bytes()).await?;
+                            write_half.flush().await?;
+
+                            denied = true;
+                        }
+                        Err(_) => {
+                            ctx.pending_decisions.expire(&blocked.blocked_id);
+                            let final_reason = format!(
+                                "{denial_reason}; timed out waiting {}s for a live decision",
+                                ctx.decision_timeout.as_secs()
+                            );
+
+                            audit.log_decision(
+                                host,
+                                port,
+                                &method,
+                                &path,
+                                &agent_id,
+                                "deny",
+                                &decision.policy_names,
+                                false,
+                                Some(&final_reason),
+                                eval_start,
+                            );
+
+                            warn!(
+                                host = host,
+                                method = method.as_str(),
+                                path = path.as_str(),
+                                agent = agent_id.as_str(),
+                                policy = policy_display.as_str(),
+                                timeout_secs = ctx.decision_timeout.as_secs(),
+                                "DENY: blocked request timed out waiting for a live decision"
+                            );
+
+                            let body_json = crate::policy::deny_response_body(
+                                host,
+                                &method,
+                                &path,
+                                &decision.policy_names,
+                            );
+                            let body_bytes = serde_json::to_string(&body_json)?;
+                            let response = build_deny_response(&body_bytes);
+                            write_half.write_all(response.as_bytes()).await?;
+                            write_half.flush().await?;
+
+                            denied = true;
+                        }
+                    }
+                }
             } else if !decision.allowed {
                 // Warn mode: policy denied but we allow through and log a warning
                 let denial_reason = if !decision.policy_reasons.is_empty() {

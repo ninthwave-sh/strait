@@ -670,6 +670,7 @@ fn build_sigv4_proxy_context(
         mitm_hosts,
         max_body_size: 10 * 1024 * 1024,
         keepalive_timeout: Duration::from_secs(30),
+        decision_timeout: Duration::from_secs(30),
         startup_instant: Instant::now(),
         identity_header: "X-Strait-Agent".to_string(),
         identity_default: "anonymous".to_string(),
@@ -684,6 +685,7 @@ fn build_sigv4_proxy_context(
         upstream_tls_override: Some(tls_config),
         upstream_connect_timeout: Duration::from_secs(30),
         upstream_response_timeout: Duration::from_secs(60),
+        pending_decisions: Arc::new(strait::decisions::PendingDecisionStore::new()),
     }
 }
 
@@ -2552,6 +2554,7 @@ fn build_test_proxy_context() -> strait::config::ProxyContext {
         mitm_hosts: vec!["localhost".to_string()],
         max_body_size: 10 * 1024 * 1024,
         keepalive_timeout: Duration::from_secs(5),
+        decision_timeout: Duration::from_secs(30),
         startup_instant: Instant::now(),
         identity_header: "X-Strait-Agent".to_string(),
         identity_default: "anonymous".to_string(),
@@ -2566,6 +2569,7 @@ fn build_test_proxy_context() -> strait::config::ProxyContext {
         upstream_tls_override: None,
         upstream_connect_timeout: std::time::Duration::from_secs(30),
         upstream_response_timeout: std::time::Duration::from_secs(60),
+        pending_decisions: Arc::new(strait::decisions::PendingDecisionStore::new()),
     }
 }
 
@@ -3311,6 +3315,7 @@ async fn upstream_connect_timeout_returns_504() {
         mitm_hosts: vec!["api.github.com".to_string()],
         max_body_size: 10 * 1024 * 1024,
         keepalive_timeout: std::time::Duration::from_secs(5),
+        decision_timeout: std::time::Duration::from_secs(30),
         startup_instant: std::time::Instant::now(),
         identity_header: "X-Strait-Agent".to_string(),
         identity_default: "anonymous".to_string(),
@@ -3326,6 +3331,7 @@ async fn upstream_connect_timeout_returns_504() {
         // Very short timeout so the test completes quickly
         upstream_connect_timeout: std::time::Duration::from_millis(100),
         upstream_response_timeout: std::time::Duration::from_secs(60),
+        pending_decisions: Arc::new(strait::decisions::PendingDecisionStore::new()),
     });
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3383,6 +3389,7 @@ async fn upstream_response_timeout_returns_504() {
         mitm_hosts: vec!["api.github.com".to_string()],
         max_body_size: 10 * 1024 * 1024,
         keepalive_timeout: std::time::Duration::from_secs(5),
+        decision_timeout: std::time::Duration::from_secs(30),
         startup_instant: std::time::Instant::now(),
         identity_header: "X-Strait-Agent".to_string(),
         identity_default: "anonymous".to_string(),
@@ -3398,6 +3405,7 @@ async fn upstream_response_timeout_returns_504() {
         upstream_connect_timeout: std::time::Duration::from_secs(30),
         // Very short response timeout so the test completes quickly
         upstream_response_timeout: std::time::Duration::from_millis(200),
+        pending_decisions: Arc::new(strait::decisions::PendingDecisionStore::new()),
     });
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3455,6 +3463,7 @@ async fn normal_upstream_succeeds_with_timeouts_configured() {
         mitm_hosts: vec!["api.github.com".to_string()],
         max_body_size: 10 * 1024 * 1024,
         keepalive_timeout: std::time::Duration::from_secs(5),
+        decision_timeout: std::time::Duration::from_secs(30),
         startup_instant: std::time::Instant::now(),
         identity_header: "X-Strait-Agent".to_string(),
         identity_default: "anonymous".to_string(),
@@ -3469,6 +3478,7 @@ async fn normal_upstream_succeeds_with_timeouts_configured() {
         upstream_tls_override: Some(tls_config),
         upstream_connect_timeout: std::time::Duration::from_secs(5),
         upstream_response_timeout: std::time::Duration::from_secs(5),
+        pending_decisions: Arc::new(strait::decisions::PendingDecisionStore::new()),
     });
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3500,6 +3510,297 @@ async fn normal_upstream_succeeds_with_timeouts_configured() {
         "Expected echoed request line, got: {}",
         response_str
     );
+}
+
+async fn start_proxy_server(ctx: Arc<strait::config::ProxyContext>) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (client, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                let _ = strait::mitm::handle_connection(client, peer, &ctx).await;
+            });
+        }
+    });
+
+    addr
+}
+
+async fn send_get_request_through_proxy(
+    proxy_addr: std::net::SocketAddr,
+    ca_pem: String,
+    host: &str,
+    path: &str,
+) -> String {
+    let mut tls = connect_through_mitm(proxy_addr, &ca_pem, host).await;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    tls.write_all(request.as_bytes()).await.unwrap();
+
+    let mut response = Vec::new();
+    tls.read_to_end(&mut response).await.unwrap();
+    String::from_utf8_lossy(&response).to_string()
+}
+
+async fn wait_for_blocked_request(
+    rx: &mut tokio::sync::broadcast::Receiver<strait::observe::ObservationEvent>,
+    ignored_ids: &[&str],
+) -> strait::observe::BlockedRequest {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.unwrap();
+            let blocked = match event.event {
+                strait::observe::EventKind::PolicyViolation {
+                    blocked: Some(blocked),
+                    ..
+                }
+                | strait::observe::EventKind::NetworkRequest {
+                    blocked: Some(blocked),
+                    ..
+                } => blocked,
+                _ => continue,
+            };
+            if ignored_ids
+                .iter()
+                .any(|ignored| *ignored == blocked.blocked_id)
+            {
+                continue;
+            }
+            return blocked;
+        }
+    })
+    .await
+    .expect("blocked request event should arrive before timeout")
+}
+
+fn build_live_decision_context(
+    echo_addr: std::net::SocketAddr,
+    deny_path: &str,
+    decision_timeout: std::time::Duration,
+) -> (
+    Arc<strait::config::ProxyContext>,
+    strait::observe::ObservationStream,
+) {
+    let obs_stream = strait::observe::ObservationStream::new();
+    let mut ctx = strait_test_helpers::build_production_mitm_context_with_deny(
+        echo_addr,
+        "api.github.com",
+        deny_path,
+    );
+    ctx.observation_stream = Some(obs_stream.clone());
+    ctx.decision_timeout = decision_timeout;
+    ctx.pending_decisions = Arc::new(strait::decisions::PendingDecisionStore::new());
+    (Arc::new(ctx), obs_stream)
+}
+
+#[tokio::test]
+async fn blocked_request_allow_once_resumes_only_current_request() {
+    let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
+    let (ctx, obs_stream) = build_live_decision_context(
+        echo_addr,
+        "/blocked-once",
+        std::time::Duration::from_secs(2),
+    );
+    let mut rx = obs_stream.subscribe();
+    let proxy_addr = start_proxy_server(ctx.clone()).await;
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
+
+    let first = tokio::spawn(send_get_request_through_proxy(
+        proxy_addr,
+        ca_pem.clone(),
+        "api.github.com",
+        "/blocked-once",
+    ));
+    let first_block = wait_for_blocked_request(&mut rx, &[]).await;
+    ctx.pending_decisions
+        .resolve_allow_once(&first_block.blocked_id)
+        .unwrap();
+
+    let first_response = first.await.unwrap();
+    assert!(
+        first_response.contains("200 OK"),
+        "expected allow-once request to resume: {first_response}"
+    );
+    assert!(first_response.contains("GET /blocked-once"));
+
+    let second = tokio::spawn(send_get_request_through_proxy(
+        proxy_addr,
+        ca_pem.clone(),
+        "api.github.com",
+        "/blocked-once",
+    ));
+    let second_block = wait_for_blocked_request(&mut rx, &[&first_block.blocked_id]).await;
+    assert_ne!(first_block.blocked_id, second_block.blocked_id);
+    ctx.pending_decisions
+        .resolve_deny(&second_block.blocked_id)
+        .unwrap();
+
+    let second_response = second.await.unwrap();
+    assert!(
+        second_response.contains("403 Forbidden"),
+        "second request should block again after allow-once: {second_response}"
+    );
+}
+
+#[tokio::test]
+async fn blocked_request_allow_session_caches_future_matches() {
+    let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
+    let (ctx, obs_stream) = build_live_decision_context(
+        echo_addr,
+        "/blocked-session",
+        std::time::Duration::from_secs(2),
+    );
+    let mut rx = obs_stream.subscribe();
+    let proxy_addr = start_proxy_server(ctx.clone()).await;
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
+
+    let first = tokio::spawn(send_get_request_through_proxy(
+        proxy_addr,
+        ca_pem.clone(),
+        "api.github.com",
+        "/blocked-session",
+    ));
+    let blocked = wait_for_blocked_request(&mut rx, &[]).await;
+    ctx.pending_decisions
+        .resolve_allow_session(&blocked.blocked_id)
+        .unwrap();
+
+    let first_response = first.await.unwrap();
+    assert!(first_response.contains("200 OK"));
+
+    let second_response = send_get_request_through_proxy(
+        proxy_addr,
+        ca_pem.clone(),
+        "api.github.com",
+        "/blocked-session",
+    )
+    .await;
+    assert!(second_response.contains("200 OK"));
+    assert!(ctx.pending_decisions.is_session_allowed(&blocked.match_key));
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            wait_for_blocked_request(&mut rx, &[&blocked.blocked_id])
+        )
+        .await
+        .is_err(),
+        "allow-session should let the next matching request pass without a new hold"
+    );
+}
+
+#[tokio::test]
+async fn blocked_request_explicit_deny_returns_403() {
+    let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
+    let (ctx, obs_stream) = build_live_decision_context(
+        echo_addr,
+        "/blocked-deny",
+        std::time::Duration::from_secs(2),
+    );
+    let mut rx = obs_stream.subscribe();
+    let proxy_addr = start_proxy_server(ctx.clone()).await;
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
+
+    let request = tokio::spawn(send_get_request_through_proxy(
+        proxy_addr,
+        ca_pem.clone(),
+        "api.github.com",
+        "/blocked-deny",
+    ));
+    let blocked = wait_for_blocked_request(&mut rx, &[]).await;
+    ctx.pending_decisions
+        .resolve_deny(&blocked.blocked_id)
+        .unwrap();
+
+    let response = request.await.unwrap();
+    assert!(
+        response.contains("403 Forbidden"),
+        "explicit deny should keep the request blocked: {response}"
+    );
+}
+
+#[tokio::test]
+async fn blocked_request_timeout_expires_decision_id() {
+    let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
+    let (ctx, obs_stream) = build_live_decision_context(
+        echo_addr,
+        "/blocked-timeout",
+        std::time::Duration::from_millis(150),
+    );
+    let mut rx = obs_stream.subscribe();
+    let proxy_addr = start_proxy_server(ctx.clone()).await;
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
+
+    let started = std::time::Instant::now();
+    let request = tokio::spawn(send_get_request_through_proxy(
+        proxy_addr,
+        ca_pem.clone(),
+        "api.github.com",
+        "/blocked-timeout",
+    ));
+    let blocked = wait_for_blocked_request(&mut rx, &[]).await;
+
+    let response = request.await.unwrap();
+    assert!(response.contains("403 Forbidden"));
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(100),
+        "blocked request should stay open until the hold timeout elapses"
+    );
+    assert_eq!(
+        ctx.pending_decisions
+            .resolve_allow_once(&blocked.blocked_id)
+            .unwrap_err(),
+        strait::decisions::DecisionError::Expired
+    );
+    assert_eq!(
+        ctx.pending_decisions
+            .resolve_allow_once("missing-blocked-id")
+            .unwrap_err(),
+        strait::decisions::DecisionError::UnknownBlockedId
+    );
+}
+
+#[tokio::test]
+async fn held_request_does_not_block_new_connections() {
+    let (echo_addr, _echo_ca_pem, _echo_ca_der) = start_tls_echo_server().await;
+    let (ctx, obs_stream) = build_live_decision_context(
+        echo_addr,
+        "/blocked-concurrent",
+        std::time::Duration::from_secs(2),
+    );
+    let mut rx = obs_stream.subscribe();
+    let proxy_addr = start_proxy_server(ctx.clone()).await;
+    let ca_pem = ctx.session_ca.ca_cert_pem.clone();
+
+    let blocked_request = tokio::spawn(send_get_request_through_proxy(
+        proxy_addr,
+        ca_pem.clone(),
+        "api.github.com",
+        "/blocked-concurrent",
+    ));
+    let blocked = wait_for_blocked_request(&mut rx, &[]).await;
+
+    let allowed_response = send_get_request_through_proxy(
+        proxy_addr,
+        ca_pem.clone(),
+        "api.github.com",
+        "/allowed-concurrent",
+    )
+    .await;
+    assert!(
+        allowed_response.contains("200 OK"),
+        "an unrelated connection should still complete while another request is held: {allowed_response}"
+    );
+
+    ctx.pending_decisions
+        .resolve_deny(&blocked.blocked_id)
+        .unwrap();
+    let blocked_response = blocked_request.await.unwrap();
+    assert!(blocked_response.contains("403 Forbidden"));
 }
 
 /// Test helper module exposed for integration tests.
@@ -3557,6 +3858,7 @@ mod strait_test_helpers {
             mitm_hosts: vec![hostname.to_string()],
             max_body_size: 10 * 1024 * 1024,
             keepalive_timeout,
+            decision_timeout: std::time::Duration::from_secs(30),
             startup_instant: std::time::Instant::now(),
             identity_header: "X-Strait-Agent".to_string(),
             identity_default: "anonymous".to_string(),
@@ -3571,6 +3873,7 @@ mod strait_test_helpers {
             upstream_tls_override: Some(tls_config),
             upstream_connect_timeout: std::time::Duration::from_secs(30),
             upstream_response_timeout: std::time::Duration::from_secs(60),
+            pending_decisions: Arc::new(strait::decisions::PendingDecisionStore::new()),
         }
     }
 
@@ -3620,6 +3923,7 @@ when {{ context.path == "{deny_path}" }};
             mitm_hosts: vec![hostname.to_string()],
             max_body_size: 10 * 1024 * 1024,
             keepalive_timeout: std::time::Duration::from_secs(5),
+            decision_timeout: std::time::Duration::from_secs(30),
             startup_instant: std::time::Instant::now(),
             identity_header: "X-Strait-Agent".to_string(),
             identity_default: "anonymous".to_string(),
@@ -3634,6 +3938,7 @@ when {{ context.path == "{deny_path}" }};
             upstream_tls_override: Some(tls_config),
             upstream_connect_timeout: std::time::Duration::from_secs(30),
             upstream_response_timeout: std::time::Duration::from_secs(60),
+            pending_decisions: Arc::new(strait::decisions::PendingDecisionStore::new()),
         }
     }
 
@@ -3660,6 +3965,7 @@ when {{ context.path == "{deny_path}" }};
             mitm_hosts: vec!["api.github.com".to_string()],
             max_body_size: 10 * 1024 * 1024,
             keepalive_timeout: std::time::Duration::from_secs(5),
+            decision_timeout: std::time::Duration::from_secs(30),
             startup_instant: std::time::Instant::now(),
             identity_header: "X-Strait-Agent".to_string(),
             identity_default: "anonymous".to_string(),
@@ -3674,6 +3980,7 @@ when {{ context.path == "{deny_path}" }};
             upstream_tls_override: None,
             upstream_connect_timeout: std::time::Duration::from_secs(30),
             upstream_response_timeout: std::time::Duration::from_secs(60),
+            pending_decisions: Arc::new(strait::decisions::PendingDecisionStore::new()),
         }
     }
 
@@ -3698,6 +4005,7 @@ when {{ context.path == "{deny_path}" }};
             mitm_hosts: vec!["api.github.com".to_string()],
             max_body_size: 10 * 1024 * 1024,
             keepalive_timeout: std::time::Duration::from_secs(5),
+            decision_timeout: std::time::Duration::from_secs(30),
             startup_instant: std::time::Instant::now(),
             identity_header: "X-Strait-Agent".to_string(),
             identity_default: "anonymous".to_string(),
@@ -3712,6 +4020,7 @@ when {{ context.path == "{deny_path}" }};
             upstream_tls_override: None,
             upstream_connect_timeout: std::time::Duration::from_secs(30),
             upstream_response_timeout: std::time::Duration::from_secs(60),
+            pending_decisions: Arc::new(strait::decisions::PendingDecisionStore::new()),
         }
     }
 

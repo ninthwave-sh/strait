@@ -18,6 +18,7 @@ use tracing::{error, info, warn};
 use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
 use crate::credentials::CredentialStore;
+use crate::decisions::PendingDecisionStore;
 use crate::observe::ObservationStream;
 use crate::policy::{extract_fs_permissions, extract_proc_permissions, PolicyEngine};
 
@@ -101,6 +102,9 @@ const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 30;
 /// Default upstream response timeout (seconds).
 const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_SECS: u64 = 60;
 
+/// Default live decision hold timeout (seconds).
+const DEFAULT_DECISION_TIMEOUT_SECS: u64 = 30;
+
 /// `[mitm]` section — which hosts to intercept.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -132,6 +136,11 @@ pub struct MitmConfig {
     /// this limit receive HTTP 504. Defaults to 60 seconds.
     #[serde(default = "default_upstream_response_timeout_secs")]
     pub upstream_response_timeout_secs: u64,
+
+    /// Timeout (seconds) to hold a blocked request open while waiting for a
+    /// live decision from the local control plane. Defaults to 30 seconds.
+    #[serde(default = "default_decision_timeout_secs")]
+    pub decision_timeout_secs: u64,
 }
 
 impl Default for MitmConfig {
@@ -142,6 +151,7 @@ impl Default for MitmConfig {
             keepalive_timeout_secs: DEFAULT_KEEPALIVE_TIMEOUT_SECS,
             upstream_connect_timeout_secs: DEFAULT_UPSTREAM_CONNECT_TIMEOUT_SECS,
             upstream_response_timeout_secs: DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_SECS,
+            decision_timeout_secs: DEFAULT_DECISION_TIMEOUT_SECS,
         }
     }
 }
@@ -160,6 +170,10 @@ fn default_upstream_connect_timeout_secs() -> u64 {
 
 fn default_upstream_response_timeout_secs() -> u64 {
     DEFAULT_UPSTREAM_RESPONSE_TIMEOUT_SECS
+}
+
+fn default_decision_timeout_secs() -> u64 {
+    DEFAULT_DECISION_TIMEOUT_SECS
 }
 
 /// `[policy]` section — Cedar policy source (local file or git repository).
@@ -387,6 +401,8 @@ pub struct ProxyContext {
     pub upstream_connect_timeout: Duration,
     /// Timeout for receiving the complete HTTP response from upstream.
     pub upstream_response_timeout: Duration,
+    /// Timeout to hold a blocked request while awaiting a live decision.
+    pub decision_timeout: Duration,
     /// Instant when the proxy context was created (for uptime calculation).
     pub startup_instant: Instant,
     /// HTTP header name to extract agent identity from.
@@ -436,6 +452,11 @@ pub struct ProxyContext {
     /// When set, `handle_mitm` uses this config instead of building one from
     /// webpki roots. Production code leaves this as `None`.
     pub upstream_tls_override: Option<Arc<rustls::ClientConfig>>,
+    /// Pending live decisions and session-scoped live allows.
+    ///
+    /// Tracks blocked-request IDs that are currently waiting on a control-plane
+    /// decision and caches allow-session selections for later matching requests.
+    pub pending_decisions: Arc<PendingDecisionStore>,
 }
 
 /// Runtime information needed to keep launch-time fs/proc policy state restart-bound.
@@ -585,6 +606,7 @@ impl ProxyContext {
             upstream_response_timeout: Duration::from_secs(
                 config.mitm.upstream_response_timeout_secs,
             ),
+            decision_timeout: Duration::from_secs(config.mitm.decision_timeout_secs),
             startup_instant: Instant::now(),
             identity_header: identity.header,
             identity_default: identity.default,
@@ -597,6 +619,7 @@ impl ProxyContext {
             live_policy_bounds: None,
             upstream_addr_override: None,
             upstream_tls_override: None,
+            pending_decisions: Arc::new(PendingDecisionStore::new()),
         })
     }
 }

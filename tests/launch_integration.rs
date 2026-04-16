@@ -2552,7 +2552,7 @@ fn launch_policy_replace_live_updates_running_session() {
     );
 
     let post_replace_probe_timeout = if std::env::var_os("CI").is_some() {
-        Duration::from_secs(60)
+        Duration::from_secs(120)
     } else {
         Duration::from_secs(20)
     };

@@ -29,9 +29,9 @@ We explored a host-scoped pivot after looking closely at `nono`. The learning wa
                          │ observations
   ┌──────────────────────▼───────────────────────────────┐
   │  Strait Host Process                                 │
-   │   - Container lifecycle management                   │
-   │   - Local control API (session.info/watch.attach)    │
-   │   - gRPC control service for desktop clients         │
+  │   - Container lifecycle management                   │
+  │   - Local control API (session.info/watch.attach)    │
+  │   - gRPC control service for desktop clients         │
   │   - Observation stream (Unix socket + JSONL)         │
   │   - strait session watch - colored live event viewer │
   │   - strait generate - Cedar policy from observations │

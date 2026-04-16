@@ -880,6 +880,10 @@ impl proto::session_control_service_server::SessionControlService for SessionCon
             let mut observed_session: Option<LaunchSessionMetadata> = None;
 
             loop {
+                if tx.is_closed() {
+                    break;
+                }
+
                 let live_sessions = match list_live_sessions().await {
                     Ok(sessions) => {
                         filter_sessions_for_subscription(sessions, requested_session_id.as_deref())

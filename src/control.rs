@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, RwLock};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream, UnixListenerStream};
 use tonic::transport::{
     Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
@@ -366,12 +366,9 @@ async fn start_tcp_tls_server(
 async fn start_managed_launch(
     options: ManagedSessionOptions,
 ) -> anyhow::Result<ManagedLaunchHandle> {
-    let existing_session_ids: HashSet<String> = list_launch_sessions()?
-        .into_iter()
-        .map(|session| session.session_id)
-        .collect();
     let session = Arc::new(RwLock::new(None));
     let session_clone = session.clone();
+    let (ready_tx, ready_rx) = oneshot::channel();
     let command = options.command.clone();
     let image = options.image.clone();
     let output = options.output.clone();
@@ -379,8 +376,9 @@ async fn start_managed_launch(
     let mounts = launch::parse_extra_mounts(&options.mount)?;
 
     let join = tokio::spawn(async move {
+        let mut ready_tx = Some(ready_tx);
         if options.observe {
-            launch::run_launch_observe(
+            launch::run_launch_observe_with_ready_signal(
                 command,
                 image.as_deref(),
                 output,
@@ -389,10 +387,13 @@ async fn start_managed_launch(
                 env,
                 mounts,
                 false,
+                ready_tx
+                    .take()
+                    .expect("managed session ready sender missing"),
             )
             .await
         } else if let Some(policy) = options.warn {
-            launch::run_launch_with_policy(
+            launch::run_launch_with_policy_with_ready_signal(
                 launch::EnforcementMode::Warn,
                 &policy,
                 command,
@@ -403,10 +404,13 @@ async fn start_managed_launch(
                 env,
                 mounts,
                 false,
+                ready_tx
+                    .take()
+                    .expect("managed session ready sender missing"),
             )
             .await
         } else if let Some(policy) = options.policy {
-            launch::run_launch_with_policy(
+            launch::run_launch_with_policy_with_ready_signal(
                 launch::EnforcementMode::Enforce,
                 &policy,
                 command,
@@ -417,6 +421,9 @@ async fn start_managed_launch(
                 env,
                 mounts,
                 false,
+                ready_tx
+                    .take()
+                    .expect("managed session ready sender missing"),
             )
             .await
         } else {
@@ -425,7 +432,7 @@ async fn start_managed_launch(
     });
 
     let tracker = tokio::spawn(async move {
-        let _ = wait_for_new_managed_session(&existing_session_ids, session_clone).await;
+        let _ = wait_for_managed_session(ready_rx, session_clone).await;
     });
 
     Ok(ManagedLaunchHandle {
@@ -435,24 +442,14 @@ async fn start_managed_launch(
     })
 }
 
-async fn wait_for_new_managed_session(
-    existing_session_ids: &HashSet<String>,
+async fn wait_for_managed_session(
+    ready_rx: oneshot::Receiver<LaunchSessionMetadata>,
     destination: Arc<RwLock<Option<LaunchSessionMetadata>>>,
 ) -> anyhow::Result<()> {
-    let session = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let sessions = list_live_sessions().await?;
-            if let Some(session) = sessions
-                .into_iter()
-                .find(|session| !existing_session_ids.contains(&session.session_id))
-            {
-                return Ok::<LaunchSessionMetadata, anyhow::Error>(session);
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .context("timed out waiting for managed launch session")??;
+    let session = tokio::time::timeout(Duration::from_secs(30), ready_rx)
+        .await
+        .context("timed out waiting for managed launch session")?
+        .context("managed launch exited before publishing session metadata")?;
 
     *destination.write().await = Some(session);
     Ok(())
@@ -563,6 +560,19 @@ fn map_session(session: &LaunchSessionMetadata) -> proto::Session {
         }),
         container_id: session.container_id.clone().unwrap_or_default(),
         container_name: session.container_name.clone().unwrap_or_default(),
+    }
+}
+
+fn filter_sessions_for_subscription(
+    sessions: Vec<LaunchSessionMetadata>,
+    requested_session_id: Option<&str>,
+) -> Vec<LaunchSessionMetadata> {
+    match requested_session_id {
+        Some(session_id) => sessions
+            .into_iter()
+            .filter(|session| session.session_id == session_id)
+            .collect(),
+        None => sessions,
     }
 }
 
@@ -879,10 +889,12 @@ impl proto::session_control_service_server::SessionControlService for SessionCon
 
             loop {
                 let sessions = match list_live_sessions().await {
-                    Ok(sessions) => sessions
-                        .into_iter()
-                        .map(|session| map_session(&session))
-                        .collect::<Vec<_>>(),
+                    Ok(sessions) => {
+                        filter_sessions_for_subscription(sessions, requested_session_id.as_deref())
+                            .into_iter()
+                            .map(|session| map_session(&session))
+                            .collect::<Vec<_>>()
+                    }
                     Err(error) => {
                         let _ = tx.send(Err(Status::internal(error.to_string()))).await;
                         break;
@@ -994,5 +1006,57 @@ impl proto::service_admin_server::ServiceAdmin for ServiceAdminApi {
     ) -> Result<Response<proto::StopServiceResponse>, Status> {
         let _ = self.state.shutdown_tx.send(true);
         Ok(Response::new(proto::StopServiceResponse { accepted: true }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_metadata(session_id: &str) -> LaunchSessionMetadata {
+        LaunchSessionMetadata {
+            version: launch::SESSION_CONTROL_PROTOCOL_VERSION,
+            session_id: session_id.to_string(),
+            mode: "observe".to_string(),
+            control_socket_path: PathBuf::from(format!("/tmp/{session_id}.control.sock")),
+            observation: launch::ObservationHandle {
+                transport: "unix".to_string(),
+                path: PathBuf::from(format!("/tmp/{session_id}.observe.sock")),
+            },
+            container_id: None,
+            container_name: None,
+        }
+    }
+
+    #[test]
+    fn filter_sessions_for_subscription_returns_all_sessions_when_unscoped() {
+        let sessions = vec![session_metadata("alpha"), session_metadata("beta")];
+
+        let filtered = filter_sessions_for_subscription(sessions.clone(), None);
+
+        assert_eq!(filtered, sessions);
+    }
+
+    #[test]
+    fn filter_sessions_for_subscription_limits_to_requested_session() {
+        let sessions = vec![session_metadata("alpha"), session_metadata("beta")];
+
+        let filtered = filter_sessions_for_subscription(sessions, Some("beta"));
+
+        assert_eq!(filtered, vec![session_metadata("beta")]);
+    }
+
+    #[tokio::test]
+    async fn wait_for_managed_session_uses_exact_published_metadata() {
+        let destination = Arc::new(RwLock::new(None));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let expected = session_metadata("managed-session");
+
+        ready_tx.send(expected.clone()).unwrap();
+        wait_for_managed_session(ready_rx, destination.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(*destination.read().await, Some(expected));
     }
 }

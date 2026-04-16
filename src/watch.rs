@@ -81,7 +81,6 @@ pub fn classify_event(event: &EventKind) -> EventColor {
         | EventKind::Mount { .. }
         | EventKind::PolicyReloaded { .. }
         | EventKind::TtyResized { .. }
-        | EventKind::TtyResized { .. }
         | EventKind::LiveDecision { .. } => EventColor::Lifecycle,
         EventKind::PolicyViolation { decision, .. } => match decision.as_str() {
             "deny" => EventColor::Deny,

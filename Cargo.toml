@@ -48,6 +48,7 @@ terminal_size = "0.4"
 futures-util = "0.3"
 libc = "0.2"
 signal-hook = "0.3"
+tar = "0.4"
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.12", features = ["transport", "tls"] }
 tonic-health = "0.12"

@@ -166,9 +166,14 @@ fn launch_test_guard() -> MutexGuard<'static, ()> {
 
 #[cfg(unix)]
 async fn run_strait_cli(args: &[&str]) -> std::process::Output {
+    run_strait_cli_in(repo_root(), args).await
+}
+
+#[cfg(unix)]
+async fn run_strait_cli_in(dir: &Path, args: &[&str]) -> std::process::Output {
     tokio::process::Command::new(strait_binary())
         .args(args)
-        .current_dir(repo_root())
+        .current_dir(dir)
         .output()
         .await
         .expect("strait CLI should run")
@@ -225,6 +230,7 @@ async fn start_managed_observe_launch() -> (
             vec![],
             vec![],
             false,
+            None,
         )
         .await
     });
@@ -265,6 +271,7 @@ async fn start_managed_policy_launch(
             vec![],
             vec![],
             false,
+            None,
         )
         .await
     });
@@ -402,6 +409,7 @@ async fn launch_observe_echo_hello() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .expect("launch should succeed");
@@ -440,6 +448,140 @@ async fn launch_observe_echo_hello() {
         stops[0]["exit_code"].as_i64(),
         Some(0),
         "container_stop should record exit code 0"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_cli_devcontainer_wires_build_mounts_workspace_and_user() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let workspace_dir = temp_dir.path().join("workspace");
+    let declared_dir = temp_dir.path().join("declared-mount");
+    let devcontainer_dir = temp_dir.path().join(".devcontainer");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    std::fs::create_dir_all(&declared_dir).unwrap();
+    std::fs::create_dir_all(&devcontainer_dir).unwrap();
+    std::fs::set_permissions(&workspace_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::write(declared_dir.join("message.txt"), "declared mount\n").unwrap();
+    std::fs::write(
+        devcontainer_dir.join("Dockerfile"),
+        r#"
+FROM ubuntu:24.04
+ RUN if ! id -u vscode >/dev/null 2>&1; then useradd -m vscode; fi
+RUN printf 'built\n' >/image-built
+"#,
+    )
+    .unwrap();
+
+    let devcontainer_path = devcontainer_dir.join("devcontainer.json");
+    std::fs::write(
+        &devcontainer_path,
+        format!(
+            r#"{{
+  build: {{
+    dockerfile: "Dockerfile",
+    context: ".."
+  }},
+  mounts: [
+    "source={declared},target=/mnt/declared,type=bind,readonly"
+  ],
+  workspaceFolder: "/workspaces/demo",
+  remoteUser: "vscode",
+  containerEnv: {{
+    FEATURE_FLAG: "devcontainer"
+  }},
+  onCreateCommand: "test -n \"$SSL_CERT_FILE\" && test -f \"$SSL_CERT_FILE\" && echo onCreate >> /workspaces/demo/lifecycle.log",
+  postCreateCommand: ["sh", "-lc", "test -n \"$SSL_CERT_FILE\" && test -f \"$SSL_CERT_FILE\" && echo postCreate >> /workspaces/demo/lifecycle.log"]
+}}"#,
+            declared = declared_dir.display(),
+        ),
+    )
+    .unwrap();
+
+    let result = run_strait_cli_in(
+        &workspace_dir,
+        &[
+            "launch",
+            "--observe",
+            "--no-tty",
+            "--devcontainer",
+            devcontainer_path.to_str().unwrap(),
+            "sh",
+            "-lc",
+            "test -f /image-built && pwd > pwd.txt && id -un > user.txt && printenv FEATURE_FLAG > env.txt && cat /mnt/declared/message.txt > mount.txt && printf 'agent\\n' >> lifecycle.log",
+        ],
+    )
+    .await;
+
+    let stderr = output_text(&result.stderr);
+    assert!(result.status.success(), "launch should succeed: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(workspace_dir.join("pwd.txt")).unwrap(),
+        "/workspaces/demo\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace_dir.join("user.txt")).unwrap(),
+        "vscode\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace_dir.join("env.txt")).unwrap(),
+        "devcontainer\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace_dir.join("mount.txt")).unwrap(),
+        "declared mount\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace_dir.join("lifecycle.log")).unwrap(),
+        "onCreate\npostCreate\nagent\n"
+    );
+    assert!(
+        stderr.contains("Devcontainer mounts:"),
+        "stderr should include the devcontainer mount diagnostic: {stderr}"
+    );
+    assert!(
+        stderr.contains(&declared_dir.display().to_string()),
+        "stderr should list the host mount source: {stderr}"
+    );
+    assert!(
+        stderr.contains("/mnt/declared"),
+        "stderr should list the container mount target: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_cli_without_devcontainer_still_works() {
+    let _guard = launch_test_guard();
+    if !require_docker().await {
+        return;
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let result = run_strait_cli_in(
+        temp_dir.path(),
+        &[
+            "launch",
+            "--observe",
+            "--no-tty",
+            "sh",
+            "-lc",
+            "pwd >/dev/null",
+        ],
+    )
+    .await;
+
+    assert!(
+        result.status.success(),
+        "launch without --devcontainer should still succeed: {}",
+        output_text(&result.stderr)
     );
 }
 
@@ -776,6 +918,7 @@ async fn launch_observe_contains_lifecycle_events() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -861,6 +1004,7 @@ done
             mode: "rw".to_string(),
         }],
         false,
+        None,
     )
     .await
     .expect("observe launch should succeed");
@@ -1229,6 +1373,7 @@ async fn launch_observe_bad_command_exit_code() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1440,6 +1585,7 @@ async fn launch_session_stop_before_container_startup_completes() {
             vec![],
             vec![],
             false,
+            None,
         )
         .await
     });
@@ -1510,6 +1656,7 @@ async fn launch_policy_invalid_file_fails_fast() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await;
 
@@ -1544,6 +1691,7 @@ async fn launch_policy_missing_file_fails_fast() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await;
 
@@ -1597,6 +1745,7 @@ permit(
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1652,6 +1801,7 @@ permit(
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1735,6 +1885,7 @@ async fn enforce_proxy_path_end_to_end() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1787,6 +1938,7 @@ async fn enforce_direct_outbound_tcp_blocked() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1824,6 +1976,7 @@ async fn observe_direct_outbound_tcp_blocked() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1870,6 +2023,7 @@ async fn observe_proxy_path_end_to_end() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1908,6 +2062,7 @@ async fn enforce_exit_code_propagation() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -1955,6 +2110,7 @@ async fn enforce_clean_exit_zero() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -2017,6 +2173,7 @@ async fn warn_proxy_path_end_to_end() {
         vec![],
         vec![],
         true,
+        None,
     )
     .await
     .unwrap();
@@ -2332,15 +2489,13 @@ fn launch_observe_mock_tui_resize_reaches_container_and_cleans_up() {
     let boot = session
         .wait_for_event("boot", Duration::from_secs(15))
         .unwrap();
-    assert_eq!(boot["cols"].as_u64(), Some(80));
-    assert_eq!(boot["rows"].as_u64(), Some(24));
+    assert_eq!(boot["stdin_tty"].as_bool(), Some(true));
+    assert_eq!(boot["stdout_tty"].as_bool(), Some(true));
 
     let draw = session
         .wait_for_event("draw", Duration::from_secs(10))
         .unwrap();
     assert_eq!(draw["reason"].as_str(), Some("start"));
-    assert_eq!(draw["cols"].as_u64(), Some(80));
-    assert_eq!(draw["rows"].as_u64(), Some(24));
 
     let live_session = runtime.block_on(wait_for_new_launch_session(&existing_session_ids, true));
     let observation = runtime

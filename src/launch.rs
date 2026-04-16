@@ -36,7 +36,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
+use bollard::image::BuildImageOptions;
 use futures_util::StreamExt;
+use hyper::body::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -48,10 +50,13 @@ use tracing::{info, warn};
 use crate::audit::AuditLogger;
 use crate::ca::SessionCa;
 use crate::config::{
-    persist_policy_exception, reload_policy, replace_policy, LivePolicyBounds, PolicyConfig,
-    PolicyMutationOutcome, ProxyContext,
+    persist_policy_exception, reload_policy, replace_policy, DevcontainerBuildConfig,
+    DevcontainerCommand, DevcontainerCommandStep, DevcontainerConfig, DevcontainerMount,
+    DevcontainerMountObject, LivePolicyBounds, PolicyConfig, PolicyMutationOutcome, ProxyContext,
 };
-use crate::container::{container_trust_diagnostic_lines, ContainerManager};
+use crate::container::{
+    container_trust_diagnostic_lines, ContainerManager, ContainerRuntimeOptions,
+};
 use crate::credentials::CredentialStore;
 use crate::mitm::handle_connection;
 use crate::observe::{EventKind, ObservationSessionContext, ObservationStream};
@@ -127,19 +132,6 @@ const SESSION_OBSERVATION_SOCKET_NAME: &str = "observe.sock";
 /// Exit code returned when a launch session is stopped via the control socket.
 #[cfg(unix)]
 const SESSION_STOP_EXIT_CODE: i32 = 130;
-
-fn launch_live_policy_bounds(cwd: &Path) -> LivePolicyBounds {
-    let cwd = cwd.to_string_lossy().to_string();
-    let mut fs_candidate_paths = vec![cwd.clone()];
-    if cwd != CONTAINER_WORKSPACE_PATH {
-        fs_candidate_paths.push(CONTAINER_WORKSPACE_PATH.to_string());
-    }
-
-    LivePolicyBounds {
-        fs_candidate_paths,
-        agent_id: "agent".to_string(),
-    }
-}
 
 /// Return the proxy Unix socket path for a given session temp directory.
 ///
@@ -1656,6 +1648,461 @@ impl ExtraMount {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedDevcontainerMount {
+    source: String,
+    target: String,
+    mode: String,
+    mount_type: String,
+    raw: String,
+}
+
+impl ResolvedDevcontainerMount {
+    fn to_bind_string(&self) -> String {
+        format!("{}:{}:{}", self.source, self.target, self.mode)
+    }
+
+    fn diagnostic_line(&self) -> String {
+        let access = if self.mode == "ro" {
+            "read-only"
+        } else {
+            "read-write"
+        };
+        format!(
+            "  - {} -> {} ({}, type={}, raw='{}')",
+            self.source, self.target, access, self.mount_type, self.raw
+        )
+    }
+}
+
+fn launch_live_policy_bounds(cwd: &Path, workspace_alias: Option<&str>) -> LivePolicyBounds {
+    let cwd = cwd.to_string_lossy().to_string();
+    let workspace_alias = workspace_alias.unwrap_or(CONTAINER_WORKSPACE_PATH);
+    let mut fs_candidate_paths = vec![cwd.clone()];
+    if cwd != workspace_alias {
+        fs_candidate_paths.push(workspace_alias.to_string());
+    }
+
+    LivePolicyBounds {
+        fs_candidate_paths,
+        agent_id: "agent".to_string(),
+    }
+}
+
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.' | ':' | '@' | '=')
+        })
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r#"'"'"'"#))
+    }
+}
+
+fn render_devcontainer_command(command: &DevcontainerCommand) -> Vec<String> {
+    match command {
+        DevcontainerCommand::Shell(command) => vec![command.clone()],
+        DevcontainerCommand::Exec(command) => vec![command
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ")],
+        DevcontainerCommand::Named(commands) => commands
+            .values()
+            .map(render_devcontainer_command_step)
+            .collect(),
+    }
+}
+
+fn render_devcontainer_command_step(step: &DevcontainerCommandStep) -> String {
+    match step {
+        DevcontainerCommandStep::Shell(command) => command.clone(),
+        DevcontainerCommandStep::Exec(command) => command
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn devcontainer_pre_exec_hooks(devcontainer: &DevcontainerConfig) -> Vec<String> {
+    let mut hooks = Vec::new();
+    if let Some(command) = devcontainer.on_create_command.as_ref() {
+        hooks.extend(render_devcontainer_command(command));
+    }
+    if let Some(command) = devcontainer.post_create_command.as_ref() {
+        hooks.extend(render_devcontainer_command(command));
+    }
+    hooks
+}
+
+fn merge_env_layers(layers: impl IntoIterator<Item = Vec<String>>) -> Vec<String> {
+    let mut merged = std::collections::BTreeMap::new();
+    for layer in layers {
+        for entry in layer {
+            let (key, value) = entry
+                .split_once('=')
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .unwrap_or_else(|| (entry.clone(), String::new()));
+            merged.insert(key, value);
+        }
+    }
+
+    merged
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
+}
+
+fn devcontainer_env(devcontainer: &DevcontainerConfig) -> Vec<String> {
+    devcontainer
+        .container_env
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
+}
+
+struct DevcontainerRuntime {
+    options: ContainerRuntimeOptions,
+    mounts: Vec<ResolvedDevcontainerMount>,
+    env: Vec<String>,
+}
+
+fn prepare_devcontainer_runtime(
+    cwd: &Path,
+    devcontainer: Option<&DevcontainerConfig>,
+) -> anyhow::Result<DevcontainerRuntime> {
+    let Some(config) = devcontainer else {
+        return Ok(DevcontainerRuntime {
+            options: ContainerRuntimeOptions::default(),
+            mounts: Vec::new(),
+            env: Vec::new(),
+        });
+    };
+    let workspace_path = Some(resolve_devcontainer_workspace(cwd, config));
+    let mounts = resolve_devcontainer_mounts(&config.mounts, cwd)?;
+    emit_devcontainer_mount_diagnostic(&mounts);
+    let options = ContainerRuntimeOptions {
+        workspace_mount_path: workspace_path.clone(),
+        working_dir: workspace_path,
+        user: config.remote_user.clone(),
+        pre_exec_hooks: devcontainer_pre_exec_hooks(config),
+    };
+    let env = devcontainer_env(config);
+    Ok(DevcontainerRuntime {
+        options,
+        mounts,
+        env,
+    })
+}
+
+fn resolve_devcontainer_workspace(cwd: &Path, devcontainer: &DevcontainerConfig) -> String {
+    devcontainer
+        .workspace_folder
+        .clone()
+        .unwrap_or_else(|| cwd.to_string_lossy().to_string())
+}
+
+fn replace_devcontainer_vars(input: &str, workspace: &Path) -> String {
+    let workspace_str = workspace.to_string_lossy();
+    let basename = workspace
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    input
+        .replace("${localWorkspaceFolder}", &workspace_str)
+        .replace("${localWorkspaceFolderBasename}", &basename)
+}
+
+fn unsupported_devcontainer_mount(raw: &str, detail: &str) -> anyhow::Error {
+    anyhow::anyhow!("devcontainer mount is not supported yet: {raw} ({detail})")
+}
+
+fn resolve_devcontainer_bind_source(source: &str, workspace: &Path) -> String {
+    let source_path = Path::new(source);
+    let resolved = if source_path.is_absolute() {
+        source_path.to_path_buf()
+    } else {
+        workspace.join(source_path)
+    };
+    resolved.to_string_lossy().to_string()
+}
+
+fn resolve_string_devcontainer_mount(
+    raw: &str,
+    workspace: &Path,
+) -> anyhow::Result<ResolvedDevcontainerMount> {
+    let mut source = None;
+    let mut target = None;
+    let mut mount_type = "bind".to_string();
+    let mut readonly = false;
+    let mut unsupported_options = Vec::new();
+
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part.eq_ignore_ascii_case("readonly") || part.eq_ignore_ascii_case("ro") {
+            readonly = true;
+            continue;
+        }
+
+        let Some((key, value)) = part.split_once('=') else {
+            anyhow::bail!("invalid devcontainer mount entry: {raw}");
+        };
+        let key = key.trim();
+        let value = replace_devcontainer_vars(value.trim(), workspace);
+        match key {
+            "source" | "src" => source = Some(value),
+            "target" | "dst" | "destination" => target = Some(value),
+            "type" => mount_type = value,
+            "readonly" => readonly = value.eq_ignore_ascii_case("true"),
+            "consistency" => {
+                // Docker ignores this on all platforms now; warn and drop.
+                eprintln!("warning: ignoring unsupported mount option 'consistency' in devcontainer mount: {raw}");
+            }
+            other => unsupported_options.push(other.to_string()),
+        }
+    }
+
+    if mount_type != "bind" {
+        return Err(unsupported_devcontainer_mount(
+            raw,
+            &format!("unsupported mount type: {mount_type}"),
+        ));
+    }
+    if !unsupported_options.is_empty() {
+        return Err(unsupported_devcontainer_mount(
+            raw,
+            &format!("unsupported options: {}", unsupported_options.join(", ")),
+        ));
+    }
+
+    let source = source.with_context(|| format!("devcontainer mount is missing source: {raw}"))?;
+    let target = target.with_context(|| format!("devcontainer mount is missing target: {raw}"))?;
+    if !target.starts_with('/') {
+        anyhow::bail!("devcontainer mount target must be absolute: {target}");
+    }
+
+    Ok(ResolvedDevcontainerMount {
+        source: resolve_devcontainer_bind_source(&source, workspace),
+        target,
+        mode: if readonly {
+            "ro".to_string()
+        } else {
+            "rw".to_string()
+        },
+        mount_type,
+        raw: raw.to_string(),
+    })
+}
+
+fn resolve_object_devcontainer_mount(
+    mount: &DevcontainerMountObject,
+    workspace: &Path,
+) -> anyhow::Result<ResolvedDevcontainerMount> {
+    let mount_type = mount
+        .mount_type
+        .clone()
+        .unwrap_or_else(|| "bind".to_string());
+    if mount_type != "bind" {
+        return Err(unsupported_devcontainer_mount(
+            &mount.raw,
+            &format!("unsupported mount type: {mount_type}"),
+        ));
+    }
+
+    let unsupported_options = mount.unsupported_keys.clone();
+    if mount.consistency.is_some() {
+        // Docker ignores this on all platforms now; warn and drop.
+        eprintln!(
+            "warning: ignoring unsupported mount option 'consistency' in devcontainer mount: {}",
+            mount.raw
+        );
+    }
+    if !unsupported_options.is_empty() {
+        return Err(unsupported_devcontainer_mount(
+            &mount.raw,
+            &format!("unsupported options: {}", unsupported_options.join(", ")),
+        ));
+    }
+
+    let source = mount
+        .source
+        .clone()
+        .with_context(|| format!("devcontainer mount is missing source: {}", mount.raw))?;
+    let target = mount
+        .target
+        .clone()
+        .with_context(|| format!("devcontainer mount is missing target: {}", mount.raw))?;
+    let target = replace_devcontainer_vars(&target, workspace);
+    if !target.starts_with('/') {
+        anyhow::bail!("devcontainer mount target must be absolute: {target}");
+    }
+
+    Ok(ResolvedDevcontainerMount {
+        source: resolve_devcontainer_bind_source(
+            &replace_devcontainer_vars(&source, workspace),
+            workspace,
+        ),
+        target,
+        mode: if mount.readonly {
+            "ro".to_string()
+        } else {
+            "rw".to_string()
+        },
+        mount_type,
+        raw: mount.raw.clone(),
+    })
+}
+
+fn resolve_devcontainer_mounts(
+    specs: &[DevcontainerMount],
+    workspace: &Path,
+) -> anyhow::Result<Vec<ResolvedDevcontainerMount>> {
+    let mut mounts = Vec::with_capacity(specs.len());
+
+    for spec in specs {
+        mounts.push(match spec {
+            DevcontainerMount::String(raw) => resolve_string_devcontainer_mount(raw, workspace)?,
+            DevcontainerMount::Object(mount) => {
+                resolve_object_devcontainer_mount(mount, workspace)?
+            }
+        });
+    }
+
+    Ok(mounts)
+}
+
+fn emit_devcontainer_mount_diagnostic(mounts: &[ResolvedDevcontainerMount]) {
+    eprintln!("Devcontainer mounts:");
+    if mounts.is_empty() {
+        eprintln!("  - none declared in devcontainer.json");
+        return;
+    }
+
+    for mount in mounts {
+        eprintln!("{}", mount.diagnostic_line());
+    }
+}
+
+async fn resolve_launch_image(
+    image: Option<&str>,
+    devcontainer: Option<&DevcontainerConfig>,
+) -> anyhow::Result<String> {
+    let Some(devcontainer) = devcontainer else {
+        return Ok(image.unwrap_or(DEFAULT_IMAGE).to_string());
+    };
+
+    if let Some(build) = devcontainer.build.as_ref() {
+        return build_devcontainer_image(build, devcontainer.image.as_deref()).await;
+    }
+
+    Ok(devcontainer
+        .image
+        .clone()
+        .or_else(|| image.map(ToOwned::to_owned))
+        .unwrap_or_else(|| DEFAULT_IMAGE.to_string()))
+}
+
+fn dockerfile_path_in_context(context: &Path, dockerfile: &Path) -> anyhow::Result<String> {
+    // Canonicalize both paths so that ".." components are resolved before
+    // comparing prefixes (e.g. context=".devcontainer/.." and
+    // dockerfile=".devcontainer/Dockerfile").
+    let context = std::fs::canonicalize(context).with_context(|| {
+        format!(
+            "failed to canonicalize devcontainer build context: {}",
+            context.display()
+        )
+    })?;
+    let dockerfile = std::fs::canonicalize(dockerfile).with_context(|| {
+        format!(
+            "failed to canonicalize devcontainer Dockerfile path: {}",
+            dockerfile.display()
+        )
+    })?;
+    let relative = dockerfile.strip_prefix(&context).with_context(|| {
+        format!(
+            "devcontainer Dockerfile must be inside the build context when using the runtime API: {} is not under {}",
+            dockerfile.display(),
+            context.display()
+        )
+    })?;
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn archive_build_context(context: &Path) -> anyhow::Result<Bytes> {
+    let mut archive = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut archive);
+        builder
+            .append_dir_all(".", context)
+            .with_context(|| format!("failed to archive build context: {}", context.display()))?;
+        builder
+            .finish()
+            .context("failed to finalize build context archive")?;
+    }
+    Ok(Bytes::from(archive))
+}
+
+async fn build_devcontainer_image(
+    build: &DevcontainerBuildConfig,
+    image_tag: Option<&str>,
+) -> anyhow::Result<String> {
+    let tag = image_tag
+        .filter(|tag| !tag.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("strait-devcontainer:{}", uuid::Uuid::new_v4()));
+    let context = build
+        .context
+        .clone()
+        .or_else(|| build.dockerfile.parent().map(Path::to_path_buf))
+        .context("devcontainer build requires a Docker build context")?;
+
+    eprintln!(
+        "Building devcontainer image '{}' from {} (context: {})",
+        tag,
+        build.dockerfile.display(),
+        context.display()
+    );
+
+    let dockerfile = dockerfile_path_in_context(&context, &build.dockerfile)?;
+    let archive = archive_build_context(&context)?;
+    let docker = ContainerManager::new()?.docker().clone();
+    let options = BuildImageOptions::<String> {
+        dockerfile,
+        t: tag.clone(),
+        pull: true,
+        rm: true,
+        forcerm: true,
+        ..Default::default()
+    };
+
+    let mut stream = docker.build_image(options, None, Some(archive));
+    while let Some(result) = stream.next().await {
+        let chunk = result.context("failed to build devcontainer image via runtime API")?;
+        if let Some(stream) = chunk.stream {
+            eprint!("{stream}");
+        }
+        if let Some(status) = chunk.status {
+            if let Some(progress) = chunk.progress {
+                eprintln!("{status} {progress}");
+            } else {
+                eprintln!("{status}");
+            }
+        }
+        if let Some(error) = chunk.error {
+            anyhow::bail!("devcontainer image build failed: {error}");
+        }
+    }
+
+    Ok(tag)
+}
+
 /// Parse and validate `--mount` flag values.
 ///
 /// Accepts `HOST:CONTAINER` or `HOST:CONTAINER:MODE` where MODE is `ro` or
@@ -1721,6 +2168,7 @@ pub async fn run_launch_observe(
     extra_env: Vec<String>,
     extra_mounts: Vec<ExtraMount>,
     tty: bool,
+    devcontainer: Option<DevcontainerConfig>,
 ) -> anyhow::Result<i32> {
     run_launch_observe_with_terminal_mode(
         command,
@@ -1733,6 +2181,7 @@ pub async fn run_launch_observe(
         tty,
         LaunchTerminalMode::Host,
         None,
+        devcontainer,
     )
     .await
 }
@@ -1763,6 +2212,7 @@ pub async fn run_launch_observe_with_ready_signal(
         tty,
         LaunchTerminalMode::Host,
         Some(ready_tx),
+        None,
     )
     .await
 }
@@ -1792,6 +2242,7 @@ pub async fn run_launch_observe_with_test_terminal(
         tty,
         LaunchTerminalMode::Test(terminal),
         None,
+        None,
     )
     .await
 }
@@ -1808,9 +2259,10 @@ async fn run_launch_observe_with_terminal_mode(
     tty: bool,
     terminal_mode: LaunchTerminalMode,
     #[cfg(unix)] ready_tx: Option<LaunchReadySender>,
+    devcontainer: Option<DevcontainerConfig>,
 ) -> anyhow::Result<i32> {
-    let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let image = resolve_launch_image(image, devcontainer.as_ref()).await?;
     let obs_log_path = output.unwrap_or_else(|| cwd.join("observations.jsonl"));
 
     // 1. Verify Docker is running early (before any other setup)
@@ -1882,6 +2334,8 @@ async fn run_launch_observe_with_terminal_mode(
         tokio::spawn(run_mitm_unix_proxy_loop(listener, proxy_ctx))
     };
 
+    let dc_runtime = prepare_devcontainer_runtime(&cwd, devcontainer.as_ref())?;
+
     // 7. Build observe-mode container config.
     warn!(
         path = %cwd.display(),
@@ -1892,17 +2346,21 @@ async fn run_launch_observe_with_terminal_mode(
     // Build config with auto_remove=false so we can reliably capture the
     // exit code via wait_container. Docker's wait API returns status_code=0
     // for TTY containers with auto_remove=true (a Docker/bollard quirk).
-    let mut config = ContainerManager::build_config(
-        image,
+    let mut config = ContainerManager::build_config_with_options(
+        &image,
         &command,
         &proxy_socket_path,
         &gateway_binary,
         Some(&ca_pem_path),
         &cwd,
         tty,
+        &dc_runtime.options,
     )?;
     config.auto_remove = false;
-    config.env.extend(extra_env);
+    config.env = merge_env_layers([dc_runtime.env, extra_env, config.env.clone()]);
+    for mount in &dc_runtime.mounts {
+        config.binds.push(mount.to_bind_string());
+    }
     for m in &extra_mounts {
         config.binds.push(m.to_bind_string());
     }
@@ -1918,6 +2376,16 @@ async fn run_launch_observe_with_terminal_mode(
         path: cwd.to_string_lossy().to_string(),
         mode: "read-write".to_string(),
     });
+    for mount in &dc_runtime.mounts {
+        obs_stream.emit(EventKind::Mount {
+            path: mount.source.clone(),
+            mode: if mount.mode == "ro" {
+                "read-only".to_string()
+            } else {
+                "read-write".to_string()
+            },
+        });
+    }
     for m in &extra_mounts {
         obs_stream.emit(EventKind::Mount {
             path: m.host_path.clone(),
@@ -2029,6 +2497,7 @@ pub async fn run_launch_with_policy(
     extra_env: Vec<String>,
     extra_mounts: Vec<ExtraMount>,
     tty: bool,
+    devcontainer: Option<DevcontainerConfig>,
 ) -> anyhow::Result<i32> {
     run_launch_with_policy_with_terminal_mode(
         mode,
@@ -2043,6 +2512,7 @@ pub async fn run_launch_with_policy(
         tty,
         LaunchTerminalMode::Host,
         None,
+        devcontainer,
     )
     .await
 }
@@ -2077,6 +2547,7 @@ pub async fn run_launch_with_policy_with_ready_signal(
         tty,
         LaunchTerminalMode::Host,
         Some(ready_tx),
+        None,
     )
     .await
 }
@@ -2110,6 +2581,7 @@ pub async fn run_launch_with_policy_with_test_terminal(
         tty,
         LaunchTerminalMode::Test(terminal),
         None,
+        None,
     )
     .await
 }
@@ -2128,9 +2600,10 @@ async fn run_launch_with_policy_with_terminal_mode(
     tty: bool,
     terminal_mode: LaunchTerminalMode,
     #[cfg(unix)] ready_tx: Option<LaunchReadySender>,
+    devcontainer: Option<DevcontainerConfig>,
 ) -> anyhow::Result<i32> {
-    let image = image.unwrap_or(DEFAULT_IMAGE);
     let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let image = resolve_launch_image(image, devcontainer.as_ref()).await?;
     let obs_log_path = output.unwrap_or_else(|| cwd.join("observations.jsonl"));
 
     // 1. Load and validate Cedar policy at startup (fail fast before container)
@@ -2190,7 +2663,12 @@ async fn run_launch_with_policy_with_terminal_mode(
         mode == EnforcementMode::Warn,
         credential_store,
         mitm_hosts,
-        Some(launch_live_policy_bounds(&cwd)),
+        Some(launch_live_policy_bounds(
+            &cwd,
+            devcontainer
+                .as_ref()
+                .and_then(|config| config.workspace_folder.as_deref()),
+        )),
     )?);
 
     #[cfg(unix)]
@@ -2218,18 +2696,24 @@ async fn run_launch_with_policy_with_terminal_mode(
         tokio::spawn(run_mitm_unix_proxy_loop(listener, proxy_ctx))
     };
 
+    let dc_runtime = prepare_devcontainer_runtime(&cwd, devcontainer.as_ref())?;
+
     // 8. Build container config with the working directory mount.
-    let mut config = ContainerManager::build_config(
-        image,
+    let mut config = ContainerManager::build_config_with_options(
+        &image,
         &command,
         &proxy_socket_path,
         &gateway_binary,
         Some(&ca_pem_path),
         &cwd,
         tty,
+        &dc_runtime.options,
     )?;
     config.auto_remove = false;
-    config.env.extend(extra_env);
+    config.env = merge_env_layers([dc_runtime.env, extra_env, config.env.clone()]);
+    for mount in &dc_runtime.mounts {
+        config.binds.push(mount.to_bind_string());
+    }
     for m in &extra_mounts {
         config.binds.push(m.to_bind_string());
     }
@@ -2247,6 +2731,16 @@ async fn run_launch_with_policy_with_terminal_mode(
         path: cwd.to_string_lossy().to_string(),
         mode: "read-write".to_string(),
     });
+    for mount in &dc_runtime.mounts {
+        obs_stream.emit(EventKind::Mount {
+            path: mount.source.clone(),
+            mode: if mount.mode == "ro" {
+                "read-only".to_string()
+            } else {
+                "read-write".to_string()
+            },
+        });
+    }
     for m in &extra_mounts {
         obs_stream.emit(EventKind::Mount {
             path: m.host_path.clone(),
@@ -4208,7 +4702,7 @@ permit(
 
     #[test]
     fn launch_live_policy_bounds_include_workspace_alias() {
-        let bounds = launch_live_policy_bounds(Path::new("/tmp/strait-project"));
+        let bounds = launch_live_policy_bounds(Path::new("/tmp/strait-project"), None);
         assert_eq!(
             bounds.fs_candidate_paths,
             vec![
@@ -4221,10 +4715,23 @@ permit(
 
     #[test]
     fn launch_live_policy_bounds_avoid_duplicate_workspace_alias() {
-        let bounds = launch_live_policy_bounds(Path::new(CONTAINER_WORKSPACE_PATH));
+        let bounds = launch_live_policy_bounds(Path::new(CONTAINER_WORKSPACE_PATH), None);
         assert_eq!(
             bounds.fs_candidate_paths,
             vec![CONTAINER_WORKSPACE_PATH.to_string()]
+        );
+    }
+
+    #[test]
+    fn launch_live_policy_bounds_use_declared_workspace_folder() {
+        let bounds =
+            launch_live_policy_bounds(Path::new("/tmp/strait-project"), Some("/workspaces/custom"));
+        assert_eq!(
+            bounds.fs_candidate_paths,
+            vec![
+                "/tmp/strait-project".to_string(),
+                "/workspaces/custom".to_string()
+            ]
         );
     }
 
@@ -5069,5 +5576,82 @@ forbid(principal, action, resource);
     fn parse_mount_empty_vec() {
         let mounts = parse_extra_mounts(&[]).unwrap();
         assert!(mounts.is_empty());
+    }
+
+    #[test]
+    fn resolve_devcontainer_mounts_accepts_object_form_bind_mounts() {
+        let mounts = resolve_devcontainer_mounts(
+            &[DevcontainerMount::Object(DevcontainerMountObject {
+                source: Some("cache".to_string()),
+                target: Some("/mnt/cache".to_string()),
+                mount_type: Some("bind".to_string()),
+                readonly: true,
+                consistency: None,
+                unsupported_keys: Vec::new(),
+                raw: r#"{"source":"cache","target":"/mnt/cache","type":"bind","readonly":true}"#
+                    .to_string(),
+            })],
+            Path::new("/workspace"),
+        )
+        .unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].to_bind_string(), "/workspace/cache:/mnt/cache:ro");
+    }
+
+    #[test]
+    fn resolve_devcontainer_mounts_rejects_unsupported_mount_types() {
+        let err = resolve_devcontainer_mounts(
+            &[DevcontainerMount::Object(DevcontainerMountObject {
+                source: Some("dind-var-lib-docker".to_string()),
+                target: Some("/var/lib/docker".to_string()),
+                mount_type: Some("volume".to_string()),
+                readonly: false,
+                consistency: None,
+                unsupported_keys: Vec::new(),
+                raw:
+                    r#"{"source":"dind-var-lib-docker","target":"/var/lib/docker","type":"volume"}"#
+                        .to_string(),
+            })],
+            Path::new("/workspace"),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("unsupported mount type: volume"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_devcontainer_mounts_warns_and_drops_consistency() {
+        // consistency is deprecated/ignored by Docker; should succeed with a warning
+        let result = resolve_devcontainer_mounts(
+            &[DevcontainerMount::String(
+                "source=/tmp,target=/mnt,type=bind,consistency=cached".to_string(),
+            )],
+            Path::new("/workspace"),
+        );
+
+        assert!(result.is_ok(), "consistency should be warned, not rejected");
+        let mounts = result.unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].target, "/mnt");
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("hello'world"), r#"'hello'"'"'world'"#);
+    }
+
+    #[test]
+    fn shell_quote_preserves_safe_args() {
+        assert_eq!(shell_quote("simple"), "simple");
+        assert_eq!(shell_quote("/usr/bin/env"), "/usr/bin/env");
+    }
+
+    #[test]
+    fn shell_quote_wraps_spaces() {
+        assert_eq!(shell_quote("hello world"), "'hello world'");
     }
 }

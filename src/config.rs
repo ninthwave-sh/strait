@@ -13,7 +13,7 @@ use std::{fs, io::Write as _};
 
 use anyhow::Context as _;
 use arc_swap::ArcSwap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::audit::AuditLogger;
@@ -325,6 +325,8 @@ pub struct DevcontainerConfig {
     pub build: Option<DevcontainerBuildConfig>,
     /// Environment variables injected into the container.
     pub container_env: BTreeMap<String, String>,
+    /// Mount declarations inherited from `devcontainer.json`.
+    pub mounts: Vec<DevcontainerMount>,
     /// Lifecycle hook run before the agent command.
     pub post_create_command: Option<DevcontainerCommand>,
     /// Lifecycle hook run during container creation.
@@ -342,6 +344,34 @@ pub struct DevcontainerBuildConfig {
     pub dockerfile: PathBuf,
     /// Optional build context resolved relative to the devcontainer file.
     pub context: Option<PathBuf>,
+}
+
+/// Supported raw `mounts` entries from `devcontainer.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DevcontainerMount {
+    /// Docker-style `--mount` string.
+    String(String),
+    /// Object-form mount declaration.
+    Object(DevcontainerMountObject),
+}
+
+/// Object-form `mounts` entry from `devcontainer.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevcontainerMountObject {
+    /// Host path or named source, if provided.
+    pub source: Option<String>,
+    /// Container destination path, if provided.
+    pub target: Option<String>,
+    /// Declared Docker mount type, if provided.
+    pub mount_type: Option<String>,
+    /// Whether the mount is read-only.
+    pub readonly: bool,
+    /// Optional mount consistency setting.
+    pub consistency: Option<String>,
+    /// Unsupported extra object keys that were present.
+    pub unsupported_keys: Vec<String>,
+    /// Original entry rendered back to JSON for diagnostics.
+    pub raw: String,
 }
 
 /// Lifecycle command shape used by `postCreateCommand` and `onCreateCommand`.
@@ -379,7 +409,7 @@ struct RawDevcontainerConfig {
     cap_add: Option<serde_json::Value>,
     run_args: Option<Vec<String>>,
     forward_ports: Option<serde_json::Value>,
-    mounts: Option<serde_json::Value>,
+    mounts: Option<RawDevcontainerMounts>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,6 +432,35 @@ enum RawDevcontainerCommand {
 enum RawDevcontainerCommandStep {
     Shell(String),
     Exec(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawDevcontainerMounts {
+    Single(RawDevcontainerMountEntry),
+    Multiple(Vec<RawDevcontainerMountEntry>),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum RawDevcontainerMountEntry {
+    String(String),
+    Object(RawDevcontainerMountObject),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RawDevcontainerMountObject {
+    source: Option<String>,
+    src: Option<String>,
+    target: Option<String>,
+    dst: Option<String>,
+    destination: Option<String>,
+    #[serde(rename = "type")]
+    mount_type: Option<String>,
+    readonly: Option<bool>,
+    consistency: Option<String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl From<RawDevcontainerCommand> for DevcontainerCommand {
@@ -449,11 +508,48 @@ pub fn parse_devcontainer(path: &Path) -> anyhow::Result<DevcontainerConfig> {
                 .map(|context| resolve_devcontainer_path(base_dir, context)),
         }),
         container_env: raw.container_env,
+        mounts: raw
+            .mounts
+            .map(RawDevcontainerMounts::into_vec)
+            .transpose()?
+            .unwrap_or_default(),
         post_create_command: raw.post_create_command.map(Into::into),
         on_create_command: raw.on_create_command.map(Into::into),
         workspace_folder: raw.workspace_folder,
         remote_user: raw.remote_user,
     })
+}
+
+impl RawDevcontainerMounts {
+    fn into_vec(self) -> anyhow::Result<Vec<DevcontainerMount>> {
+        match self {
+            Self::Single(mount) => Ok(vec![mount.try_into()?]),
+            Self::Multiple(mounts) => mounts.into_iter().map(TryInto::try_into).collect(),
+        }
+    }
+}
+
+impl TryFrom<RawDevcontainerMountEntry> for DevcontainerMount {
+    type Error = anyhow::Error;
+
+    fn try_from(value: RawDevcontainerMountEntry) -> anyhow::Result<Self> {
+        match value {
+            RawDevcontainerMountEntry::String(raw) => Ok(Self::String(raw)),
+            RawDevcontainerMountEntry::Object(raw) => {
+                let raw_json = serde_json::to_string(&raw)
+                    .context("failed to serialize devcontainer mount for diagnostics")?;
+                Ok(Self::Object(DevcontainerMountObject {
+                    source: raw.source.or(raw.src),
+                    target: raw.target.or(raw.dst).or(raw.destination),
+                    mount_type: raw.mount_type,
+                    readonly: raw.readonly.unwrap_or(false),
+                    consistency: raw.consistency,
+                    unsupported_keys: raw.extra.into_keys().collect(),
+                    raw: raw_json,
+                }))
+            }
+        }
+    }
 }
 
 fn resolve_devcontainer_path(base_dir: &Path, raw_path: &str) -> PathBuf {
@@ -508,23 +604,43 @@ fn warn_on_ignored_devcontainer_fields(config: &RawDevcontainerConfig, path: &Pa
             DEVCONTAINER_STRATEGY_DOC
         );
     }
+}
 
-    if has_nonempty_value(config.mounts.as_ref()) {
-        warn!(
-            path = %path.display(),
-            "ignoring devcontainer field 'mounts' during parse; mounts are honored by the container runtime directly. See {}.",
-            DEVCONTAINER_STRATEGY_DOC
-        );
+fn has_nonempty_value(value: Option<&impl HasNonEmptyValue>) -> bool {
+    value.is_some_and(HasNonEmptyValue::has_nonempty_value)
+}
+
+trait HasNonEmptyValue {
+    fn has_nonempty_value(&self) -> bool;
+}
+
+impl HasNonEmptyValue for serde_json::Value {
+    fn has_nonempty_value(&self) -> bool {
+        match self {
+            serde_json::Value::Array(items) => !items.is_empty(),
+            serde_json::Value::Object(map) => !map.is_empty(),
+            serde_json::Value::String(text) => !text.is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        }
     }
 }
 
-fn has_nonempty_value(value: Option<&serde_json::Value>) -> bool {
-    match value {
-        Some(serde_json::Value::Array(items)) => !items.is_empty(),
-        Some(serde_json::Value::Object(map)) => !map.is_empty(),
-        Some(serde_json::Value::String(text)) => !text.is_empty(),
-        Some(serde_json::Value::Null) | None => false,
-        Some(_) => true,
+impl HasNonEmptyValue for RawDevcontainerMounts {
+    fn has_nonempty_value(&self) -> bool {
+        match self {
+            Self::Single(entry) => entry.has_nonempty_value(),
+            Self::Multiple(items) => !items.is_empty(),
+        }
+    }
+}
+
+impl HasNonEmptyValue for RawDevcontainerMountEntry {
+    fn has_nonempty_value(&self) -> bool {
+        match self {
+            Self::String(text) => !text.is_empty(),
+            Self::Object(_) => true,
+        }
     }
 }
 
@@ -1352,14 +1468,6 @@ mod tests {
         f
     }
 
-    fn persist_snippet_for(host: &str, method: &str, path: &str) -> String {
-        crate::policy::synthesize_blocked_request(host, method, path, &[], &[], false)
-            .candidate_exception
-            .unwrap()
-            .persist
-            .cedar_snippet
-    }
-
     fn write_devcontainer(content: &str) -> (TempDir, PathBuf) {
         let temp_dir = tempfile::tempdir().unwrap();
         let devcontainer_dir = temp_dir.path().join(".devcontainer");
@@ -1407,6 +1515,14 @@ mod tests {
                 self.0 = format!("{:?}", value);
             }
         }
+    }
+
+    fn persist_snippet_for(host: &str, method: &str, path: &str) -> String {
+        crate::policy::synthesize_blocked_request(host, method, path, &[], &[], false)
+            .candidate_exception
+            .unwrap()
+            .persist
+            .cedar_snippet
     }
 
     #[test]
@@ -2797,6 +2913,7 @@ upstream_response_timeout_secs = 90
         );
         assert!(config.build.is_none());
         assert!(config.container_env.is_empty());
+        assert!(config.mounts.is_empty());
         assert!(config.post_create_command.is_none());
         assert!(config.on_create_command.is_none());
         assert!(config.workspace_folder.is_none());
@@ -2843,6 +2960,9 @@ upstream_response_timeout_secs = 90
                 RUST_LOG: "debug",
                 CI: "1",
               },
+              mounts: [
+                "source=${localWorkspaceFolder}/cache,target=/tmp/cache,type=bind,readonly",
+              ],
               postCreateCommand: ["cargo", "test"],
               onCreateCommand: {
                 bootstrap: "scripts/bootstrap.sh",
@@ -2866,6 +2986,13 @@ upstream_response_timeout_secs = 90
         assert_eq!(
             config.container_env.get("CI").map(String::as_str),
             Some("1")
+        );
+        assert_eq!(
+            config.mounts,
+            vec![DevcontainerMount::String(
+                "source=${localWorkspaceFolder}/cache,target=/tmp/cache,type=bind,readonly"
+                    .to_string()
+            )]
         );
         assert_eq!(
             config.post_create_command,
@@ -2961,7 +3088,7 @@ upstream_response_timeout_secs = 90
     }
 
     #[test]
-    fn parse_devcontainer_warns_on_forward_ports_and_mounts() {
+    fn parse_devcontainer_warns_on_forward_ports_and_preserves_mounts() {
         let (_temp_dir, path) = write_devcontainer(
             r#"
             {
@@ -2980,6 +3107,12 @@ upstream_response_timeout_secs = 90
 
         let config = parse_devcontainer(&path).unwrap();
         assert_eq!(config.image.as_deref(), Some("ubuntu:24.04"));
+        assert_eq!(
+            config.mounts,
+            vec![DevcontainerMount::String(
+                "source=/tmp,target=/mnt,type=bind".to_string()
+            )]
+        );
 
         let messages = messages.lock().unwrap();
         assert!(
@@ -2990,9 +3123,40 @@ upstream_response_timeout_secs = 90
             *messages
         );
         assert!(
-            messages.iter().any(|message| message.contains("mounts")),
-            "warning should mention mounts, got: {:?}",
+            messages.iter().all(|message| !message.contains("mounts")),
+            "mounts should no longer be warned as ignored, got: {:?}",
             *messages
         );
+    }
+
+    #[test]
+    fn parse_devcontainer_preserves_object_mount_entries() {
+        let (_temp_dir, path) = write_devcontainer(
+            r#"
+            {
+              image: "ubuntu:24.04",
+              mounts: [{ source: "dind-var-lib-docker", target: "/var/lib/docker", type: "volume" }],
+            }
+            "#,
+        );
+
+        let config = parse_devcontainer(&path).unwrap();
+        assert_eq!(config.mounts.len(), 1);
+        assert!(matches!(
+            &config.mounts[0],
+            DevcontainerMount::Object(DevcontainerMountObject {
+                source,
+                target,
+                mount_type,
+                readonly: false,
+                consistency: None,
+                unsupported_keys,
+                ..
+            })
+            if source.as_deref() == Some("dind-var-lib-docker")
+                && target.as_deref() == Some("/var/lib/docker")
+                && mount_type.as_deref() == Some("volume")
+                && unsupported_keys.is_empty()
+        ));
     }
 }

@@ -12,6 +12,7 @@ repository = "https://github.com/ninthwave-io/strait"
 readme = "README.md"
 
 [dependencies]
+prost = "0.13"
 hudsucker = { version = "0.22", features = ["rustls-client"] }
 cedar-policy = "4"
 rcgen = { version = "0.13", features = ["pem"] }
@@ -47,10 +48,18 @@ terminal_size = "0.4"
 futures-util = "0.3"
 libc = "0.2"
 signal-hook = "0.3"
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.12", features = ["transport", "tls"] }
+tonic-health = "0.12"
+tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
 tempfile = "3"
 libc = "0.2"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
 
 [[bin]]
 name = "mock-tui-fixture"

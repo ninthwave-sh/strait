@@ -8,6 +8,7 @@ pub mod audit;
 pub mod ca;
 pub mod config;
 pub mod container;
+pub mod control;
 pub mod credentials;
 pub mod decisions;
 pub mod diff;

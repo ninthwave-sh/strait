@@ -19,6 +19,39 @@ Two auth models are supported:
 In both cases, GitHub and npm credentials are injected by the proxy and
 never exposed to the agent.
 
+## Devcontainer feature (recommended)
+
+The `.devcontainer/devcontainer.json` in this directory uses the strait
+devcontainer feature (`ghcr.io/ninthwave-io/strait`). This is the
+simplest path: add the feature to your devcontainer.json, set two host
+environment variables, and the container connects to your host-side
+strait proxy automatically.
+
+### Quick start
+
+1. Start strait on the host:
+
+   ```bash
+   strait service start
+   strait launch --observe --output /tmp/observations.jsonl -- sleep infinity
+   ```
+
+2. Set the host environment variables to point at the running session:
+
+   ```bash
+   export STRAIT_PROXY_SOCKET=/path/to/session/proxy.sock
+   export STRAIT_CA_PEM=/path/to/session/ca.pem
+   ```
+
+3. Open this directory in VS Code or any devcontainer-compatible tool.
+   The feature installs the gateway, configures CA trust, and routes
+   all outbound traffic through the host proxy.
+
+The proxy runs on the host. The container has no direct network access
+to the proxy credentials. The gateway binary inside the container
+forwards TCP connections over a bind-mounted Unix socket to the host
+proxy.
+
 ## Prerequisites
 
 - Docker (or OrbStack / Podman)

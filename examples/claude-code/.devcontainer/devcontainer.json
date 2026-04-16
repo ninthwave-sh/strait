@@ -1,0 +1,32 @@
+// Claude Code devcontainer with strait network policy.
+//
+// Prerequisites:
+//   1. strait running on the host: `strait service start`
+//   2. A launch session: `strait launch --observe --output /tmp/observations.jsonl -- sleep infinity`
+//      (or use `strait service start --observe -- sleep infinity` for a managed session)
+//   3. Host env vars set to the session paths:
+//        export STRAIT_PROXY_SOCKET=/path/to/proxy.sock
+//        export STRAIT_CA_PEM=/path/to/ca.pem
+//
+// The strait feature installs the gateway binary, mounts the proxy socket
+// and CA PEM from the host, and wraps the container entrypoint so all
+// outbound traffic flows through the host-side strait proxy.
+//
+// Network policy is defined in policy.cedar (see ../policy.cedar).
+// Proxy and credential config is in strait.toml (see ../strait.toml).
+{
+    "name": "Claude Code with Strait",
+    "image": "ubuntu:24.04",
+    "features": {
+        "ghcr.io/ninthwave-io/strait:latest": {
+            "version": "latest"
+        }
+    },
+    "remoteUser": "root",
+    "containerEnv": {
+        "NODE_OPTIONS": "--max-old-space-size=4096"
+    },
+    "postCreateCommand": "apt-get update && apt-get install -y git curl ca-certificates && npm install -g @anthropic-ai/claude-code",
+    "workspaceFolder": "/workspace",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated"
+}

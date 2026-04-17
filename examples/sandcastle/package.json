@@ -1,0 +1,17 @@
+{
+  "name": "strait-sandcastle-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Runnable sandcastle example that wires a container into strait via CAP_NET_ADMIN and a host-socket bind mount.",
+  "scripts": {
+    "start": "tsx main.ts"
+  },
+  "dependencies": {
+    "sandcastle": "^0.1.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.0"
+  }
+}

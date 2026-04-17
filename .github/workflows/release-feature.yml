@@ -1,0 +1,340 @@
+name: Release feature
+
+# Builds the strait-agent binary for linux/amd64 + linux/arm64, assembles
+# the devcontainer feature bundle under features/strait/, and publishes
+# it as an OCI artifact at ghcr.io/ninthwave-io/strait:<version>. After
+# publish, a smoke-test job pulls the fresh tag and verifies a
+# devcontainer referencing `ghcr.io/ninthwave-io/strait:<version>` in
+# its `devcontainer.json` actually installs the feature inside the
+# container for both architectures.
+#
+# Trigger: push of any tag matching `v*` (for example `v0.1.0`). Also
+# exposed via `workflow_dispatch` so maintainers can dry-run the
+# publish against a pre-release tag without pushing it to the default
+# branch.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish as (e.g. v0.1.0). Required for workflow_dispatch.'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  FEATURE_NAMESPACE: ninthwave-io
+  FEATURE_ID: strait
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # -------------------------------------------------------------------
+  # Build strait-agent for each target arch natively so we do not
+  # depend on cross-compilation toolchains. GitHub's arm64 Linux
+  # runners (ubuntu-24.04-arm) are available for public repos.
+  # -------------------------------------------------------------------
+  build-agent:
+    name: Build strait-agent (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build strait-agent
+        run: cargo build --release --target ${{ matrix.target }} --package strait-agent --bin strait-agent
+
+      - name: Verify binary arch
+        run: |
+          BIN="target/${{ matrix.target }}/release/strait-agent"
+          file "${BIN}"
+          case "${{ matrix.arch }}" in
+            amd64)
+              file "${BIN}" | grep -qE "x86-64|x86_64" \
+                || { echo "::error::binary is not x86_64"; exit 1; }
+              ;;
+            arm64)
+              file "${BIN}" | grep -q "aarch64" \
+                || { echo "::error::binary is not aarch64"; exit 1; }
+              ;;
+          esac
+
+      - name: Stage binary
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/strait-agent" \
+             "dist/strait-agent-linux-${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: strait-agent-linux-${{ matrix.arch }}
+          path: dist/strait-agent-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------
+  # Assemble the feature bundle (features/strait/ + both binaries),
+  # pin the manifest version to the release tag, and publish to ghcr
+  # using the official devcontainer CLI. The CLI packages each
+  # subdirectory of the staging dir as a separate feature; our staging
+  # dir only contains `strait`, so the published artifact is
+  # ghcr.io/<namespace>/strait:<version>.
+  # -------------------------------------------------------------------
+  publish:
+    name: Publish feature to ghcr
+    needs: build-agent
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      feature_ref: ${{ steps.resolve.outputs.feature_ref }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Resolve tag / version
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          case "${TAG}" in
+            v*.*.*) ;;
+            *)
+              echo "::error::tag must look like v<semver> (got '${TAG}')"
+              exit 1
+              ;;
+          esac
+          VERSION="${TAG#v}"
+          FEATURE_REF="ghcr.io/${FEATURE_NAMESPACE}/${FEATURE_ID}:${VERSION}"
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "feature_ref=${FEATURE_REF}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing ${FEATURE_REF}"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: strait-agent-linux-amd64
+          path: dist/
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: strait-agent-linux-arm64
+          path: dist/
+
+      - name: Assemble feature bundle
+        run: |
+          set -euo pipefail
+          mkdir -p "bundle/${FEATURE_ID}"
+          # Copy the in-repo feature sources, then layer the per-arch
+          # binaries on top. `cp -a` preserves the executable bit on
+          # install.sh.
+          cp -a "features/${FEATURE_ID}/." "bundle/${FEATURE_ID}/"
+
+          # Pin the manifest version to the release tag (sans leading
+          # `v`) so consumers see a stable semver in the OCI metadata
+          # independent of what the in-repo manifest happens to declare.
+          python3 - <<'PY'
+          import json, os
+          feature_id = os.environ['FEATURE_ID']
+          version = os.environ['RELEASE_VERSION']
+          path = f'bundle/{feature_id}/devcontainer-feature.json'
+          with open(path) as f:
+              feature = json.load(f)
+          feature['version'] = version
+          with open(path, 'w') as f:
+              json.dump(feature, f, indent=4)
+              f.write('\n')
+          print(f'pinned {path} to version={version}')
+          PY
+
+          install -m 0755 dist/strait-agent-linux-amd64 \
+            "bundle/${FEATURE_ID}/strait-agent-linux-amd64"
+          install -m 0755 dist/strait-agent-linux-arm64 \
+            "bundle/${FEATURE_ID}/strait-agent-linux-arm64"
+
+          echo "Bundle contents:"
+          ls -la "bundle/${FEATURE_ID}"
+          echo "Manifest:"
+          cat "bundle/${FEATURE_ID}/devcontainer-feature.json"
+        env:
+          RELEASE_VERSION: ${{ steps.resolve.outputs.version }}
+
+      - name: Log in to ghcr
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install devcontainers CLI
+        run: npm install -g @devcontainers/cli@latest
+
+      - name: Publish feature
+        run: |
+          set -euo pipefail
+          # `devcontainer features publish` iterates each subdirectory
+          # of the input path and publishes it as its own feature under
+          # the given namespace. With bundle/ containing only `strait/`,
+          # the result is ghcr.io/<namespace>/strait:<version> plus the
+          # `latest` + major/minor tag aliases the CLI maintains.
+          devcontainer features publish \
+            --registry ghcr.io \
+            --namespace "${FEATURE_NAMESPACE}" \
+            ./bundle
+
+      - name: Verify OCI artifact layout
+        run: |
+          set -euo pipefail
+          # Fetch the just-published manifest from ghcr and print it so
+          # the workflow log shows what we pushed. `curl` against the
+          # registry API keeps this check dependency-free (no `oras`).
+          TOKEN=$(curl -sSf \
+            "https://ghcr.io/token?scope=repository:${FEATURE_NAMESPACE}/${FEATURE_ID}:pull" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+          MANIFEST_FILE="$(mktemp)"
+          curl -sSfL \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.oci.image.manifest.v1+json" \
+            -o "${MANIFEST_FILE}" \
+            "https://ghcr.io/v2/${FEATURE_NAMESPACE}/${FEATURE_ID}/manifests/${RELEASE_VERSION}"
+          python3 -m json.tool "${MANIFEST_FILE}"
+          MANIFEST_FILE="${MANIFEST_FILE}" python3 - <<'PY'
+          import json, os, sys
+          with open(os.environ['MANIFEST_FILE']) as f:
+              m = json.load(f)
+          layers = m.get('layers', [])
+          if not layers:
+              print('::error::published manifest has no layers')
+              sys.exit(1)
+          mt = layers[0].get('mediaType', '')
+          if 'devcontainer' not in mt and 'tar' not in mt:
+              print(f'::error::unexpected layer mediaType {mt!r}')
+              sys.exit(1)
+          print(f'OK: {len(layers)} layer(s), first mediaType={mt}')
+          PY
+          rm -f "${MANIFEST_FILE}"
+        env:
+          RELEASE_VERSION: ${{ steps.resolve.outputs.version }}
+
+  # -------------------------------------------------------------------
+  # Smoke test: create a minimal consumer project that references the
+  # published feature by its ghcr id, then use the devcontainer CLI to
+  # build + boot + exec. We run the matrix through QEMU so a single
+  # amd64 runner can verify both arches without renting an arm64
+  # machine.
+  # -------------------------------------------------------------------
+  smoke-test:
+    name: Smoke test (${{ matrix.arch }})
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Set up QEMU
+        if: matrix.arch != 'amd64'
+        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3
+        with:
+          platforms: linux/arm64
+
+      - name: Log in to ghcr
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install devcontainers CLI
+        run: npm install -g @devcontainers/cli@latest
+
+      - name: Scaffold consumer project
+        run: |
+          set -euo pipefail
+          mkdir -p project/.devcontainer
+          # Pin the image platform via a tiny Dockerfile so `devcontainer
+          # up` honors the matrix arch even on an amd64 host runner.
+          cat > project/.devcontainer/Dockerfile <<DOCKERFILE
+          FROM --platform=linux/${{ matrix.arch }} mcr.microsoft.com/devcontainers/base:debian
+          DOCKERFILE
+          cat > project/.devcontainer/devcontainer.json <<JSON
+          {
+              "name": "strait-feature-smoke",
+              "build": { "dockerfile": "Dockerfile" },
+              "remoteUser": "vscode",
+              "features": {
+                  "${{ needs.publish.outputs.feature_ref }}": {
+                      "agent_user": "vscode",
+                      "proxy_port": "9443"
+                  }
+              }
+          }
+          JSON
+          cat project/.devcontainer/devcontainer.json
+
+      - name: Build and boot devcontainer
+        run: |
+          set -euo pipefail
+          cd project
+          devcontainer up --workspace-folder . --log-level info
+
+      - name: Verify feature installed + binary matches container arch
+        run: |
+          set -euo pipefail
+          cd project
+          # `devcontainer exec` runs the given command inside the
+          # container. We ship the smoke script to the container via an
+          # explicit file mount (written by the runner) rather than
+          # inline so that shellcheck on the runner and shellcheck on
+          # the inner script stay independent.
+          SMOKE="$(mktemp)"
+          cat > "${SMOKE}" <<'SMOKE'
+          set -eu
+          echo "container uname -m: $(uname -m)"
+          test -x /usr/local/bin/strait-agent \
+            || { echo "FAIL: /usr/local/bin/strait-agent missing or not executable"; exit 1; }
+          test -x /usr/local/share/strait/entrypoint.sh \
+            || { echo "FAIL: entrypoint missing"; exit 1; }
+          test -f /etc/strait/strait-agent.toml \
+            || { echo "FAIL: config missing"; exit 1; }
+
+          # Running --version exercises the binary. If the wrong arch
+          # was installed by the feature install.sh, this would either
+          # segfault or fail to exec.
+          OUT="$(/usr/local/bin/strait-agent --version 2>&1)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "^strait-agent" \
+            || { echo "FAIL: --version did not identify strait-agent"; exit 1; }
+
+          # Config reflects the options passed in devcontainer.json.
+          grep -q 'agent_user = "vscode"' /etc/strait/strait-agent.toml
+          grep -q 'port = 9443' /etc/strait/strait-agent.toml
+
+          echo "PASS: ghcr feature installs and runs on $(uname -m)"
+          SMOKE
+          devcontainer exec --workspace-folder . sh -eu < "${SMOKE}"
+          rm -f "${SMOKE}"

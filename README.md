@@ -187,6 +187,32 @@ strait proxy --config strait.toml                   # run the standalone HTTPS p
 cargo install strait    # from source
 ```
 
+### Devcontainer feature
+
+Strait is published as a devcontainer feature at
+`ghcr.io/ninthwave-io/strait`. Reference it from your
+`.devcontainer/devcontainer.json` to install the in-container agent
+without cloning this repository. Multi-arch binaries (`linux/amd64` and
+`linux/arm64`) are shipped; the install script picks the right one at
+build time based on the container architecture.
+
+```jsonc
+{
+    "image": "mcr.microsoft.com/devcontainers/base:debian",
+    "remoteUser": "vscode",
+    "features": {
+        "ghcr.io/ninthwave-io/strait:0.1": {
+            "agent_user": "vscode",
+            "proxy_port": "9443"
+        }
+    }
+}
+```
+
+See [`features/strait/README.md`](features/strait/README.md) for the
+full option list, the required `CAP_NET_ADMIN` capability, and the
+host control-plane socket mount.
+
 ## License
 
 Apache-2.0

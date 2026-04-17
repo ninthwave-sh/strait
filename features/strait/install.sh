@@ -77,45 +77,70 @@ if ! command -v iptables >/dev/null 2>&1; then
     fi
 fi
 
+# ---- Arch detection -----------------------------------------------------
+#
+# The feature bundle ships one pre-built strait-agent per linux arch as
+# `strait-agent-linux-amd64` / `strait-agent-linux-arm64`. Pick the one
+# that matches the container's arch. `uname -m` reflects the container
+# arch at feature-install time (docker buildx + --platform sets this up
+# correctly via QEMU or a native arm64 builder).
+
+UNAME_M="$(uname -m)"
+case "${UNAME_M}" in
+    x86_64|amd64)
+        AGENT_ARCH="amd64"
+        ;;
+    aarch64|arm64)
+        AGENT_ARCH="arm64"
+        ;;
+    *)
+        echo "strait feature: unsupported architecture ${UNAME_M}" >&2
+        echo "strait feature: supported: x86_64/amd64, aarch64/arm64" >&2
+        exit 1
+        ;;
+esac
+
 # ---- Bundled binary -----------------------------------------------------
 #
-# H-INST-1 scope: the strait-agent binary is "bundled at install time"
-# rather than downloaded. The install script accepts a binary from one
-# of three sources, in order:
+# The install script accepts a binary from one of four sources, in order:
 #
 #   1. A pre-existing /usr/local/bin/strait-agent (bind-mount or COPY).
-#   2. A sibling `strait-agent` file next to this script (feature bundle).
-#   3. $STRAIT_AGENT_BINARY pointing at an explicit path.
-#
-# H-INST-2 will replace this with a pinned download from ghcr.
+#   2. $STRAIT_AGENT_BINARY pointing at an explicit path.
+#   3. A per-arch binary next to this script
+#      (`strait-agent-linux-${AGENT_ARCH}`). This is what the release
+#      feature bundle published to ghcr ships.
+#   4. A sibling `strait-agent` file next to this script, for local
+#      `features/strait/` development where a single arch is built.
 
 FEATURE_DIR="$(cd "$(dirname "$0")" && pwd)"
-BUNDLED_BIN="${FEATURE_DIR}/strait-agent"
+BUNDLED_BIN_ARCH="${FEATURE_DIR}/strait-agent-linux-${AGENT_ARCH}"
+BUNDLED_BIN_GENERIC="${FEATURE_DIR}/strait-agent"
 
 if [ -x "${AGENT_BIN}" ]; then
     echo "strait feature: using pre-installed ${AGENT_BIN}"
 elif [ -n "${STRAIT_AGENT_BINARY:-}" ] && [ -x "${STRAIT_AGENT_BINARY}" ]; then
     install -m 0755 "${STRAIT_AGENT_BINARY}" "${AGENT_BIN}"
     echo "strait feature: installed strait-agent from STRAIT_AGENT_BINARY=${STRAIT_AGENT_BINARY}"
-elif [ -x "${BUNDLED_BIN}" ]; then
-    install -m 0755 "${BUNDLED_BIN}" "${AGENT_BIN}"
+elif [ -x "${BUNDLED_BIN_ARCH}" ]; then
+    install -m 0755 "${BUNDLED_BIN_ARCH}" "${AGENT_BIN}"
+    echo "strait feature: installed bundled strait-agent (linux-${AGENT_ARCH}) to ${AGENT_BIN}"
+elif [ -x "${BUNDLED_BIN_GENERIC}" ]; then
+    install -m 0755 "${BUNDLED_BIN_GENERIC}" "${AGENT_BIN}"
     echo "strait feature: installed bundled strait-agent to ${AGENT_BIN}"
 else
     cat >&2 <<EOF
 strait feature: strait-agent binary not found.
 
 Checked (in order):
-  1. ${AGENT_BIN}               (pre-installed)
-  2. \$STRAIT_AGENT_BINARY       (explicit path)
-  3. ${BUNDLED_BIN}              (bundled next to install.sh)
+  1. ${AGENT_BIN}                                 (pre-installed)
+  2. \$STRAIT_AGENT_BINARY                         (explicit path)
+  3. ${BUNDLED_BIN_ARCH}
+  4. ${BUNDLED_BIN_GENERIC}
 
-H-INST-1 ships the feature with a locally built binary. A future item
-(H-INST-2) will publish a pinned binary on ghcr and download it here.
-Until then, either:
-
-  * COPY a prebuilt strait-agent to ${AGENT_BIN} before enabling the
-    feature, or
-  * place the binary next to features/strait/install.sh (feature bundle).
+The published feature on ghcr (ghcr.io/ninthwave-io/strait) ships
+per-arch binaries under source (3). If you are developing locally
+against features/strait/ directly, build strait-agent for your
+container arch and place it at (4), or set STRAIT_AGENT_BINARY.
 EOF
     exit 1
 fi

@@ -2,15 +2,15 @@
 //!
 //! Two subcommands in one binary:
 //!
-//! - `entrypoint` -- runs as container PID 1 or equivalent. Will (in
-//!   H-ICDP-2) verify `CAP_NET_ADMIN`, install iptables OUTPUT REDIRECT
-//!   rules for the configured ports to the proxy port, then drop
-//!   privileges to the configured agent user and exec the agent command.
+//! - `entrypoint` -- runs as container PID 1 or equivalent. Verifies
+//!   `CAP_NET_ADMIN`, spawns the proxy subprocess, installs iptables
+//!   OUTPUT REDIRECT rules for the configured ports to the proxy port,
+//!   drops privileges to the configured agent user, and `exec`s the
+//!   agent command. See [`strait_agent::entrypoint`].
 //! - `proxy` -- MITM proxy ported from the top-level crate's
 //!   `src/mitm.rs`. Accepts REDIRECT'd TCP connections, recovers the
 //!   original destination via `SO_ORIGINAL_DST`, terminates TLS with the
-//!   session-local CA, evaluates Cedar policy, and forwards upstream
-//!   (H-ICDP-3).
+//!   session-local CA, evaluates Cedar policy, and forwards upstream.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use strait_agent::config::AgentConfig;
+use strait_agent::entrypoint;
 use strait_agent::proxy::{self, PromptDenyClient, ProxyConfig};
 
 #[derive(Parser)]
@@ -36,17 +37,26 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
 
+    /// Override `entrypoint.agent_user` from the config file.
+    ///
+    /// Convenience for `--cap-add=NET_ADMIN` container invocations where
+    /// the user is passed via docker-run args rather than a mounted
+    /// config. Global so the same flag works with both subcommands.
+    #[arg(long, global = true, value_name = "USER")]
+    agent_user: Option<String>,
+
+    /// Override `proxy.port` from the config file.
+    #[arg(long, global = true, value_name = "PORT")]
+    proxy_port: Option<u16>,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Container entrypoint: install iptables rules, drop privileges, exec
-    /// the agent command.
-    ///
-    /// Not implemented in this skeleton (H-ICDP-2). Currently prints the
-    /// parsed config and exits.
+    /// Container entrypoint: install iptables rules, drop privileges,
+    /// and exec the agent command.
     Entrypoint {
         /// Command (and args) to exec after privilege drop.
         ///
@@ -92,25 +102,21 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
-    let config = AgentConfig::load_optional(cli.config.as_deref())?;
+    let mut config = AgentConfig::load_optional(cli.config.as_deref())?;
+    // CLI overrides win over env + file so operators can tune a single
+    // invocation without editing the config file or exporting env vars.
+    if let Some(user) = cli.agent_user {
+        config.agent_user = if user.is_empty() { None } else { Some(user) };
+    }
+    if let Some(port) = cli.proxy_port {
+        if port == 0 {
+            anyhow::bail!("--proxy-port must be non-zero");
+        }
+        config.proxy_port = port;
+    }
 
     match cli.command {
-        Commands::Entrypoint { command } => {
-            println!("strait-agent: mode=entrypoint (skeleton; H-ICDP-2 fills this in)");
-            println!("  proxy_port       = {}", config.proxy_port);
-            println!(
-                "  agent_user       = {}",
-                config.agent_user.as_deref().unwrap_or("<unset>")
-            );
-            println!("  redirect_ports   = {:?}", config.redirect_ports);
-            println!("  host_socket      = {}", config.host_socket.display());
-            if command.is_empty() {
-                println!("  child command    = <none>");
-            } else {
-                println!("  child command    = {command:?}");
-            }
-            Ok(())
-        }
+        Commands::Entrypoint { command } => entrypoint::run(&config, &command),
         Commands::Proxy { policy, ca_cert } => run_proxy(&config, policy, ca_cert),
     }
 }

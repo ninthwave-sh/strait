@@ -22,12 +22,22 @@
 //!   integration tests.
 //! - [`host_client`]: gRPC client for the host control plane. Connects
 //!   over the bind-mounted Unix domain socket shared with `strait-host`.
+//! - [`entrypoint`]: container entrypoint flow (`strait-agent entrypoint`).
+//!   Verifies `CAP_NET_ADMIN`, spawns the proxy subprocess, installs the
+//!   `iptables` OUTPUT REDIRECT rules, drops privileges to the configured
+//!   agent user, and `exec`s the agent command. Linux-only at runtime;
+//!   the module compiles cross-platform but `run()` errors on non-Linux.
+//! - [`iptables`]: thin wrapper around the `iptables` binary used by
+//!   [`entrypoint`]. Linux-only (the module is gated out on other
+//!   platforms).
 //!
-//! Future phases (H-ICDP-2, H-ICDP-4) will fill in the entrypoint
-//! privilege-drop flow and container-side CA trust injection.
+//! Future phase (H-ICDP-4) will fill in container-side CA trust injection.
 
 pub mod config;
+pub mod entrypoint;
 pub mod host_client;
+#[cfg(target_os = "linux")]
+pub mod iptables;
 pub mod proxy;
 pub mod so_original_dst;
 

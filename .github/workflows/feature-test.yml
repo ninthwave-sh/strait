@@ -1,0 +1,286 @@
+name: Feature test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'features/strait/**'
+      - '.github/workflows/feature-test.yml'
+      - 'agent/**'
+  pull_request:
+    paths:
+      - 'features/strait/**'
+      - '.github/workflows/feature-test.yml'
+      - 'agent/**'
+
+jobs:
+  validate:
+    name: Validate manifest + install.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate devcontainer-feature.json
+        run: |
+          python3 - <<'PY'
+          import json, sys, os
+          with open('features/strait/devcontainer-feature.json') as f:
+              feature = json.load(f)
+
+          errors = []
+          for field in ['id', 'version', 'name', 'description']:
+              if field not in feature:
+                  errors.append(f'missing required field: {field}')
+
+          fid = feature.get('id', '')
+          if not fid or not all(c.isalnum() or c == '-' for c in fid):
+              errors.append(f'id must be lowercase alphanumeric with hyphens: {fid!r}')
+
+          version = feature.get('version', '')
+          parts = version.split('.')
+          if len(parts) != 3 or not all(p.isdigit() for p in parts):
+              errors.append(f'version must be semver (x.y.z): {version!r}')
+
+          options = feature.get('options', {})
+          for required_opt in ('host', 'agent_user', 'policy', 'proxy_port'):
+              if required_opt not in options:
+                  errors.append(f'missing expected option: {required_opt}')
+
+          if feature.get('entrypoint') != '/usr/local/share/strait/entrypoint.sh':
+              errors.append('entrypoint should point at /usr/local/share/strait/entrypoint.sh')
+
+          if 'NET_ADMIN' not in feature.get('capAdd', []):
+              errors.append('capAdd must include NET_ADMIN')
+
+          if not os.path.isfile('features/strait/install.sh'):
+              errors.append('install.sh not found')
+          elif not os.access('features/strait/install.sh', os.X_OK):
+              errors.append('install.sh must be executable')
+
+          if errors:
+              for e in errors:
+                  print(f'::error::{e}')
+              sys.exit(1)
+
+          print(f'Feature validated: {feature["id"]} v{feature["version"]}')
+          PY
+
+      - name: install.sh shebang
+        run: |
+          head -1 features/strait/install.sh | grep -q '^#!/bin/sh' || {
+            echo '::error::install.sh must start with #!/bin/sh'
+            exit 1
+          }
+
+      - name: Shellcheck install.sh
+        run: |
+          if command -v shellcheck > /dev/null 2>&1; then
+            shellcheck -s sh features/strait/install.sh
+          else
+            echo 'shellcheck not available; skipping'
+          fi
+
+  integration:
+    name: Build + install + run
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # The feature bundles a locally built strait-agent (H-INST-1 scope;
+      # H-INST-2 switches to a pinned ghcr download). Build it here with
+      # the default linux-gnu target -- the CI runner's docker images are
+      # glibc-based, so gnu is the simplest path. The release workflow
+      # handles cross-compiled musl builds separately.
+      - name: Build strait-agent
+        run: cargo build --release -p strait-agent --bin strait-agent
+
+      - name: Assemble feature bundle
+        run: |
+          mkdir -p /tmp/strait-feature-bundle
+          cp -r features/strait/. /tmp/strait-feature-bundle/
+          cp target/release/strait-agent /tmp/strait-feature-bundle/strait-agent
+          chmod +x /tmp/strait-feature-bundle/strait-agent /tmp/strait-feature-bundle/install.sh
+          ls -la /tmp/strait-feature-bundle
+
+      - name: Build test image (feature installed into Debian slim)
+        run: |
+          # `docker build` does not natively honor the devcontainer
+          # feature's `entrypoint` field -- that field is interpreted by
+          # the devcontainer CLI, which injects it into the built image.
+          # To exercise the same runtime behavior without a full
+          # `devcontainer build`, set ENTRYPOINT explicitly to the path
+          # the feature installs to. This matches what a real devcontainer
+          # runtime does and keeps the test lightweight.
+          cat > /tmp/strait-feature-bundle/Dockerfile <<'DOCKERFILE'
+          FROM debian:stable-slim
+          RUN apt-get update \
+           && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                ca-certificates procps iptables \
+           && rm -rf /var/lib/apt/lists/* \
+           && useradd -m -u 1001 testagent
+          COPY . /feature/
+          # Default option values for the install. The feature integration
+          # tests override these below with explicit env vars to prove
+          # options flow through.
+          RUN HOST=/run/strait/host.sock \
+              AGENT_USER=testagent \
+              POLICY=/etc/strait/policy.cedar \
+              PROXY_PORT=9443 \
+              /feature/install.sh
+          ENTRYPOINT ["/usr/local/share/strait/entrypoint.sh"]
+          DOCKERFILE
+          docker build -t strait-feature-test:latest /tmp/strait-feature-bundle
+
+      - name: Feature installed artifacts are present
+        run: |
+          docker run --rm --entrypoint /bin/sh strait-feature-test:latest -c '
+            set -e
+            test -x /usr/local/bin/strait-agent || { echo FAIL: binary; exit 1; }
+            test -x /usr/local/share/strait/entrypoint.sh || { echo FAIL: entrypoint; exit 1; }
+            test -f /etc/strait/strait-agent.toml || { echo FAIL: config; exit 1; }
+            grep -q "agent_user = \"testagent\"" /etc/strait/strait-agent.toml
+            grep -q "port = 9443" /etc/strait/strait-agent.toml
+            grep -q "socket_path = \"/run/strait/host.sock\"" /etc/strait/strait-agent.toml
+            echo PASS: artifacts present and config reflects options
+          '
+
+      - name: Entrypoint wraps user command (happy path)
+        run: |
+          # The feature's ENTRYPOINT (set above in the Dockerfile) runs
+          # entrypoint.sh, which execs `strait-agent entrypoint`. That
+          # verifies CAP_NET_ADMIN, installs iptables rules, drops
+          # privileges, and finally execs the container command.
+          NAME="strait-feature-$$"
+          docker run --rm -d --name "$NAME" --cap-add=NET_ADMIN \
+            strait-feature-test:latest \
+            sh -c 'id -u > /tmp/exec_uid && sleep 30'
+          trap 'docker kill "$NAME" >/dev/null 2>&1 || true' EXIT
+
+          # Poll for /tmp/exec_uid to be present and non-empty.
+          UID_OUT=""
+          for _ in $(seq 1 30); do
+            if docker exec -u 0 "$NAME" test -s /tmp/exec_uid 2>/dev/null; then
+              UID_OUT="$(docker exec -u 0 "$NAME" cat /tmp/exec_uid | tr -d '[:space:]')"
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$UID_OUT" != "1001" ]; then
+            echo "::error::exec'd child should run as testagent (uid 1001), got ${UID_OUT:-<empty>}"
+            docker logs "$NAME" || true
+            exit 1
+          fi
+          echo "PASS: entrypoint dropped privileges to testagent"
+
+          # iptables rules should be installed in the nat table.
+          RULES="$(docker exec -u 0 "$NAME" iptables -t nat -S OUTPUT)"
+          echo "$RULES"
+          echo "$RULES" | grep -q -- '--uid-owner 1001' \
+            || { echo '::error::expected --uid-owner 1001 rule'; exit 1; }
+          echo "$RULES" | grep -q -- '--dport 80' \
+            || { echo '::error::expected --dport 80 REDIRECT'; exit 1; }
+          echo "$RULES" | grep -q -- '--dport 443' \
+            || { echo '::error::expected --dport 443 REDIRECT'; exit 1; }
+          echo "$RULES" | grep -q -- '--to-ports 9443' \
+            || { echo '::error::expected --to-ports 9443'; exit 1; }
+          echo "PASS: iptables rules installed"
+
+      - name: Options flow through (custom agent_user + proxy_port)
+        run: |
+          # Rebuild with non-default options to prove they thread all the
+          # way through to the live iptables rules.
+          mkdir -p /tmp/strait-feature-custom
+          cp -r /tmp/strait-feature-bundle/. /tmp/strait-feature-custom/
+          cat > /tmp/strait-feature-custom/Dockerfile <<'DOCKERFILE'
+          FROM debian:stable-slim
+          RUN apt-get update \
+           && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                ca-certificates procps iptables \
+           && rm -rf /var/lib/apt/lists/* \
+           && useradd -m -u 1337 someoneelse
+          COPY . /feature/
+          RUN HOST=/tmp/host.sock \
+              AGENT_USER=someoneelse \
+              POLICY=/tmp/policy.cedar \
+              PROXY_PORT=18443 \
+              /feature/install.sh
+          ENTRYPOINT ["/usr/local/share/strait/entrypoint.sh"]
+          DOCKERFILE
+          docker build -t strait-feature-custom:latest /tmp/strait-feature-custom
+
+          docker run --rm --entrypoint /bin/sh strait-feature-custom:latest -c '
+            set -e
+            grep -q "port = 18443" /etc/strait/strait-agent.toml
+            grep -q "agent_user = \"someoneelse\"" /etc/strait/strait-agent.toml
+            grep -q "socket_path = \"/tmp/host.sock\"" /etc/strait/strait-agent.toml
+          '
+          echo "PASS: config file reflects custom options"
+
+          NAME="strait-feature-custom-$$"
+          docker run --rm -d --name "$NAME" --cap-add=NET_ADMIN \
+            strait-feature-custom:latest \
+            sh -c 'id -u > /tmp/exec_uid && sleep 30'
+          trap 'docker kill "$NAME" >/dev/null 2>&1 || true' EXIT
+
+          UID_OUT=""
+          for _ in $(seq 1 30); do
+            if docker exec -u 0 "$NAME" test -s /tmp/exec_uid 2>/dev/null; then
+              UID_OUT="$(docker exec -u 0 "$NAME" cat /tmp/exec_uid | tr -d '[:space:]')"
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$UID_OUT" != "1337" ]; then
+            echo "::error::exec'd child should run as someoneelse (uid 1337), got ${UID_OUT:-<empty>}"
+            docker logs "$NAME" || true
+            exit 1
+          fi
+
+          RULES="$(docker exec -u 0 "$NAME" iptables -t nat -S OUTPUT)"
+          echo "$RULES"
+          echo "$RULES" | grep -q -- '--uid-owner 1337' \
+            || { echo '::error::custom agent_user did not flow through (--uid-owner 1337 missing)'; exit 1; }
+          echo "$RULES" | grep -q -- '--to-ports 18443' \
+            || { echo '::error::custom proxy_port did not flow through (--to-ports 18443 missing)'; exit 1; }
+          echo "PASS: custom options flow through to runtime iptables rules"
+
+      - name: Missing CAP_NET_ADMIN produces actionable error
+        run: |
+          # Force-drop the default Docker capabilities so NET_ADMIN is
+          # definitely absent. The entrypoint must fail fast, mention
+          # CAP_NET_ADMIN, and not exec the user command.
+          set +e
+          OUT="$(docker run --rm --cap-drop=ALL strait-feature-test:latest sh -c 'id -u' 2>&1)"
+          RC=$?
+          set -e
+          echo "stdout+stderr:"
+          echo "$OUT"
+          if [ $RC -eq 0 ]; then
+            echo '::error::entrypoint should fail without CAP_NET_ADMIN'
+            exit 1
+          fi
+          echo "$OUT" | grep -q 'CAP_NET_ADMIN' \
+            || { echo '::error::diagnostic should mention CAP_NET_ADMIN'; exit 1; }
+          echo "$OUT" | grep -q 'cap-add' \
+            || { echo '::error::diagnostic should tell the user how to add the cap'; exit 1; }
+          echo "PASS: missing CAP_NET_ADMIN produces actionable error"
+
+      - name: Feature install is idempotent
+        run: |
+          # Re-running install.sh on top of an already-installed image
+          # must succeed without error.
+          docker run --rm --entrypoint /bin/sh strait-feature-test:latest -c '
+            set -e
+            HOST=/run/strait/host.sock \
+              AGENT_USER=testagent \
+              POLICY=/etc/strait/policy.cedar \
+              PROXY_PORT=9443 \
+              /feature/install.sh
+            test -x /usr/local/bin/strait-agent
+            test -x /usr/local/share/strait/entrypoint.sh
+            test -f /etc/strait/strait-agent.toml
+          '
+          echo "PASS: install.sh is idempotent"

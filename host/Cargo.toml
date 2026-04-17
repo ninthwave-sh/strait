@@ -20,10 +20,11 @@ futures-core = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 prost = "0.13"
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 strait-proto = { path = "../proto" }
 tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 toml = "0.8"
 tonic = { version = "0.12", features = ["transport"] }
 tower = { version = "0.5", features = ["util"] }

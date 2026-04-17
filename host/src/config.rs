@@ -24,6 +24,13 @@ pub const DEFAULT_TCP_LISTEN: &str = "127.0.0.1:3129";
 /// else on the box can.
 pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
 
+/// Default on-disk path for the rule store, relative to `$HOME`.
+///
+/// Follows the XDG data dir convention. The full default path is built by
+/// [`default_rules_db_path`] so that a missing `$HOME` falls back to a
+/// relative path rather than panicking.
+pub const DEFAULT_RULES_DB_RELATIVE: &str = ".local/share/strait/rules.db";
+
 /// Resolved host configuration with defaults filled in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
@@ -33,6 +40,8 @@ pub struct HostConfig {
     pub tcp_listen: SocketAddr,
     /// Permission bits for the Unix socket file.
     pub socket_mode: u32,
+    /// Filesystem path of the persistent rule store (SQLite).
+    pub rules_db: PathBuf,
 }
 
 impl HostConfig {
@@ -44,6 +53,7 @@ impl HostConfig {
                 .parse()
                 .expect("DEFAULT_TCP_LISTEN must be a valid SocketAddr"),
             socket_mode: DEFAULT_SOCKET_MODE,
+            rules_db: default_rules_db_path(),
         }
     }
 
@@ -77,6 +87,9 @@ impl HostConfig {
         if let Some(mode) = file.socket_mode {
             self.socket_mode = mode;
         }
+        if let Some(path) = file.rules_db {
+            self.rules_db = path;
+        }
         Ok(())
     }
 }
@@ -89,6 +102,7 @@ struct HostConfigFile {
     unix_socket: Option<PathBuf>,
     tcp_listen: Option<String>,
     socket_mode: Option<u32>,
+    rules_db: Option<PathBuf>,
 }
 
 /// Return the default path for `host.toml`. On Unix this is
@@ -99,6 +113,16 @@ pub fn default_config_path() -> PathBuf {
     match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home).join(".config/strait/host.toml"),
         None => PathBuf::from("host.toml"),
+    }
+}
+
+/// Return the default path for the persistent rule store. Prefers
+/// `$HOME/.local/share/strait/rules.db`; if `$HOME` is not set falls back to
+/// `./rules.db` so the binary can still start in unusual environments.
+pub fn default_rules_db_path() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(DEFAULT_RULES_DB_RELATIVE),
+        None => PathBuf::from("rules.db"),
     }
 }
 
@@ -115,6 +139,7 @@ mod tests {
             DEFAULT_TCP_LISTEN.parse::<SocketAddr>().unwrap()
         );
         assert_eq!(cfg.socket_mode, DEFAULT_SOCKET_MODE);
+        assert_eq!(cfg.rules_db, default_rules_db_path());
     }
 
     #[test]
@@ -139,6 +164,7 @@ mod tests {
             unix_socket = "/tmp/strait/custom.sock"
             tcp_listen = "127.0.0.1:9999"
             socket_mode = 0o640
+            rules_db = "/tmp/strait/rules.db"
             "#,
         )
         .unwrap();
@@ -148,6 +174,7 @@ mod tests {
             "127.0.0.1:9999".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(cfg.socket_mode, 0o640);
+        assert_eq!(cfg.rules_db, PathBuf::from("/tmp/strait/rules.db"));
     }
 
     #[test]

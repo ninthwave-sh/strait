@@ -4,7 +4,38 @@ Routes all outbound TCP inside a devcontainer through a Cedar-policy-gated
 MITM proxy. No `HTTPS_PROXY` dependency: `iptables` REDIRECT rewrites
 ports 80 and 443 from the agent user to the in-container proxy.
 
-## Example `devcontainer.json`
+## Reference the feature by id
+
+The feature is published as an OCI artifact at
+`ghcr.io/ninthwave-io/strait` on every `v*` tag (see
+[`.github/workflows/release-feature.yml`](../../.github/workflows/release-feature.yml)).
+Consumers pin a version and reference it from their `devcontainer.json`
+without cloning this repository:
+
+```jsonc
+{
+    "image": "mcr.microsoft.com/devcontainers/base:debian",
+    "remoteUser": "vscode",
+    "features": {
+        "ghcr.io/ninthwave-io/strait:0.1": {
+            "agent_user": "vscode",
+            "proxy_port": "9443",
+            "host": "/run/strait/host.sock",
+            "policy": "/workspaces/my-repo/.strait/policy.cedar"
+        }
+    }
+}
+```
+
+Both `linux/amd64` and `linux/arm64` are shipped; the install script
+picks the matching binary via `uname -m` inside the builder container,
+so Apple Silicon hosts automatically get the arm64 artifact.
+
+### Using the in-repo sources
+
+For local development on the feature itself, the same options work
+against the in-repo path. `install.sh` falls back to a sibling
+`strait-agent` binary when no per-arch binary is present.
 
 ```jsonc
 {
@@ -59,8 +90,6 @@ time, then get baked into `/etc/strait/strait-agent.toml`.
 
 ## What this feature does not do
 
-- It does not download the `strait-agent` binary. H-INST-1 bundles a
-  locally built binary; H-INST-2 will add a pinned download from ghcr.
 - It does not start the host control plane. The host process
   (`strait-host`) runs on the developer workstation; see
   `docs/designs/in-container-rewrite.md`. The `host` option only tells

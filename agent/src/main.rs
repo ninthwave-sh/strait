@@ -2,23 +2,21 @@
 //!
 //! Two subcommands in one binary:
 //!
-//! - `entrypoint` -- runs as container PID 1 or equivalent. Will (in
-//!   H-ICDP-2) verify `CAP_NET_ADMIN`, install iptables OUTPUT REDIRECT
-//!   rules for the configured ports to the proxy port, then drop
-//!   privileges to the configured agent user and exec the agent command.
+//! - `entrypoint` -- runs as container PID 1 or equivalent. Verifies
+//!   `CAP_NET_ADMIN`, spawns the proxy subprocess, installs iptables
+//!   OUTPUT REDIRECT rules for the configured ports to the proxy port,
+//!   drops privileges to the configured agent user, and `exec`s the
+//!   agent command. See [`strait_agent::entrypoint`].
 //! - `proxy` -- MITM proxy. Will (in H-ICDP-3) host the pipeline moved
 //!   out of the top-level crate's `src/mitm.rs`, using `SO_ORIGINAL_DST`
 //!   to recover the intended destination after the REDIRECT.
-//!
-//! This skeleton only wires up clap, loads the startup config, prints
-//! a stub message, and exits successfully. No iptables work, no socket
-//! listening, no privilege drop.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use strait_agent::config::AgentConfig;
+use strait_agent::entrypoint;
 
 #[derive(Parser)]
 #[command(
@@ -35,17 +33,26 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
 
+    /// Override `entrypoint.agent_user` from the config file.
+    ///
+    /// Convenience for `--cap-add=NET_ADMIN` container invocations where
+    /// the user is passed via docker-run args rather than a mounted
+    /// config. Global so the same flag works with both subcommands.
+    #[arg(long, global = true, value_name = "USER")]
+    agent_user: Option<String>,
+
+    /// Override `proxy.port` from the config file.
+    #[arg(long, global = true, value_name = "PORT")]
+    proxy_port: Option<u16>,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Container entrypoint: install iptables rules, drop privileges, exec
-    /// the agent command.
-    ///
-    /// Not implemented in this skeleton (H-ICDP-2). Currently prints the
-    /// parsed config and exits.
+    /// Container entrypoint: install iptables rules, drop privileges,
+    /// and exec the agent command.
     Entrypoint {
         /// Command (and args) to exec after privilege drop.
         ///
@@ -80,29 +87,26 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {
-    let config = AgentConfig::load_optional(cli.config.as_deref())?;
+    let mut config = AgentConfig::load_optional(cli.config.as_deref())?;
+    // CLI overrides win over env + file so operators can tune a single
+    // invocation without editing the config file or exporting env vars.
+    if let Some(user) = cli.agent_user {
+        config.agent_user = if user.is_empty() { None } else { Some(user) };
+    }
+    if let Some(port) = cli.proxy_port {
+        if port == 0 {
+            anyhow::bail!("--proxy-port must be non-zero");
+        }
+        config.proxy_port = port;
+    }
 
     match cli.command {
-        Commands::Entrypoint { command } => {
-            println!("strait-agent: mode=entrypoint (skeleton; H-ICDP-2 fills this in)");
-            println!("  proxy_port       = {}", config.proxy_port);
-            println!(
-                "  agent_user       = {}",
-                config.agent_user.as_deref().unwrap_or("<unset>")
-            );
-            println!("  redirect_ports   = {:?}", config.redirect_ports);
-            println!("  host_socket      = {}", config.host_socket.display());
-            if command.is_empty() {
-                println!("  child command    = <none>");
-            } else {
-                println!("  child command    = {command:?}");
-            }
-        }
+        Commands::Entrypoint { command } => entrypoint::run(&config, &command),
         Commands::Proxy => {
             println!("strait-agent: mode=proxy (skeleton; H-ICDP-3 fills this in)");
             println!("  proxy_port       = {}", config.proxy_port);
             println!("  host_socket      = {}", config.host_socket.display());
+            Ok(())
         }
     }
-    Ok(())
 }

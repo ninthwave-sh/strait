@@ -107,6 +107,13 @@ jobs:
 
       - name: Build test image (feature installed into Debian slim)
         run: |
+          # `docker build` does not natively honor the devcontainer
+          # feature's `entrypoint` field -- that field is interpreted by
+          # the devcontainer CLI, which injects it into the built image.
+          # To exercise the same runtime behavior without a full
+          # `devcontainer build`, set ENTRYPOINT explicitly to the path
+          # the feature installs to. This matches what a real devcontainer
+          # runtime does and keeps the test lightweight.
           cat > /tmp/strait-feature-bundle/Dockerfile <<'DOCKERFILE'
           FROM debian:stable-slim
           RUN apt-get update \
@@ -123,6 +130,7 @@ jobs:
               POLICY=/etc/strait/policy.cedar \
               PROXY_PORT=9443 \
               /feature/install.sh
+          ENTRYPOINT ["/usr/local/share/strait/entrypoint.sh"]
           DOCKERFILE
           docker build -t strait-feature-test:latest /tmp/strait-feature-bundle
 
@@ -141,23 +149,25 @@ jobs:
 
       - name: Entrypoint wraps user command (happy path)
         run: |
-          # The entrypoint wrapper should exec strait-agent entrypoint,
-          # which installs iptables rules, drops privileges, and execs
-          # the user command as testagent.
+          # The feature's ENTRYPOINT (set above in the Dockerfile) runs
+          # entrypoint.sh, which execs `strait-agent entrypoint`. That
+          # verifies CAP_NET_ADMIN, installs iptables rules, drops
+          # privileges, and finally execs the container command.
           NAME="strait-feature-$$"
           docker run --rm -d --name "$NAME" --cap-add=NET_ADMIN \
             strait-feature-test:latest \
             sh -c 'id -u > /tmp/exec_uid && sleep 30'
           trap 'docker kill "$NAME" >/dev/null 2>&1 || true' EXIT
 
-          # Poll for /tmp/exec_uid to prove the child started.
+          # Poll for /tmp/exec_uid to be present and non-empty.
+          UID_OUT=""
           for _ in $(seq 1 30); do
-            if docker exec -u 0 "$NAME" cat /tmp/exec_uid > /tmp/exec_uid 2>/dev/null; then
+            if docker exec -u 0 "$NAME" test -s /tmp/exec_uid 2>/dev/null; then
+              UID_OUT="$(docker exec -u 0 "$NAME" cat /tmp/exec_uid | tr -d '[:space:]')"
               break
             fi
             sleep 0.5
           done
-          UID_OUT="$(cat /tmp/exec_uid | tr -d '[:space:]')"
           if [ "$UID_OUT" != "1001" ]; then
             echo "::error::exec'd child should run as testagent (uid 1001), got ${UID_OUT:-<empty>}"
             docker logs "$NAME" || true
@@ -197,6 +207,7 @@ jobs:
               POLICY=/tmp/policy.cedar \
               PROXY_PORT=18443 \
               /feature/install.sh
+          ENTRYPOINT ["/usr/local/share/strait/entrypoint.sh"]
           DOCKERFILE
           docker build -t strait-feature-custom:latest /tmp/strait-feature-custom
 
@@ -214,13 +225,14 @@ jobs:
             sh -c 'id -u > /tmp/exec_uid && sleep 30'
           trap 'docker kill "$NAME" >/dev/null 2>&1 || true' EXIT
 
+          UID_OUT=""
           for _ in $(seq 1 30); do
-            if docker exec -u 0 "$NAME" cat /tmp/exec_uid > /tmp/exec_uid_custom 2>/dev/null; then
+            if docker exec -u 0 "$NAME" test -s /tmp/exec_uid 2>/dev/null; then
+              UID_OUT="$(docker exec -u 0 "$NAME" cat /tmp/exec_uid | tr -d '[:space:]')"
               break
             fi
             sleep 0.5
           done
-          UID_OUT="$(cat /tmp/exec_uid_custom | tr -d '[:space:]')"
           if [ "$UID_OUT" != "1337" ]; then
             echo "::error::exec'd child should run as someoneelse (uid 1337), got ${UID_OUT:-<empty>}"
             docker logs "$NAME" || true

@@ -38,7 +38,8 @@ The `test` job is a required status check on `main` — PRs cannot merge until i
 - `src/replay.rs` — `strait test --replay` policy verification against observations
 - `src/explain.rs` — human-readable Cedar policy summaries
 - `src/diff.rs` — semantic Cedar policy diffing
-- `src/templates.rs` — built-in Cedar policy templates (GitHub, AWS, container sandbox)
+- `host/src/templates.rs` — built-in Cedar policy templates (GitHub, AWS, container sandbox)
+- `host/src/presets.rs` — devcontainer presets + server-side policy preset library (container sessions opt in via `RegisterContainer.preset_ids`)
 - `src/health.rs` — health check HTTP endpoint
 - `tests/integration.rs` — loopback integration tests (TLS echo server, no network)
 - `tests/launch_integration.rs` — Docker-based container lifecycle tests

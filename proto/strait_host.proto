@@ -72,6 +72,13 @@ message RegisterContainerRequest {
   string agent_version = 4;
   // Free-form labels the sandbox runtime wants to attach.
   repeated string labels = 5;
+  // Built-in policy preset ids the session opts into at registration
+  // time. Each known id causes the host to copy the preset's Cedar
+  // source into the rule store under the newly assigned session scope;
+  // unknown ids surface in the response `ignored_preset_ids` list
+  // instead of failing the call. Desktop shells and devcontainer
+  // features send this list; empty means "no presets".
+  repeated string preset_ids = 6;
 }
 
 message RegisterContainerResponse {
@@ -86,6 +93,13 @@ message RegisterContainerResponse {
   // Resume token the agent should pass to StreamRules. An empty value means
   // "start from snapshot".
   string rules_resume_token = 4;
+  // Subset of `preset_ids` from the request that the host actually
+  // loaded into the session's scope (known preset id, successful
+  // insert). Desktop clients use this to confirm what applied.
+  repeated string applied_preset_ids = 5;
+  // Subset of `preset_ids` the host did not recognise. The session is
+  // still created; the caller decides whether to warn the operator.
+  repeated string ignored_preset_ids = 6;
 }
 
 // ---- SubmitDecision ----

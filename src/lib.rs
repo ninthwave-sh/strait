@@ -17,9 +17,7 @@ pub mod health;
 pub mod mitm;
 pub mod observe;
 pub mod policy;
-pub mod presets;
 pub mod replay;
-pub mod templates;
 
 // The credential store (including AWS SigV4 signing) now lives in the
 // `strait-host` crate. Re-export the modules here so existing callers in
@@ -30,6 +28,14 @@ pub mod templates;
 // unused.
 pub use strait_host::credentials;
 pub use strait_host::sigv4;
+
+// Preset and template libraries moved into `strait-host` as part of
+// M-ONB-2 so the host control plane owns the bundled Cedar corpus and
+// can serve preset rules to registered sessions. Re-export here so the
+// existing CLI (`strait template`, `strait preset`) and any downstream
+// callers see the same public surface.
+pub use strait_host::presets;
+pub use strait_host::templates;
 
 pub fn ensure_rustls_crypto_provider() {
     static INIT: Once = Once::new();

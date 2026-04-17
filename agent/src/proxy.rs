@@ -40,11 +40,14 @@ use anyhow::Context as _;
 use rustls::server::Acceptor;
 use rustls::ClientConfig;
 use strait::ca::SessionCa;
+use strait::observe::{EventKind, ObservationEvent};
 use strait::policy::PolicyEngine;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 use tracing::{info, warn};
+
+use crate::observations::{NoopSink, ObservationSink};
 
 /// Placeholder host-control-plane RPC verdict.
 ///
@@ -134,6 +137,11 @@ pub struct ProxyConfig {
     pub ca_cert_out: PathBuf,
     /// Host-control-plane RPC client. Defaults to [`PromptDenyClient`].
     pub host_rpc: Arc<dyn HostRpcClient>,
+    /// Observation sink the proxy reports each handled request to. Defaults
+    /// to [`NoopSink`] so the proxy works correctly without a host. In
+    /// production, wire a [`crate::observations::HostStreamingSink`] that
+    /// forwards events to `strait-host`.
+    pub observation_sink: Arc<dyn ObservationSink>,
     /// Test-only override: when `Some`, the proxy dials this address
     /// instead of the one recovered from `SO_ORIGINAL_DST`. Production
     /// code leaves this `None`.
@@ -154,6 +162,7 @@ impl ProxyConfig {
             policy_path,
             ca_cert_out,
             host_rpc: Arc::new(PromptDenyClient),
+            observation_sink: Arc::new(NoopSink),
             test_upstream_override: None,
             test_upstream_tls: None,
             max_body_size: 10 * 1024 * 1024,
@@ -167,6 +176,7 @@ pub struct ProxyState {
     pub session_ca: SessionCa,
     pub policy: PolicyEngine,
     pub host_rpc: Arc<dyn HostRpcClient>,
+    pub observation_sink: Arc<dyn ObservationSink>,
     pub test_upstream_override: Option<SocketAddr>,
     pub test_upstream_tls: Option<Arc<ClientConfig>>,
     pub max_body_size: usize,
@@ -179,6 +189,7 @@ pub async fn run(cfg: ProxyConfig) -> anyhow::Result<()> {
         cfg.policy_path.clone(),
         cfg.ca_cert_out.clone(),
         cfg.host_rpc.clone(),
+        cfg.observation_sink.clone(),
         cfg.test_upstream_override,
         cfg.test_upstream_tls.clone(),
         cfg.max_body_size,
@@ -195,10 +206,12 @@ pub async fn run(cfg: ProxyConfig) -> anyhow::Result<()> {
 
 /// Build the shared proxy state outside of `run` so tests can construct
 /// the pieces individually (custom listener, injected RPC client).
+#[allow(clippy::too_many_arguments)]
 pub fn build_state(
     policy_path: PathBuf,
     ca_cert_out: PathBuf,
     host_rpc: Arc<dyn HostRpcClient>,
+    observation_sink: Arc<dyn ObservationSink>,
     test_upstream_override: Option<SocketAddr>,
     test_upstream_tls: Option<Arc<ClientConfig>>,
     max_body_size: usize,
@@ -219,6 +232,7 @@ pub fn build_state(
         session_ca,
         policy,
         host_rpc,
+        observation_sink,
         test_upstream_override,
         test_upstream_tls,
         max_body_size,
@@ -342,6 +356,7 @@ where
     let (read_half, mut write_half) = tokio::io::split(tls);
     let mut reader = BufReader::new(read_half);
 
+    let request_start = std::time::Instant::now();
     let request = match read_http_request(&mut reader, state.max_body_size).await? {
         Some(req) => req,
         None => {
@@ -406,6 +421,14 @@ where
     };
 
     if !allowed {
+        emit_network_observation(
+            &state.observation_sink,
+            sni_host,
+            &request.method,
+            &request.path,
+            "deny",
+            request_start,
+        );
         let body = strait::policy::deny_response_body(
             sni_host,
             &request.method,
@@ -420,6 +443,18 @@ where
         let _ = write_half.shutdown().await;
         return Ok(());
     }
+
+    // Event is emitted as soon as the verdict is known so downstream
+    // consumers (desktop UI, watch CLIs) see the decision regardless of
+    // whether the upstream eventually fails mid-forward.
+    emit_network_observation(
+        &state.observation_sink,
+        sni_host,
+        &request.method,
+        &request.path,
+        "allow",
+        request_start,
+    );
 
     // Forward upstream. In tests we dial the echo-server address and use
     // a NoVerify client config; in production we dial `original_dst` with
@@ -461,6 +496,39 @@ where
     relay_upstream_response(&request.method, &mut upstream_reader, &mut write_half).await?;
     let _ = write_half.shutdown().await;
     Ok(())
+}
+
+/// Ship a `NetworkRequest` observation up to the configured sink.
+///
+/// Lives here (rather than inline) so the decision side and the
+/// forwarded-allow side can share the exact same payload shape. The
+/// timestamp uses the common RFC3339 millisecond format produced by
+/// `src/observe.rs` so downstream tooling does not need to handle two
+/// variants.
+fn emit_network_observation(
+    sink: &Arc<dyn ObservationSink>,
+    host: &str,
+    method: &str,
+    path: &str,
+    decision: &str,
+    start: std::time::Instant,
+) {
+    let latency_us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+    let event = ObservationEvent {
+        version: strait::observe::SCHEMA_VERSION,
+        timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        session: None,
+        event: EventKind::NetworkRequest {
+            method: method.to_string(),
+            host: host.to_string(),
+            path: path.to_string(),
+            decision: decision.to_string(),
+            latency_us,
+            enforcement_mode: String::new(),
+            blocked: None,
+        },
+    };
+    sink.emit(event);
 }
 
 fn default_upstream_tls_config() -> Arc<ClientConfig> {

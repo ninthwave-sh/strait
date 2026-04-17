@@ -28,7 +28,7 @@ use strait_proto::v1::{
     FetchCredentialRequest, FetchCredentialResponse, HeaderCredential, HeartbeatRequest,
     HeartbeatResponse, InjectedCredential, ObservationEvent, RegisterContainerRequest,
     RegisterContainerResponse, RuleEvent, StreamObservationsAck, StreamRulesRequest,
-    SubmitDecisionRequest, SubmitDecisionResponse, Verdict,
+    SubmitDecisionRequest, SubmitDecisionResponse, SubscribeObservationsRequest, Verdict,
 };
 use tempfile::tempdir;
 use tokio::net::UnixStream;
@@ -83,11 +83,13 @@ async fn connect_unix(path: PathBuf) -> StraitHostClient<Channel> {
 
 fn test_config(sock: PathBuf, port: u16) -> HostConfig {
     let db = sock.with_extension("rules.db");
+    let obs = sock.with_extension("observations.jsonl");
     HostConfig {
         unix_socket: sock,
         tcp_listen: format!("127.0.0.1:{port}").parse().unwrap(),
         socket_mode: DEFAULT_SOCKET_MODE,
         rules_db: db,
+        observations_log: obs,
     }
 }
 
@@ -327,14 +329,18 @@ async fn default_service_returns_unimplemented_for_deferred_rpcs() {
         .expect_err("empty session_id must be rejected");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
-    // StreamObservations: client-streaming. Empty outbound stream; server
-    // returns Unimplemented immediately.
+    // StreamObservations: client-streaming. With the observation pipeline
+    // live (M-HCP-5), an empty outbound stream returns a well-formed ack
+    // with zero events accepted. The transport still has to work for the
+    // ack to arrive at all, which is what this round-trip proves.
     let outbound = tokio_stream::iter(Vec::<ObservationEvent>::new());
-    let err = client
+    let ack = client
         .stream_observations(outbound)
         .await
-        .expect_err("should be unimplemented");
-    assert_eq!(err.code(), tonic::Code::Unimplemented);
+        .expect("stream_observations should round-trip on the default service")
+        .into_inner();
+    assert_eq!(ack.accepted, 0);
+    assert_eq!(ack.rejected, 0);
 
     shutdown.trigger();
     let _ = timeout(Duration::from_secs(2), server).await;
@@ -445,6 +451,21 @@ impl StraitHost for EchoHost {
             accepted,
             rejected: 0,
         }))
+    }
+
+    type SubscribeObservationsStream = std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<ObservationEvent, Status>> + Send + 'static>,
+    >;
+
+    async fn subscribe_observations(
+        &self,
+        _req: Request<SubscribeObservationsRequest>,
+    ) -> Result<Response<Self::SubscribeObservationsStream>, Status> {
+        let empty: Self::SubscribeObservationsStream = Box::pin(tokio_stream::iter(Vec::<
+            Result<ObservationEvent, Status>,
+        >::new(
+        )));
+        Ok(Response::new(empty))
     }
 
     async fn heartbeat(
@@ -558,18 +579,21 @@ async fn echo_service_round_trips_every_rpc() {
             observation_id: "o1".into(),
             observed_at_unix_ms: 1,
             raw_json: "{}".into(),
+            container_registration_id: "c1".into(),
         },
         ObservationEvent {
             session_id: reg.session_id.clone(),
             observation_id: "o2".into(),
             observed_at_unix_ms: 2,
             raw_json: "{}".into(),
+            container_registration_id: "c1".into(),
         },
         ObservationEvent {
             session_id: reg.session_id.clone(),
             observation_id: "o3".into(),
             observed_at_unix_ms: 3,
             raw_json: "{}".into(),
+            container_registration_id: "c1".into(),
         },
     ]);
     let ack = client
@@ -643,6 +667,17 @@ async fn hold_and_resume_honours_client_timeout() {
             &self,
             _req: Request<Streaming<ObservationEvent>>,
         ) -> Result<Response<StreamObservationsAck>, Status> {
+            Err(Status::unimplemented("not needed"))
+        }
+
+        type SubscribeObservationsStream = std::pin::Pin<
+            Box<dyn futures_core::Stream<Item = Result<ObservationEvent, Status>> + Send + 'static>,
+        >;
+
+        async fn subscribe_observations(
+            &self,
+            _req: Request<SubscribeObservationsRequest>,
+        ) -> Result<Response<Self::SubscribeObservationsStream>, Status> {
             Err(Status::unimplemented("not needed"))
         }
 

@@ -31,6 +31,14 @@ pub const DEFAULT_SOCKET_MODE: u32 = 0o600;
 /// relative path rather than panicking.
 pub const DEFAULT_RULES_DB_RELATIVE: &str = ".local/share/strait/rules.db";
 
+/// Default on-disk path for the observations log, relative to `$HOME`.
+///
+/// The full default path is built by [`default_observations_path`] so a
+/// missing `$HOME` falls back to a relative path rather than panicking.
+/// The file is append-only JSONL and is the canonical audit trail of every
+/// observation the host accepts over `StreamObservations` (M-HCP-5).
+pub const DEFAULT_OBSERVATIONS_RELATIVE: &str = ".local/share/strait/observations.jsonl";
+
 /// Resolved host configuration with defaults filled in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
@@ -42,6 +50,8 @@ pub struct HostConfig {
     pub socket_mode: u32,
     /// Filesystem path of the persistent rule store (SQLite).
     pub rules_db: PathBuf,
+    /// Filesystem path of the observations JSONL log (M-HCP-5).
+    pub observations_log: PathBuf,
 }
 
 impl HostConfig {
@@ -54,6 +64,7 @@ impl HostConfig {
                 .expect("DEFAULT_TCP_LISTEN must be a valid SocketAddr"),
             socket_mode: DEFAULT_SOCKET_MODE,
             rules_db: default_rules_db_path(),
+            observations_log: default_observations_path(),
         }
     }
 
@@ -90,6 +101,9 @@ impl HostConfig {
         if let Some(path) = file.rules_db {
             self.rules_db = path;
         }
+        if let Some(path) = file.observations_log {
+            self.observations_log = path;
+        }
         Ok(())
     }
 }
@@ -103,6 +117,7 @@ struct HostConfigFile {
     tcp_listen: Option<String>,
     socket_mode: Option<u32>,
     rules_db: Option<PathBuf>,
+    observations_log: Option<PathBuf>,
 }
 
 /// Return the default path for `host.toml`. On Unix this is
@@ -126,6 +141,17 @@ pub fn default_rules_db_path() -> PathBuf {
     }
 }
 
+/// Return the default path for the observations JSONL log. Prefers
+/// `$HOME/.local/share/strait/observations.jsonl`; if `$HOME` is not set
+/// falls back to `./observations.jsonl` so the binary can still start in
+/// unusual environments.
+pub fn default_observations_path() -> PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(DEFAULT_OBSERVATIONS_RELATIVE),
+        None => PathBuf::from("observations.jsonl"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +166,7 @@ mod tests {
         );
         assert_eq!(cfg.socket_mode, DEFAULT_SOCKET_MODE);
         assert_eq!(cfg.rules_db, default_rules_db_path());
+        assert_eq!(cfg.observations_log, default_observations_path());
     }
 
     #[test]
@@ -165,6 +192,7 @@ mod tests {
             tcp_listen = "127.0.0.1:9999"
             socket_mode = 0o640
             rules_db = "/tmp/strait/rules.db"
+            observations_log = "/tmp/strait/observations.jsonl"
             "#,
         )
         .unwrap();
@@ -175,6 +203,10 @@ mod tests {
         );
         assert_eq!(cfg.socket_mode, 0o640);
         assert_eq!(cfg.rules_db, PathBuf::from("/tmp/strait/rules.db"));
+        assert_eq!(
+            cfg.observations_log,
+            PathBuf::from("/tmp/strait/observations.jsonl")
+        );
     }
 
     #[test]

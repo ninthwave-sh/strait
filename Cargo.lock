@@ -3141,6 +3141,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "caps",
+ "chrono",
  "clap",
  "http 1.4.0",
  "hyper-util",
@@ -3160,6 +3161,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "webpki-roots 1.0.6",
 ]
 
@@ -3184,6 +3186,8 @@ dependencies = [
  "prost",
  "rusqlite",
  "serde",
+ "serde_json",
+ "strait",
  "strait-agent",
  "strait-proto",
  "tempfile",

@@ -122,10 +122,14 @@ mod tests {
             observation_id: "obs-1".into(),
             observed_at_unix_ms: 3,
             raw_json: "{}".into(),
+            container_registration_id: "container-1".into(),
         });
         rt(StreamObservationsAck {
             accepted: 10,
             rejected: 0,
+        });
+        rt(SubscribeObservationsRequest {
+            session_id: "sess-1".into(),
         });
 
         rt(HeartbeatRequest {

@@ -1,161 +1,291 @@
-# Strategy: strait and the devcontainer standard
+# Strategy: strait as a sandbox-native network policy layer
+
+**Last updated:** 2026-04-17
+**Status:** APPROVED
+**Supersedes:** previous revision (2026-04-16)
 
 ## Context
 
-The refocus plan (`.opencode/plans/1776234011325-kind-engine.md`) commits strait to a container-scoped trust boundary as the product's moat: session-local CA inside the container only, all egress forced through a proxy, Cedar policy covering network + fs + proc in one model. Phase-1 work items (H-CSM-3..7) are about turning that boundary into a usable permission workflow: blocked-request explanations, live deny/allow-once/allow-session/persist decisions, a local control service, and a desktop control plane.
+The April 2026 refocus committed strait to network policy for containerized AI
+agents. This revision locks in three decisions that were still open:
 
-Meanwhile, Microsoft's devcontainer spec (https://containers.dev/) is the established format for "what does my project need to run in a container?" The Claude Code docs (https://code.claude.com/docs/en/devcontainer) bless a reference devcontainer setup with an iptables-based firewall (domain allowlist via `init-firewall.sh`) as the sanctioned way to sandbox an agent in a container.
+1. Where the data plane (proxy + interception) lives.
+2. How in-container tools reach the proxy.
+3. What the primary install surface is.
 
-That is the wedge. Devcontainer plus iptables answers part of the problem; strait answers the harder part. This document locks the position: strait sits inside the devcontainer ecosystem rather than parallel to it, and narrows its product surface to network egress.
+The trigger was a closer read of three reference implementations that share
+the problem space: `agentic-devcontainer` (opensnitch-in-container), `opensnitch`
+(Linux application firewall), and `LuLu` (macOS outbound firewall). Every one
+of them intercepts traffic at the kernel or system-extension layer and treats
+the proxy-env-var convention as insufficient on its own.
+
+That read changes strait's architecture in one important way: the proxy moves
+into the container and relies on iptables REDIRECT for transparency, while
+the control plane stays on the host and fans out across many containers.
 
 ## Thesis
 
-strait should be compatible with devcontainer, not a competitor to it. In the devcontainer world, strait should narrow to network egress as its primary concern.
+Strait is the live, granular network policy layer for AI agent sandboxes.
+The thing it sells is the UX and the granularity -- observe-then-enforce,
+live allow/deny with session and persist durations, rules scoped by HTTP
+method and path and agent identity. "The agent cannot bypass it" is expected
+baseline, not the headline.
 
-The two specs answer different questions:
+Two design laws follow from that:
 
-| Question | Answer |
-|---|---|
-| What image, tools, env, and mounts does my project need? | devcontainer.json |
-| What is my project allowed to do over the network once it runs? | strait |
+1. **No bypass paths.** The proxy is not reachable only by a polite
+   `HTTPS_PROXY` environment variable. Every outbound TCP flow from the
+   agent is forced through the proxy by the kernel, regardless of whether
+   the tool making the request cooperates.
+2. **Granularity down to the request.** Cedar rules address HTTP method,
+   host, path, and agent identity. That requires HTTP-layer inspection,
+   which means keeping MITM. Connection-level (SNI-only) enforcement is
+   rejected as a viable option; it collapses the rule surface that makes
+   the product distinctive.
 
-Devcontainer owns the environment contract. strait owns the network permission contract. The integration goal is that a user with an existing `.devcontainer/devcontainer.json` can adopt strait without rewriting their config, and a user adopting strait can publish a devcontainer.json that works in VS Code, Codespaces, and GitHub without ceremony.
+## Architecture
 
-### Narrowing to network-only (inside devcontainer)
+```
+Host                                     Container (Linux namespace)
++---------------------------------+     +----------------------------------+
+| strait-host (control plane)     |     | strait-agent (data plane)        |
+|                                 |     |                                  |
+|  - Rule store                   |<--->|  - MITM proxy (root)             |
+|  - Decisions (allow/deny/persist| uds |  - iptables REDIRECT entrypoint  |
+|  - Credential store             |     |  - Registers with host on start  |
+|  - Desktop UI                   |     |                                  |
+|  - Multi-container registry     |     |   (agent runs as non-root user;  |
+|                                 |     |    cannot touch proxy or rules)  |
++---------------------------------+     +----------------------------------+
+         ^                                         ^
+         |  one host <-> many containers           |
+         |                                         |
+         +------- Unix socket, root-only in -------+
+```
 
-The current unified-policy framing (`http:` + `fs:` + `proc:`) duplicates work the container boundary already does:
+### Data plane: inside the container
 
-- Filesystem access is determined by the devcontainer image, `mounts`, and `workspaceFolder`. If `/secrets` is not mounted there is nothing to authorize. If it is mounted, Cedar `fs:read` rules are a second layer over a first layer the user already configured.
-- Process execution is determined by the image. If `curl` is not installed there is nothing to authorize. Cedar `proc:exec` rules are again a second layer.
-- Network egress is genuinely different. TLS hides egress from the host kernel. The devcontainer spec has no native story for network policy. Claude Code's reference setup bolts on iptables (domain-granular, coarse, restart-to-edit).
+The proxy runs inside the container as root. At entrypoint:
 
-Network egress is the exfiltration vector that matters and the one the container boundary does not solve. So in the devcontainer world, strait's value is concentrated on network policy, and the other two domains are dropped.
+1. The entrypoint starts as root.
+2. It installs iptables rules that `REDIRECT` all outbound TCP (default:
+   ports 80, 443, plus configured extras) to `127.0.0.1:<proxy_port>`.
+3. It starts the strait MITM proxy bound to that port, owned by root.
+4. It drops to the configured non-root user and `exec`s the agent command.
 
-### What this simplifies
+The agent never runs as root and cannot modify iptables, cannot kill the
+proxy, and cannot read the proxy's config or its socket to the host. The
+CA trust bundle, policy files, and the host-facing Unix socket are all
+read-only bind mounts owned by root inside the container.
 
-- Templates and onboarding: one domain to teach, not three.
-- Observation and generation: only HTTP requests need capture and wildcard-collapsing.
-- Policy mental model: "what APIs can this agent reach?" is a question users already ask; "what files can this agent read?" is a question the container already answers.
-- Config surface: `[container]` ImageSpec in `src/config.rs` goes away. devcontainer.json is the image source.
-- Pitch: "Cedar-powered network policy for devcontainers, with a desktop control plane" is sharper than "unified agent policy platform" for an audience that already bought the container model.
+The trust boundary is recast from "container vs host" to "proxy-as-root
+vs agent-as-user, inside the same namespace." That is weaker than full
+namespace isolation, but it is the right boundary for this product: the
+threat model is a prompt-injected agent that the user is intentionally
+running, not a malicious container trying to break out.
 
-### What stays
+### Control plane: on the host, always
 
-- MITM pipeline, session-local CA, `--network=none` plus Unix-socket gateway, credential injection: all the hard and distinctive infra.
-- Control plane (H-CSM-3, H-CSM-4, H-CSM-5), desktop shell (M-CSM-6), onboarding (M-CSM-7): unchanged. Every Phase-1 work item is already network-focused.
-- Cedar policy engine: still the right tool for expressive network rules (method, host, path, identity). Narrower entity model, same engine.
+The host runs a long-lived `strait-host` process. It owns:
 
-### What goes
+- The rule store and the audit log.
+- Decision flow -- when an in-container proxy sees a new request, it asks
+  the host for a verdict. The host holds the request (hold-and-resume),
+  surfaces the decision to the desktop UI, and responds with allow, deny,
+  allow-once, allow-session, or persist.
+- The credential store. On allow, the host supplies the credential that
+  the in-container proxy injects into the outbound request. Credentials
+  never exist on disk inside the container.
+- The container registry. Multiple containers connect to the same host
+  control plane. The UI surfaces per-session panes, not per-host views.
+- The desktop shell (the existing M-CSM-6 Electron app).
 
-- `fs:` and `proc:` Cedar domains are dropped. The devcontainer already answers those questions. Carrying a parallel enforcement layer costs complexity with no marginal value inside the target audience.
-- Codebase consequences: fs/proc actions removed from the entity schema in `src/policy.rs`; the mount-derivation pipeline that reads `fs:` rules and turns them into bind mounts is deleted; templates, examples, and docs that reference these domains are removed or rewritten.
-- Generation, observation, and replay narrow to HTTP only. No fs or exec tracing, no mount inference.
-- Standalone `strait launch` without a devcontainer still works (proxy plus MITM plus network-none boundary are intact), but it requires a user-provided image and the user is responsible for the image's fs/proc shape. strait does not layer anything on top.
+This is the piece that makes strait fit orchestration layers like
+`sandcastle`. A host strait-host can serve many agent sandboxes in
+parallel -- the sandboxes are provisioned by whatever orchestrator the
+user prefers, and strait is the policy layer they share.
 
-### Positioning consequence
+### Host <-> container transport
 
-Claude Code's iptables firewall is the status quo; strait replaces it with a policy engine, an observe workflow, live decisions, and a desktop UX. Everything else in the devcontainer config (image, features, lifecycle hooks, editor customizations, mounts) is unaffected and stays the user's problem, expressed in devcontainer.json.
+A Unix domain socket is bind-mounted from host into container at
+`/run/strait/host.sock`. Inside the container it is owned by `root:root`
+with mode `0600`. The agent user has no read or connect permission.
 
-## What strait can honor from devcontainer.json
+The in-container proxy opens the socket on startup, registers the
+container's session id, and keeps a long-lived gRPC channel to the host
+control plane. Every new Cedar evaluation that returns "prompt" (no cached
+verdict) rides that channel as a `SubmitDecision` RPC.
 
-Fields that map cleanly onto strait's model:
+### Interception mechanism
 
-- `image` / `build.dockerfile` / `build.context`: replaces the ad-hoc `[container].base_image` / `apt` / `npm` / `pip` generation in `src/config.rs`. Devcontainer builds become the canonical image source.
-- `containerEnv`: merged with strait's session-specific env (proxy socket path, CA bundle path) at entrypoint.
-- `postCreateCommand` / `onCreateCommand`: chained after strait's CA trust injection, before the agent command.
-- `remoteUser`: strait learns to run the agent as a non-root user.
-- `workspaceFolder`: replaces the hardcoded `/workspace`.
-- `features`: strait itself can ship as a feature (`ghcr.io/ninthwave-io/strait`) so users add one block to enable it.
+iptables REDIRECT is the primary mechanism. Requirements:
 
-## What strait's security model rejects or translates
+- Container must have `CAP_NET_ADMIN` at entrypoint time so it can install
+  the rules. The capability is dropped before the agent user takes over.
+- Works on Linux. On macOS, users run Docker Desktop or OrbStack, both of
+  which run a Linux VM; the container runs under Linux kernel semantics,
+  so REDIRECT works there too.
+- The proxy reads the original destination via `SO_ORIGINAL_DST` on the
+  redirected TCP connection, then MITM-terminates TLS using the session-
+  local CA.
 
-Under the narrowed thesis, mounts become the user's problem (expressed in devcontainer.json), not strait's. What remains:
+eBPF-based socket redirection is in scope as a future mechanism, not a
+v1 requirement. iptables REDIRECT is well understood, ubiquitous, and
+enough for the wedge.
 
-- `forwardPorts`: strait uses `--network=none` plus a Unix-socket gateway. Inbound ports can't be forwarded directly. Two options: translate into a Cedar `http:` allow rule for outbound equivalents, or warn and ignore with a clear message about the network model.
-- `mounts`: honored as-is. devcontainer.json owns the filesystem story. strait only inspects mounts to surface them in diagnostics ("this agent has read access to /secrets because your devcontainer.json mounts it"). No Cedar `fs:` rules required.
-- `runArgs` / `capAdd` / `privileged`: reject privileged requests with a clear error. strait's network isolation depends on non-privileged containers with `--network=none`; `--privileged` would let the agent bypass both.
+### What this is not
 
-Principle: devcontainer describes environment; strait enforces network egress. strait intervenes only where the container boundary is blind (TLS-terminated egress) and delegates everywhere else.
+- Not a connection-level firewall. strait MITMs. Users who want only
+  SNI-level decisions should use one of the reference implementations.
+- Not a container orchestrator. strait does not launch containers any
+  more. `strait launch` is removed as a user-facing command.
+- Not Linux-kernel-only. The host control plane runs on macOS and Linux;
+  the data plane runs inside a Linux container regardless of host OS.
+- Not privileged on the host. The control plane is a normal user process.
+  Only the in-container data plane needs `CAP_NET_ADMIN`, and only at
+  startup.
 
-## What to learn from Claude Code's devcontainer
+## Install surface
 
-What Claude Code does well that strait should match or exceed:
+### Primary: devcontainer feature
 
-- Zero-config first run. The user clones a repo, opens in VS Code, and it Just Works. strait's `generate` plus `--observe` workflow is more powerful but higher ceremony. Presets (M-CSM-7 onboarding) should close that gap.
-- Legible threat model. The docs are explicit about what the firewall does and does not prevent. strait's onboarding copy needs the same discipline.
-- One-file config. Users edit `init-firewall.sh` directly. strait's equivalent is Cedar policy; the desktop control plane (M-CSM-6) and `persist` action (H-CSM-4) are what make that editable without shell scripts.
+Most users adopt strait by adding a block to `devcontainer.json`:
 
-Where Claude Code's model falls short and where strait's wedge is real:
+```json
+"features": {
+  "ghcr.io/ninthwave-io/strait": {
+    "host": "unix:///var/run/strait/host.sock",
+    "agent_user": "node",
+    "policy": "policy.cedar"
+  }
+}
+```
 
-- iptables is domain-granular, not request-granular. No per-path, per-method, per-identity rules.
-- No observe-then-enforce workflow. Users guess at allowlist entries and iterate by breaking the agent.
-- No live decisions. A blocked request means restart the container with edited firewall rules.
-- No audit trail beyond iptables logs.
-- No desktop UX. Everything happens in a terminal.
+The feature ships the in-container `strait-agent` binary, an entrypoint
+wrapper that installs iptables rules and drops privileges, and the
+read-only mount of the session CA.
 
-Every one of those gaps maps onto an already-planned strait work item. Devcontainer compatibility is not new scope; it is repackaging the Phase-1 roadmap for an audience that already lives in devcontainer.json.
+The host strait-host process must already be running; the feature does
+not start it. Installing the host control plane is a one-time action
+(Homebrew cask on macOS, apt or binary install on Linux).
 
-## Recommended phasing
+### Secondary: bring-your-own-sandbox
 
-Phase 0: this document. Lock the thesis and the positioning.
+For users who are not on devcontainer -- orchestrators like sandcastle,
+hand-rolled Docker setups, Podman rootless, CI runners -- strait is a
+small static binary plus a documented entrypoint pattern:
 
-Phase 1: public comparison doc (`docs/devcontainer.md`). Explains where strait fits relative to devcontainer. Walks through the Claude Code iptables setup and shows the equivalent strait setup side by side. Documents incompatibilities (forwardPorts, privileged runArgs) up front.
+```
+1. Copy strait-agent into your image.
+2. Make your entrypoint run: strait-agent entrypoint -- <your cmd>
+3. Grant CAP_NET_ADMIN at startup (drop it in the wrapper).
+4. Bind-mount /var/run/strait/host.sock from host.
+```
 
-Phase 2: narrow the codebase to network-only (drop `fs:` / `proc:` Cedar domains and the mount-derivation pipeline); add a devcontainer.json reader; wire `strait launch --devcontainer <path>` through the existing launch flow; rewrite user-facing docs (README, CLAUDE.md, unified-agent-policy-platform design) for the narrower framing.
+This is the surface that lets strait plug into any agent sandbox. The
+contract with the host control plane is the gRPC protocol on the
+bind-mounted socket; everything above that is the user's concern.
 
-Phase 3: ship as a devcontainer feature (`ghcr.io/ninthwave-io/strait`) so users add one block to their devcontainer.json and get strait plus proxy plus desktop-pairing out of the box. Depends on the local control service (H-CSM-5) being stable.
+### Removed: `strait launch`
 
-## Positioning
+The CLI command that currently launches containers and wires up a host-
+side proxy is removed in this phase. It conflates container orchestration
+with policy, and carrying it forward means carrying the host-side proxy
+path -- which is exactly the architecture being removed. Users who need
+to launch containers will use their existing tooling (docker, podman,
+compose, devcontainer CLI, sandcastle).
 
-One-sentence product claim, post-compat and post-narrowing:
+## Migration posture
 
-> strait is the network policy layer for devcontainers. Replace your iptables allowlist with a Cedar policy engine, live request-level decisions, and a desktop control plane.
+Clean cut, pre-v1, no deprecation window. Strait is pre-users. The work
+items below delete the old data plane rather than flagging it.
 
-This framing:
+## Phasing
 
-1. Names the thing strait replaces (iptables plus init-firewall.sh).
-2. Names the audience (anyone running Claude Code or VS Code in a devcontainer).
-3. Does not require users to learn a new runtime or abandon their existing config.
-4. Scopes the promise. "Network policy" is legibly smaller than "unified agent policy platform," which trades surface area for credibility.
+### Phase 0 (this document)
 
-## Decisions
+Lock the thesis: proxy inside container, iptables REDIRECT for
+transparency, control plane on host, devcontainer feature as primary
+install, `strait launch` removed.
 
-1. Desktop control plane stays the primary client surface. Not a VS Code extension. Users are moving away from VS Code, and devcontainers run outside VS Code (Codespaces, JetBrains, CLI, headless). Tying strait's UX to VS Code would narrow the audience in the wrong direction. The desktop shell (M-CSM-6) remains the Phase-1 target.
-2. Host-side proxy stays on the host, always. If strait ships as a devcontainer feature, the feature registers the container with an already-running host-side strait daemon; it does not run the proxy inside the container. Running the proxy inside would expose it to tampering by whatever is executing inside the container. The entire trust boundary exists to prevent that.
-3. Recommend removing iptables when adopting strait. Both can coexist without harm, but the comparison doc takes a clear position: once strait is in place, iptables plus init-firewall.sh is redundant and strictly less expressive. Remove it.
-4. Clean cut on fs/proc. No backwards compat, no migration path, no legacy references. strait is pre-v1, pre-launch, pre-users. The narrowing is a decisive rewrite: fs/proc actions are removed from the entity schema, parsers, templates, and docs. No deprecation warnings. No migration tool. No "legacy" mentions in the codebase or README.
+### Phase 1: in-container data plane
 
-## Prior art observations (2026-04-16)
+- Replace the host-side proxy + in-container gateway with a single
+  in-container `strait-agent` binary that embeds the MITM proxy and
+  the iptables-setting entrypoint.
+- Collapse the current `gateway` crate into `strait-agent`; it becomes
+  the shipping in-container binary.
+- Delete `src/launch.rs` and the `strait launch` CLI command. Move any
+  still-needed logic into the host control plane.
+- Rewrite container-side bring-up to use iptables REDIRECT instead of
+  `HTTPS_PROXY` env vars.
+- Drop `--network=none` + Unix-socket gateway. The container gets real
+  Linux networking; the kernel redirects everything through the proxy.
 
-Surveyed the landscape of interactive network firewalls (Linux application-level firewalls, macOS outbound firewalls) and agent-sandbox devcontainers to inform strait's decision-flow and desktop-UX design.
+### Phase 2: host control plane
 
-### Market validation
+- Introduce `strait-host`, a long-lived process with a gRPC API.
+- Move the rule store, decision flow, and credential store behind that
+  API. Audit log becomes a tail of decisions from the host.
+- Retarget the existing control protocol (H-CSM-3 hold-and-resume,
+  H-CSM-4 persist action) at the host control plane rather than a
+  per-container local service.
+- Rescope H-CSM-5 from "local control service" to "host control service
+  with multi-container session management."
+- Desktop control plane (M-CSM-6) connects to `strait-host` instead of
+  a single in-container daemon.
 
-Existing devcontainer sandboxes already combine deny-by-default firewalls with interactive approval prompts. The common pattern: an eBPF or kernel-level firewall inside the container, a TUI or desktop prompt for each new outbound connection, and JSON rules persisted to the host for team commits.
+### Phase 3: devcontainer feature + bring-your-own-sandbox
 
-strait's architectural advantages over this pattern:
-- Proxy on host (tamper-proof) vs firewall inside container (agent can interfere)
-- Cedar policy (method/host/path/identity) vs regex rules (domain-only)
-- Desktop control plane vs terminal TUI
-- MITM at HTTP layer (request inspection) vs connection-level filtering
-- Observe-then-enforce workflow vs guess-and-iterate
+- Publish `ghcr.io/ninthwave-io/strait` as a devcontainer feature.
+- Entrypoint wrapper installs iptables rules, starts proxy as root,
+  drops to `remoteUser` before `exec`ing the agent command.
+- Document the bring-your-own-sandbox install path with a working
+  sandcastle example.
+- Retire the existing `examples/claude-code/` flow in favor of a
+  devcontainer.json example that uses the feature.
 
-### Decision architecture: hold-and-resume
+### Phase 4: onboarding and presets
 
-Established application-level firewalls on both Linux and macOS use hold-and-resume for interactive decisions: the actual network flow is paused while the user is prompted. Packets are held in a kernel queue or the filter framework issues a pause verdict. The connection does not fail -- it waits. A configurable timeout (typically 15-30s) defaults to deny on expiry.
+- Rescope M-CSM-7 onboarding around "first session through the
+  devcontainer feature" rather than `strait launch`.
+- Host control plane gets an install flow (Homebrew cask on macOS,
+  systemd service on Linux, or run-from-terminal for dogfood).
+- Presets become host-side defaults that any newly registered container
+  can adopt.
 
-The daemon-UI split uses gRPC bidirectional streaming as the IPC protocol: heartbeat, blocking decision request, registration, and a streaming channel for config updates. The daemon blocks on the decision RPC; the UI responds with a rule object (action + duration + conditions).
+## What stays from previous revisions
 
-This directly informs H-CSM-3 (hold-and-resume, not block-and-retry) and H-CSM-5 (gRPC control service).
+- Cedar policy engine, HTTP-only action model, observe-then-enforce
+  workflow.
+- Session-local CA and TLS termination.
+- Credential broker. Moves from in-proxy to host control plane; injected
+  by the in-container proxy using a credential handed down over the
+  host socket on allow.
+- Desktop control plane as the primary client surface. Not a VS Code
+  extension. Users ship agents across many IDEs and many sandboxes.
+- No fs or proc Cedar domains. Devcontainer owns filesystem shape;
+  strait stays scoped to network.
+- No backwards compat with the host-side-proxy architecture. Removed.
 
-### Desktop UX: decision flow and tray integration
+## What this closes
 
-Established macOS outbound firewalls demonstrate polished patterns:
-- Pause-controlled alerts: the alert controls whether the flow proceeds, not just informational
-- Structured request details with expandable info
-- Duration options on decision: once / session / always / custom TTL
-- Related-flow batching: multiple connections to the same destination batch into one decision
-- Light-touch status bar presence with quick-access menu
-- Countdown timer with auto-deny on expiry
+Two open questions the previous revision left behind:
 
-This directly informs M-CSM-6 (desktop control plane shell).
+1. **How do in-container tools find the proxy without `HTTPS_PROXY`?**
+   Answer: they do not find it. The kernel redirects every outbound
+   TCP flow through the proxy. Tools that ignore `HTTPS_PROXY` cannot
+   bypass strait; tools that honor it do not need to set it.
+2. **How does one strait deployment serve many sandboxes?**
+   Answer: the host control plane is the coordination point. Each
+   sandbox registers its session on startup over the host-mounted
+   socket and lives in the multi-container session view of the
+   desktop UI.
+
+## References
+
+- `docs/devcontainer.md` -- public-facing comparison with Claude Code's
+  reference devcontainer. Needs rewrite after Phase 1 lands.
+- `docs/designs/in-container-rewrite.md` -- detailed project plan and
+  work-item outline for Phases 1 through 4.
+- `.ninthwave/decisions/` -- decision logs for individual work items.

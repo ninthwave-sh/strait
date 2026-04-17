@@ -22,7 +22,13 @@ The `test` job is a required status check on `main` — PRs cannot merge until i
 
 ## Architecture
 
-- `src/main.rs` — CLI entry point (clap): `proxy`, `launch`, `init`, `generate`, `test`, `watch`, `explain`, `diff`, `template` subcommands
+Note: the file list below reflects the current codebase (host-side proxy +
+in-container gateway). The in-container rewrite (`docs/designs/in-container-
+rewrite.md`) will delete several of these (`launch.rs`, `container.rs`) and
+split the proxy into a new `strait-agent` crate. Update this section as the
+rewrite lands.
+
+- `src/main.rs` -- CLI entry point (clap): `proxy`, `launch`, `init`, `generate`, `test`, `watch`, `explain`, `diff`, `template` subcommands
 - `src/config.rs` — unified TOML config (`strait.toml`) parsing
 - `src/ca.rs` — session-local CA cert generation (rcgen)
 - `src/policy.rs` — Cedar policy engine for HTTP actions, URL-derived resource hierarchy, and per-request evaluation
@@ -45,15 +51,36 @@ The `test` job is a required status check on `main` — PRs cannot merge until i
 
 ## Key Design Decisions
 
-- **Container-based sandboxing** — Docker/Podman/OrbStack. Not kernel sandboxes (ESF, Seatbelt). Ships cross-platform, no special OS permissions.
-- **Cedar over OPA** — sub-ms evaluation, embeddable, no sidecar process.
-- **Network-only Cedar model** — `Action::"http:GET"`, `Action::"http:POST"`, `Action::"http:DELETE"` govern outbound HTTP policy.
-- **Proxy on host, not in container** — stronger isolation. Agent can't tamper with the proxy.
-- **Session-local CA** — new CA cert generated on each startup. Injected into container system CA bundle.
-- **Credential injection on allow only** — agent never sees real secrets. Prevents exfiltration via prompt injection.
-- **Enforced network isolation** — containers run with `--network=none`. A gateway binary inside the container routes traffic through a bind-mounted Unix socket to the host proxy. No direct network access.
-- **Observe-then-enforce workflow** — `--observe` → `generate` → `--warn` → `--policy`. Solves policy paralysis.
-- **General-purpose tool** — not ninthwave-specific. Standalone binary, separate repo.
+See `docs/designs/devcontainer-strategy.md` for the current architecture and
+`docs/designs/in-container-rewrite.md` for the Phase 1-4 plan moving the data
+plane from host to in-container. The bullets below reflect the target state.
+
+- **Container-based sandboxing** -- Docker/Podman/OrbStack. Not kernel sandboxes
+  (ESF, Seatbelt). Ships cross-platform, no special OS permissions.
+- **Cedar over OPA** -- sub-ms evaluation, embeddable, no sidecar process.
+- **Network-only Cedar model** -- `Action::"http:GET"`, `Action::"http:POST"`,
+  `Action::"http:DELETE"` govern outbound HTTP policy.
+- **Data plane inside the container, control plane on the host** -- the MITM
+  proxy runs as root inside the container; the agent runs as a non-root user.
+  The host runs `strait-host`, which owns rules, decisions, credentials, and
+  the desktop UI, and serves many containers at once.
+- **iptables REDIRECT at entrypoint** -- the container entrypoint installs
+  iptables rules that redirect all outbound TCP to the local proxy, then drops
+  privileges. No `HTTPS_PROXY` env var, no bypass path for tools that ignore
+  proxy conventions.
+- **Session-local CA** -- new CA cert generated on each startup by the
+  in-container proxy. Trust injection happens entirely inside the container.
+- **Credential injection on allow only** -- credentials live on the host.
+  On allow, the in-container proxy fetches the credential over gRPC and
+  injects it into the outbound request. Never persisted in the container.
+- **Observe-then-enforce workflow** -- `--observe` -> `generate` -> `--warn`
+  -> `--policy`. Solves policy paralysis.
+- **No container orchestration in strait** -- `strait launch` is removed.
+  Install via the devcontainer feature or bring-your-own-sandbox (sandcastle,
+  hand-rolled Docker, Podman). Users keep the orchestration tool they already
+  use; strait is the policy layer on top.
+- **General-purpose tool** -- not ninthwave-specific. Standalone binary,
+  separate repo.
 
 ## Conventions
 

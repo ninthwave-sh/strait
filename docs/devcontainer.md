@@ -4,6 +4,8 @@ Strait is the network policy layer for devcontainers. Keep `devcontainer.json` f
 
 This doc is the public companion to [`docs/designs/devcontainer-strategy.md`](designs/devcontainer-strategy.md). It explains where strait fits relative to the [Development Containers spec](https://containers.dev/) and Claude Code's [reference devcontainer](https://code.claude.com/docs/en/devcontainer).
 
+> **Heads up (2026-04-17):** the architecture is mid-rewrite. The strategy doc now describes an in-container data plane with iptables REDIRECT and a host-side control plane, and `strait launch` is being removed. The examples and migration steps below still reflect the older host-side proxy model and will be rewritten once Phase 1 of [`designs/in-container-rewrite.md`](designs/in-container-rewrite.md) lands.
+
 ## Start here: incompatibilities and migration calls
 
 If you are starting from Claude Code's reference devcontainer, make these decisions first:

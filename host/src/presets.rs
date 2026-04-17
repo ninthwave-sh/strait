@@ -53,11 +53,11 @@ pub const PRESETS: &[Preset] = &[Preset {
     name: "claude-code-devcontainer",
     description: "Claude Code inside a devcontainer: session CA, GitHub + npm starter policy",
     devcontainer_json: include_str!(
-        "../examples/claude-code-devcontainer/.devcontainer/devcontainer.json"
+        "../../examples/claude-code-devcontainer/.devcontainer/devcontainer.json"
     ),
-    strait_toml: include_str!("../examples/claude-code-devcontainer/strait.toml"),
-    policy_cedar: include_str!("../examples/claude-code-devcontainer/policy.cedar"),
-    readme: include_str!("../examples/claude-code-devcontainer/README.md"),
+    strait_toml: include_str!("../../examples/claude-code-devcontainer/strait.toml"),
+    policy_cedar: include_str!("../../examples/claude-code-devcontainer/policy.cedar"),
+    readme: include_str!("../../examples/claude-code-devcontainer/README.md"),
 }];
 
 /// Filesystem layout produced by `Preset::apply_to`.
@@ -224,6 +224,139 @@ pub fn devcontainer_onboarding_lines() -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Policy preset library
+// ---------------------------------------------------------------------------
+
+// Presets below are the server-side default Cedar policies a container
+// session can opt into at `RegisterContainer` time. They are distinct
+// from the devcontainer [`Preset`] bundle above: a devcontainer preset
+// is a file-on-disk CLI helper, a policy preset is a server-side rule
+// the rule store loads into the session's scope.
+//
+// Keeping both lists in the same crate is intentional: the host process
+// is the single source of truth for the bundled Cedar corpus, and both
+// surfaces (`strait preset apply` for files, `RegisterContainer
+// preset_ids` for live opt-in) reuse the Cedar source in `templates/`.
+
+use crate::rule_store::{Rule, RuleAction, RuleDuration, RuleStore};
+
+/// Opaque prefix that identifies rules inserted by the preset library.
+///
+/// The `{rule_id}` format is `{PRESET_RULE_ID_PREFIX}{id}@{version}`.
+/// Rule ids that do not start with this prefix are user-authored.
+pub const PRESET_RULE_ID_PREFIX: &str = "preset:";
+
+/// One named Cedar policy the host exposes as a server-side default.
+///
+/// The `cedar_source` is embedded at compile time from `templates/` so
+/// the host process can insert it into the rule store without a filesystem
+/// read. `version` is a short, monotonic label -- a preset library update
+/// is a new `version` string on the same `id`, so already-registered
+/// sessions keep the old Cedar source in their scope while new sessions
+/// pick up the update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyPreset {
+    /// Short opaque id the operator opts in with, e.g. `github-read`.
+    pub id: &'static str,
+    /// Monotonic version label. Incremented on any Cedar source change.
+    pub version: &'static str,
+    /// One-line human description shown in the preset picker.
+    pub description: &'static str,
+    /// Cedar policy source loaded into the rule store on opt-in.
+    pub cedar_source: &'static str,
+}
+
+/// Bundled policy presets, ordered by id. Each entry maps a short opt-in
+/// id to a Cedar policy from `templates/`. When a container session opts
+/// into one at register time, its Cedar source is copied into the rule
+/// store under the session's scope and tagged with
+/// [`PRESET_RULE_ID_PREFIX`].
+pub const POLICY_PRESETS: &[PolicyPreset] = &[
+    PolicyPreset {
+        id: "aws-read",
+        version: "1",
+        description: "Read-only S3 access (GetObject, ListBucket, HEAD)",
+        cedar_source: include_str!("../../templates/aws-s3-readonly.cedar"),
+    },
+    PolicyPreset {
+        id: "aws-readwrite",
+        version: "1",
+        description: "S3 read + write, deny DeleteBucket and DeleteObject",
+        cedar_source: include_str!("../../templates/aws-s3-readwrite.cedar"),
+    },
+    PolicyPreset {
+        id: "claude-code",
+        version: "1",
+        description: "Claude Code agent (OAuth): GitHub API + npm registry",
+        cedar_source: include_str!("../../templates/claude-code.cedar"),
+    },
+    PolicyPreset {
+        id: "container-sandbox",
+        version: "1",
+        description: "Container sandbox: scoped HTTP access",
+        cedar_source: include_str!("../../templates/container-sandbox.cedar"),
+    },
+    PolicyPreset {
+        id: "github-contributor",
+        version: "1",
+        description: "Read + PR creation, deny push to main/release branches",
+        cedar_source: include_str!("../../templates/github-org-contributor.cedar"),
+    },
+    PolicyPreset {
+        id: "github-read",
+        version: "1",
+        description: "Read-only access to a GitHub org's repos",
+        cedar_source: include_str!("../../templates/github-org-readonly.cedar"),
+    },
+];
+
+/// Find a policy preset by id.
+pub fn find_policy_preset(id: &str) -> Option<&'static PolicyPreset> {
+    POLICY_PRESETS.iter().find(|p| p.id == id)
+}
+
+/// Build the rule id a preset registers into the rule store. The rule id
+/// encodes the preset id and version so a future preset bump registers a
+/// fresh row rather than overwriting an already-applied one.
+pub fn preset_rule_id(preset_id: &str, version: &str) -> String {
+    format!("{PRESET_RULE_ID_PREFIX}{preset_id}@{version}")
+}
+
+/// Return `Some((id, version))` if `rule_id` was registered by the preset
+/// library. Used by tests and audit tools to distinguish preset-sourced
+/// rules from user-authored ones.
+pub fn split_preset_rule_id(rule_id: &str) -> Option<(&str, &str)> {
+    let tail = rule_id.strip_prefix(PRESET_RULE_ID_PREFIX)?;
+    let (id, version) = tail.split_once('@')?;
+    Some((id, version))
+}
+
+/// Apply a policy preset to the rule store at `scope`. Inserts a single
+/// allow rule whose `cedar_source` is the preset's Cedar policy; re-apply
+/// with the same `(preset_id, version, scope)` is an upsert, so the call
+/// is idempotent.
+///
+/// Returns the inserted/updated rule (with the freshly assigned
+/// `version_token`) so callers can correlate the result with the
+/// subsequent `RuleChange::Add` broadcast.
+pub fn apply_policy_preset_to_store(
+    store: &RuleStore,
+    preset: &PolicyPreset,
+    scope: &str,
+) -> anyhow::Result<Rule> {
+    let rule_id = preset_rule_id(preset.id, preset.version);
+    store.upsert(Rule {
+        rule_id,
+        scope: scope.to_string(),
+        cedar_source: preset.cedar_source.to_string(),
+        action: RuleAction::Allow,
+        duration: RuleDuration::Session,
+        ttl_unix_ms: None,
+        version_token: String::new(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -329,13 +462,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn all_preset_configs_parse_as_toml() {
-        for preset in PRESETS {
-            toml::from_str::<crate::config::StraitConfig>(preset.strait_toml)
-                .unwrap_or_else(|e| panic!("preset {} has invalid strait.toml: {e}", preset.name));
-        }
-    }
+    // The `strait.toml` round-trip through `strait::config::StraitConfig`
+    // belongs to the `strait` crate because the config type lives there;
+    // see `tests/preset_policy_library.rs` in the root crate.
 
     #[test]
     fn find_unknown_preset_returns_none() {
@@ -489,16 +618,9 @@ mod tests {
         assert!(err.to_string().contains("unknown preset"));
     }
 
-    #[test]
-    fn apply_parsed_devcontainer_json_roundtrips_through_parse_devcontainer() {
-        let dir = tempfile::tempdir().unwrap();
-        let layout = apply("claude-code-devcontainer", dir.path()).unwrap();
-        let parsed = crate::config::parse_devcontainer(&layout.devcontainer_path).unwrap();
-        assert!(
-            parsed.image.is_some() || parsed.build.is_some(),
-            "preset devcontainer.json should either supply an image or a build"
-        );
-    }
+    // The `parse_devcontainer` round-trip lives in the `strait` crate
+    // (see `tests/preset_policy_library.rs`) because the parser it
+    // exercises is in the strait CLI, not in this crate.
 
     #[test]
     fn devcontainer_onboarding_lines_name_trust_boundary_and_persist_flow() {
@@ -535,7 +657,11 @@ mod tests {
         // sync. The example directory is the canonical dogfood path; the
         // embedded copy is what ships in the compiled binary.
         let preset = find("claude-code-devcontainer").unwrap();
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // `CARGO_MANIFEST_DIR` for this crate is the `host/` subdirectory;
+        // the example directory lives one level up at the repo root.
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("host manifest dir has a parent");
         let example_root = repo_root.join("examples/claude-code-devcontainer");
 
         let on_disk_dc =
@@ -548,5 +674,136 @@ mod tests {
         assert_eq!(preset.strait_toml, on_disk_toml);
         assert_eq!(preset.policy_cedar, on_disk_policy);
         assert_eq!(preset.readme, on_disk_readme);
+    }
+
+    // --- Policy preset library tests ---
+
+    #[test]
+    fn policy_presets_are_non_empty_and_sorted_by_id() {
+        assert!(
+            !POLICY_PRESETS.is_empty(),
+            "policy preset library must ship at least one entry"
+        );
+        let ids: Vec<&str> = POLICY_PRESETS.iter().map(|p| p.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            ids, sorted,
+            "policy preset list must be sorted alphabetically by id"
+        );
+    }
+
+    #[test]
+    fn policy_preset_library_ships_github_aws_and_sandbox_parity() {
+        // Acceptance: "The current preset library (GitHub, AWS, container
+        // sandbox) reaches parity in the new home." Guard the required ids
+        // so a future rename surfaces as a failing test rather than a
+        // silent regression in the onboarding picker.
+        for required in [
+            "aws-read",
+            "aws-readwrite",
+            "claude-code",
+            "container-sandbox",
+            "github-contributor",
+            "github-read",
+        ] {
+            assert!(
+                find_policy_preset(required).is_some(),
+                "policy preset library must include {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_preset_cedar_sources_parse() {
+        for preset in POLICY_PRESETS {
+            PolicySet::from_str(preset.cedar_source).unwrap_or_else(|e| {
+                panic!("policy preset {} has invalid Cedar source: {e}", preset.id);
+            });
+        }
+    }
+
+    #[test]
+    fn preset_rule_id_round_trips_through_split() {
+        let id = preset_rule_id("github-read", "1");
+        assert_eq!(id, "preset:github-read@1");
+        let (preset_id, version) = split_preset_rule_id(&id).unwrap();
+        assert_eq!(preset_id, "github-read");
+        assert_eq!(version, "1");
+    }
+
+    #[test]
+    fn split_preset_rule_id_rejects_user_authored_ids() {
+        // A user-authored rule id carries no `preset:` prefix so the
+        // splitter returns None. This is what the audit path relies on to
+        // distinguish preset-sourced rules.
+        assert!(split_preset_rule_id("persist-allow:default:api.github.com:http:GET").is_none());
+        assert!(split_preset_rule_id("custom-rule").is_none());
+    }
+
+    #[test]
+    fn apply_policy_preset_inserts_session_scoped_rule() {
+        let store = RuleStore::in_memory().unwrap();
+        let preset = find_policy_preset("github-read").unwrap();
+        let rule = apply_policy_preset_to_store(&store, preset, "sess-alpha").unwrap();
+        assert_eq!(rule.rule_id, "preset:github-read@1");
+        assert_eq!(rule.scope, "sess-alpha");
+        assert_eq!(rule.duration, RuleDuration::Session);
+        assert!(
+            rule.cedar_source.contains("@id(\"read-org-repos\")"),
+            "cedar source should be the templates/github-org-readonly.cedar body"
+        );
+
+        // The rule must be visible through the store as a session-scoped
+        // row -- default-scoped consumers must not see it.
+        let visible = store.snapshot_for_session("sess-alpha").unwrap();
+        assert!(visible.iter().any(|r| r.rule_id == rule.rule_id));
+        let other = store.snapshot_for_session("sess-other").unwrap();
+        assert!(!other.iter().any(|r| r.rule_id == rule.rule_id));
+    }
+
+    #[test]
+    fn apply_policy_preset_is_idempotent_for_same_version() {
+        let store = RuleStore::in_memory().unwrap();
+        let preset = find_policy_preset("container-sandbox").unwrap();
+        let first = apply_policy_preset_to_store(&store, preset, "sess-x").unwrap();
+        let second = apply_policy_preset_to_store(&store, preset, "sess-x").unwrap();
+        assert_eq!(first.rule_id, second.rule_id);
+        // Upsert assigns a fresh `version_token` on every call so stream
+        // consumers can de-duplicate; the row count must still be one.
+        assert_ne!(first.version_token, second.version_token);
+        let all = store.list_all().unwrap();
+        assert_eq!(all.len(), 1, "idempotent re-apply must not duplicate rows");
+    }
+
+    #[test]
+    fn preset_version_bump_does_not_overwrite_existing_session_rule() {
+        // Edge case from the test plan: "preset updated across a version
+        // bump -- existing containers keep their pinned version unless
+        // explicitly upgraded". Simulate a version bump by applying the
+        // same preset id twice with different versions; the older rule
+        // must survive so a session that registered before the bump keeps
+        // its original Cedar source.
+        let store = RuleStore::in_memory().unwrap();
+        let original = PolicyPreset {
+            id: "example",
+            version: "1",
+            description: "v1",
+            cedar_source: "permit(principal, action, resource);\n",
+        };
+        let bumped = PolicyPreset {
+            id: "example",
+            version: "2",
+            description: "v2",
+            cedar_source: "permit(principal, action, resource == Resource::\"v2\");\n",
+        };
+        let v1 = apply_policy_preset_to_store(&store, &original, "sess-old").unwrap();
+        let v2 = apply_policy_preset_to_store(&store, &bumped, "sess-new").unwrap();
+        assert_ne!(v1.rule_id, v2.rule_id);
+        // Both rows must still be present; the old session keeps `v1`.
+        assert!(store.get(&v1.rule_id).unwrap().is_some());
+        assert!(store.get(&v2.rule_id).unwrap().is_some());
+        let old = store.get(&v1.rule_id).unwrap().unwrap();
+        assert_eq!(old.cedar_source, original.cedar_source);
     }
 }

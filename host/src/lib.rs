@@ -16,8 +16,10 @@ pub mod grpc;
 pub mod listener;
 pub mod migrations;
 pub mod observations;
+pub mod presets;
 pub mod rule_store;
 pub mod sigv4;
+pub mod templates;
 
 pub use config::{
     default_config_path, default_observations_path, default_rules_db_path, HostConfig,
@@ -29,4 +31,8 @@ pub use decisions::{DecisionError, DecisionQueue, HoldInfo, PendingSummary, DEFA
 pub use grpc::{ResolveError, StraitHostService};
 pub use listener::{serve, serve_with_service, ShutdownSignal};
 pub use observations::ObservationHub;
+pub use presets::{
+    apply_policy_preset_to_store, find_policy_preset, preset_rule_id, split_preset_rule_id,
+    PolicyPreset, POLICY_PRESETS, PRESET_RULE_ID_PREFIX,
+};
 pub use rule_store::{Rule, RuleAction, RuleChange, RuleDuration, RuleStore};

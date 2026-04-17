@@ -48,12 +48,15 @@ mod tests {
             hostname: "container-1".into(),
             agent_version: "0.1.0".into(),
             labels: vec!["a".into(), "b".into()],
+            preset_ids: vec!["github-read".into()],
         });
         rt(RegisterContainerResponse {
             session_id: "sess-1".into(),
             default_scope: "default".into(),
             registered_at_unix_ms: 42,
             rules_resume_token: "v1".into(),
+            applied_preset_ids: vec!["github-read".into()],
+            ignored_preset_ids: vec!["not-a-preset".into()],
         });
 
         let mut headers = std::collections::HashMap::new();

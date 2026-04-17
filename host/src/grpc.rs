@@ -291,11 +291,53 @@ impl StraitHost for StraitHostService {
         if let Ok(mut map) = self.registration_ids.lock() {
             map.insert(session_id.clone(), req.container_id.clone());
         }
+
+        // Apply any preset opt-ins the caller requested. Unknown ids are
+        // surfaced in the response so the desktop shell can warn the
+        // operator without failing the call; known ids copy their Cedar
+        // source into the newly minted session scope.
+        let mut applied_preset_ids = Vec::with_capacity(req.preset_ids.len());
+        let mut ignored_preset_ids = Vec::new();
+        for preset_id in &req.preset_ids {
+            match crate::presets::find_policy_preset(preset_id) {
+                Some(preset) => {
+                    match crate::presets::apply_policy_preset_to_store(
+                        &self.rules,
+                        preset,
+                        &session_id,
+                    ) {
+                        Ok(_) => applied_preset_ids.push(preset_id.clone()),
+                        Err(e) => {
+                            warn!(
+                                target: "strait_host::grpc",
+                                session_id = %session_id,
+                                preset_id = %preset_id,
+                                error = %e,
+                                "failed to apply preset to rule store"
+                            );
+                            ignored_preset_ids.push(preset_id.clone());
+                        }
+                    }
+                }
+                None => {
+                    warn!(
+                        target: "strait_host::grpc",
+                        session_id = %session_id,
+                        preset_id = %preset_id,
+                        "unknown preset id; ignoring"
+                    );
+                    ignored_preset_ids.push(preset_id.clone());
+                }
+            }
+        }
+
         Ok(Response::new(RegisterContainerResponse {
             session_id,
             default_scope: RuleStore::DEFAULT_SCOPE.to_string(),
             registered_at_unix_ms: now_unix_ms(),
             rules_resume_token: String::new(),
+            applied_preset_ids,
+            ignored_preset_ids,
         }))
     }
 

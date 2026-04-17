@@ -38,6 +38,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 [dev-dependencies]
+cedar-policy = "4"
+json5 = "0.4"
 strait = { path = ".." }
 strait-agent = { path = "../agent" }
 tempfile = "3"

@@ -1,0 +1,36 @@
+{
+    "id": "strait",
+    "version": "0.1.0",
+    "name": "Strait Network Policy",
+    "description": "Routes all outbound TCP inside the container through a Cedar-policy-gated MITM proxy. iptables REDIRECT forwards traffic from the configured agent user to the in-container proxy; no HTTPS_PROXY dependency.",
+    "documentationURL": "https://github.com/ninthwave-io/strait",
+    "options": {
+        "host": {
+            "type": "string",
+            "default": "/run/strait/host.sock",
+            "description": "Path inside the container where the host control plane Unix socket is mounted."
+        },
+        "agent_user": {
+            "type": "string",
+            "default": "vscode",
+            "description": "Unix user the entrypoint drops privileges to before exec'ing the user's command. Must already exist in the base image (common-utils installs the default 'vscode' user)."
+        },
+        "policy": {
+            "type": "string",
+            "default": "/etc/strait/policy.cedar",
+            "description": "Path inside the container to the Cedar policy file."
+        },
+        "proxy_port": {
+            "type": "string",
+            "default": "9443",
+            "description": "TCP port the in-container MITM proxy listens on. iptables REDIRECT rewrites ports 80 and 443 to this port."
+        }
+    },
+    "entrypoint": "/usr/local/share/strait/entrypoint.sh",
+    "capAdd": [
+        "NET_ADMIN"
+    ],
+    "installsAfter": [
+        "ghcr.io/devcontainers/features/common-utils"
+    ]
+}

@@ -16,7 +16,9 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+rcgen = { version = "0.13", features = ["pem"] }
 serde = { version = "1", features = ["derive"] }
+time = "0.3"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }

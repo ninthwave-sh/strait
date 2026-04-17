@@ -129,6 +129,19 @@ export class ControlPlane extends EventEmitter {
   private streams = new Map<string, grpc.ClientReadableStream<any>>();
   private client: GrpcClient | null = null;
   private clientSocketPath: string | null = null;
+  /**
+   * Wall-clock time we first observed each session id. The control service
+   * proto has no registered_at field; tracking this locally gives the rail
+   * a stable uptime without changing the wire format. Entries persist for
+   * the desktop app's lifetime -- restarting the app resets them.
+   */
+  private firstSeenAt = new Map<string, number>();
+  /**
+   * Chronological log of blocked-request observations, most recent last.
+   * Used to answer "quick-resume most recent pending decision" from the
+   * tray menu without scanning the whole blockedRequests array every tick.
+   */
+  private blockedArrivalOrder: string[] = [];
 
   private getClient(): GrpcClient {
     const socketPath = this.snapshot.serviceSocketPath;
@@ -235,7 +248,7 @@ export class ControlPlane extends EventEmitter {
       const sessions = await this.listSessions();
       this.snapshot.connected = true;
       this.snapshot.lastError = null;
-      this.snapshot.sessions = sessions;
+      this.snapshot.sessions = this.applyFirstSeen(sessions);
       this.reconcileStreams(sessions);
     } catch (error) {
       this.snapshot.connected = false;
@@ -243,6 +256,49 @@ export class ControlPlane extends EventEmitter {
       this.stopStreams();
     }
     this.emitState();
+  }
+
+  private applyFirstSeen(sessions: SessionSummary[]): SessionSummary[] {
+    const now = Date.now();
+    const liveIds = new Set<string>();
+    const annotated = sessions.map((session) => {
+      liveIds.add(session.sessionId);
+      const existing = this.firstSeenAt.get(session.sessionId);
+      const firstSeenAtUnixMs = existing ?? now;
+      if (existing === undefined) {
+        this.firstSeenAt.set(session.sessionId, firstSeenAtUnixMs);
+      }
+      return { ...session, firstSeenAtUnixMs };
+    });
+    // Forget sessions that went away so an id that comes back later counts
+    // as a new session for uptime purposes.
+    for (const id of this.firstSeenAt.keys()) {
+      if (!liveIds.has(id)) {
+        this.firstSeenAt.delete(id);
+      }
+    }
+    return annotated;
+  }
+
+  /**
+   * Returns the session id and blocked id of the most recently observed
+   * blocked request still awaiting a decision. The tray quick-resume entry
+   * calls this to route the operator directly at the prompt they most
+   * likely want to answer.
+   */
+  getMostRecentPending(): { sessionId: string; blockedId: string } | null {
+    const live = new Map<string, string>();
+    for (const request of this.snapshot.blockedRequests) {
+      live.set(request.blockedId, request.sessionId);
+    }
+    for (let index = this.blockedArrivalOrder.length - 1; index >= 0; index -= 1) {
+      const blockedId = this.blockedArrivalOrder[index];
+      const sessionId = live.get(blockedId);
+      if (sessionId) {
+        return { sessionId, blockedId };
+      }
+    }
+    return null;
   }
 
   private async listSessions(): Promise<SessionSummary[]> {
@@ -289,6 +345,10 @@ export class ControlPlane extends EventEmitter {
         return;
       }
       this.snapshot.blockedRequests = [...this.snapshot.blockedRequests, blocked].slice(-200);
+      this.blockedArrivalOrder.push(blocked.blockedId);
+      if (this.blockedArrivalOrder.length > 400) {
+        this.blockedArrivalOrder.splice(0, this.blockedArrivalOrder.length - 400);
+      }
       this.emitState();
     });
 

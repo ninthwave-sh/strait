@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
-import type { DesktopBridge } from '../src/bridge';
+import type { DesktopBridge, FocusSessionRequest } from '../src/bridge';
 import type { DesktopSnapshot, SubmitDecisionInput } from '../src/types';
 
 const bridge: DesktopBridge = {
@@ -19,6 +19,13 @@ const bridge: DesktopBridge = {
   },
   focusWindow() {
     return ipcRenderer.invoke('desktop:focus-window');
+  },
+  onFocusSession(listener) {
+    const wrapped = (_event: Electron.IpcRendererEvent, request: FocusSessionRequest) => {
+      listener(request);
+    };
+    ipcRenderer.on('desktop:focus-session', wrapped);
+    return () => ipcRenderer.removeListener('desktop:focus-session', wrapped);
   }
 };
 

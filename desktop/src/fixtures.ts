@@ -11,7 +11,8 @@ export function buildSession(partial: Partial<SessionSummary> = {}): SessionSumm
     control: partial.control ?? { network: 'unix', address: '/tmp/control.sock' },
     observation: partial.observation ?? { network: 'unix', address: '/tmp/observe.sock' },
     containerId: partial.containerId ?? 'abc123',
-    containerName: partial.containerName ?? 'strait-devcontainer'
+    containerName: partial.containerName ?? 'strait-devcontainer',
+    firstSeenAtUnixMs: partial.firstSeenAtUnixMs ?? Date.now()
   };
 }
 

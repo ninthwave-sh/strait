@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { resolveBridge, type DesktopBridge } from './bridge';
+import { SessionRail, sessionLabel, type SessionRailEntry } from './Sessions';
 import type {
   BlockedBatch,
   BlockedRequestSummary,
   DecisionAction,
-  DesktopSnapshot
+  DesktopSnapshot,
+  SessionSummary
 } from './types';
 
 const EMPTY_SNAPSHOT: DesktopSnapshot = {
@@ -78,16 +80,36 @@ function actionLabel(action: DecisionAction): string {
   }
 }
 
+function pickActiveSessionId(
+  sessions: SessionSummary[],
+  current: string | null,
+  blockedRequests: BlockedRequestSummary[]
+): string | null {
+  if (current && sessions.some((session) => session.sessionId === current)) {
+    return current;
+  }
+  const pending = blockedRequests.find((request) =>
+    sessions.some((session) => session.sessionId === request.sessionId)
+  );
+  if (pending) {
+    return pending.sessionId;
+  }
+  return sessions[0]?.sessionId ?? null;
+}
+
 export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
   const bridge = useMemo(() => resolveBridge(providedBridge), [providedBridge]);
   const [snapshot, setSnapshot] = useState<DesktopSnapshot>(EMPTY_SNAPSHOT);
   const [loading, setLoading] = useState(true);
   const [now, setNow] = useState(() => Date.now());
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [alertedSessionIds, setAlertedSessionIds] = useState<Record<string, true>>({});
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
   const [pendingBatchIds, setPendingBatchIds] = useState<Record<string, true>>({});
   const [hiddenBlockedIds, setHiddenBlockedIds] = useState<Record<string, true>>({});
   const [customTtls, setCustomTtls] = useState<Record<string, string>>({});
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [seenBlockedIds, setSeenBlockedIds] = useState<Record<string, true>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -117,12 +139,133 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
     return () => window.clearInterval(interval);
   }, []);
 
+  // Keep the active session valid as the session list churns.
+  useEffect(() => {
+    setActiveSessionId((current) =>
+      pickActiveSessionId(snapshot.sessions, current, snapshot.blockedRequests)
+    );
+  }, [snapshot.blockedRequests, snapshot.sessions]);
+
+  // The active session is definitionally "not alerted" -- the operator is
+  // looking straight at it. This also covers the first-load race where
+  // pickActiveSessionId runs after seenBlockedIds has already tagged every
+  // starter request as cross-session.
+  useEffect(() => {
+    if (!activeSessionId) {
+      return;
+    }
+    setAlertedSessionIds((current) => {
+      if (!current[activeSessionId]) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[activeSessionId];
+      return next;
+    });
+  }, [activeSessionId]);
+
+  // Track blocked requests that landed while a different session was focused.
+  // Each session's alerted flag clears only when the operator explicitly
+  // focuses it, so cross-session alerts never get silently absorbed by the
+  // session that happened to be focused when the request arrived.
+  useEffect(() => {
+    const alerts: Record<string, true> = {};
+    let discoveredSomethingNew = false;
+    const nextSeen: Record<string, true> = { ...seenBlockedIds };
+    for (const request of snapshot.blockedRequests) {
+      if (seenBlockedIds[request.blockedId]) {
+        continue;
+      }
+      discoveredSomethingNew = true;
+      nextSeen[request.blockedId] = true;
+      if (request.sessionId && request.sessionId !== activeSessionId) {
+        alerts[request.sessionId] = true;
+      }
+    }
+    if (!discoveredSomethingNew) {
+      return;
+    }
+    setSeenBlockedIds(nextSeen);
+    if (Object.keys(alerts).length > 0) {
+      setAlertedSessionIds((current) => ({ ...current, ...alerts }));
+    }
+  }, [activeSessionId, seenBlockedIds, snapshot.blockedRequests]);
+
+  const handleSelectSession = useCallback((sessionId: string) => {
+    setActiveSessionId(sessionId);
+    setAlertedSessionIds((current) => {
+      if (!current[sessionId]) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[sessionId];
+      return next;
+    });
+    setSelectedBatchId(null);
+  }, []);
+
+  // Tray → renderer focus requests. The main process dispatches these when
+  // the user clicks a session or the quick-resume entry in the tray menu.
+  useEffect(() => {
+    const unsubscribe = bridge.onFocusSession(({ sessionId, blockedId }) => {
+      handleSelectSession(sessionId);
+      if (blockedId) {
+        // Defer until the filtered batch list re-renders under the new
+        // active session; the batch id is `${sessionId}:${host}`.
+        const match = snapshot.blockedRequests.find((request) => request.blockedId === blockedId);
+        if (match) {
+          setSelectedBatchId(`${match.sessionId}:${match.host}`);
+        }
+      }
+    });
+    return () => unsubscribe();
+  }, [bridge, handleSelectSession, snapshot.blockedRequests]);
+
   const visibleRequests = useMemo(
     () => snapshot.blockedRequests.filter((request) => !hiddenBlockedIds[request.blockedId]),
     [hiddenBlockedIds, snapshot.blockedRequests]
   );
-  const batches = useMemo(() => buildBlockedBatches(visibleRequests, now), [now, visibleRequests]);
-  const selectedBatch = batches.find((batch) => batch.id === selectedBatchId) ?? batches[0] ?? null;
+
+  const batchesBySession = useMemo(() => {
+    const allBatches = buildBlockedBatches(visibleRequests, now);
+    const grouped = new Map<string, BlockedBatch[]>();
+    for (const batch of allBatches) {
+      const bucket = grouped.get(batch.sessionId) ?? [];
+      bucket.push(batch);
+      grouped.set(batch.sessionId, bucket);
+    }
+    return grouped;
+  }, [now, visibleRequests]);
+
+  const activeBatches = useMemo(
+    () => (activeSessionId ? batchesBySession.get(activeSessionId) ?? [] : []),
+    [activeSessionId, batchesBySession]
+  );
+
+  const pendingCountsBySession = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const [sessionId, batches] of batchesBySession.entries()) {
+      counts.set(
+        sessionId,
+        batches.reduce((sum, batch) => sum + batch.requests.length, 0)
+      );
+    }
+    return counts;
+  }, [batchesBySession]);
+
+  const sessionEntries = useMemo<SessionRailEntry[]>(
+    () =>
+      snapshot.sessions.map((session) => ({
+        session,
+        pendingCount: pendingCountsBySession.get(session.sessionId) ?? 0,
+        alerted: Boolean(alertedSessionIds[session.sessionId]),
+        active: session.sessionId === activeSessionId
+      })),
+    [activeSessionId, alertedSessionIds, pendingCountsBySession, snapshot.sessions]
+  );
+
+  const selectedBatch =
+    activeBatches.find((batch) => batch.id === selectedBatchId) ?? activeBatches[0] ?? null;
 
   useEffect(() => {
     if (selectedBatch && selectedBatch.id !== selectedBatchId) {
@@ -164,21 +307,39 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
     [bridge]
   );
 
+  // Auto-deny expired batches across every session so a background session's
+  // timed-out prompt is not held hostage by a focus decision.
   useEffect(() => {
-    for (const batch of batches) {
-      if (batch.timeRemainingMs <= 0 && !pendingBatchIds[batch.id]) {
-        void submitDecision(batch, 'deny');
-        break;
+    const expired: BlockedBatch[] = [];
+    for (const batches of batchesBySession.values()) {
+      for (const batch of batches) {
+        if (batch.timeRemainingMs <= 0 && !pendingBatchIds[batch.id]) {
+          expired.push(batch);
+        }
       }
     }
-  }, [batches, pendingBatchIds, submitDecision]);
+    if (expired.length === 0) {
+      return;
+    }
+    // Fire-and-forget one per render to avoid thundering herd.
+    void submitDecision(expired[0], 'deny');
+  }, [batchesBySession, pendingBatchIds, submitDecision]);
+
+  const activeSession = snapshot.sessions.find((session) => session.sessionId === activeSessionId) ?? null;
+  const totalPending = Array.from(pendingCountsBySession.values()).reduce(
+    (sum, count) => sum + count,
+    0
+  );
 
   return (
     <div className="app-shell">
       <header className="header">
         <div>
           <h1>Strait Desktop</h1>
-          <p className="subhead">Thin shell over the live gRPC control service.</p>
+          <p className="subhead">
+            Multi-container control plane. {snapshot.sessions.length} session
+            {snapshot.sessions.length === 1 ? '' : 's'} · {totalPending} pending
+          </p>
         </div>
         <button className="secondary" onClick={() => void bridge.focusWindow()}>
           Focus window
@@ -199,28 +360,25 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
       {snapshot.lastError ? <div className="warning-banner">{snapshot.lastError}</div> : null}
 
       <main className="content-grid">
-        <aside className="panel sessions-panel">
-          <h2>Sessions</h2>
-          {loading ? <p>Loading…</p> : null}
-          <ul className="session-list">
-            {snapshot.sessions.map((session) => (
-              <li key={session.sessionId}>
-                <strong>{session.sessionId}</strong>
-                <span>{session.mode}</span>
-                <span>{session.containerName || 'No container name'}</span>
-              </li>
-            ))}
-          </ul>
-          {!snapshot.sessions.length && !loading ? <p>No sessions published.</p> : null}
-        </aside>
+        <SessionRail
+          entries={sessionEntries}
+          loading={loading}
+          now={now}
+          onSelect={handleSelectSession}
+        />
 
-        <section className="panel alerts-panel">
+        <section className="panel alerts-panel" aria-label="Blocked requests">
           <div className="panel-header">
-            <h2>Blocked requests</h2>
-            <span>{batches.length} active alert{batches.length === 1 ? '' : 's'}</span>
+            <h2>
+              Blocked requests
+              {activeSession ? ` · ${sessionLabel(activeSession)}` : ''}
+            </h2>
+            <span>
+              {activeBatches.length} active alert{activeBatches.length === 1 ? '' : 's'}
+            </span>
           </div>
           <div className="alert-list">
-            {batches.map((batch) => {
+            {activeBatches.map((batch) => {
               const primary = batch.requests[0];
               const pending = Boolean(pendingBatchIds[batch.id]);
               const ttlValue = customTtls[batch.id] ?? '300';
@@ -283,11 +441,17 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
                 </article>
               );
             })}
-            {!batches.length && !loading ? <p>No live blocked requests.</p> : null}
+            {!activeBatches.length && !loading ? (
+              <p>
+                {activeSession
+                  ? 'No live blocked requests for this session.'
+                  : 'Select a session from the rail to inspect its blocked requests.'}
+              </p>
+            ) : null}
           </div>
         </section>
 
-        <aside className="panel detail-panel">
+        <aside className="panel detail-panel" aria-label="Request detail">
           <h2>Request detail</h2>
           {selectedBatch ? (
             <>

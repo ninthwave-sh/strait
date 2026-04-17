@@ -12,6 +12,17 @@ export interface SessionSummary {
   observation?: SessionEndpoint;
   containerId?: string;
   containerName?: string;
+  /**
+   * Millisecond wall-clock timestamp of the first moment the desktop shell
+   * saw this session in a ListSessions response. Used to render session
+   * uptime in the rail; absent entries are treated as "just seen".
+   *
+   * Populated by the main-process ControlPlane, not by the control service,
+   * because the existing SessionControlService proto has no registered_at
+   * field. The in-process tracker is stable for the lifetime of the desktop
+   * app; restarting the app resets it.
+   */
+  firstSeenAtUnixMs?: number;
 }
 
 export interface ExceptionSuggestion {

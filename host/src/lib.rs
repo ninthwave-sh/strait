@@ -10,18 +10,21 @@
 //! crate provides the server-side implementation and the listener wiring.
 
 pub mod config;
+pub mod credentials;
 pub mod decisions;
 pub mod grpc;
 pub mod listener;
 pub mod migrations;
 pub mod observations;
 pub mod rule_store;
+pub mod sigv4;
 
 pub use config::{
     default_config_path, default_observations_path, default_rules_db_path, HostConfig,
     DEFAULT_OBSERVATIONS_RELATIVE, DEFAULT_RULES_DB_RELATIVE, DEFAULT_SOCKET_MODE,
     DEFAULT_TCP_LISTEN, DEFAULT_UNIX_SOCKET,
 };
+pub use credentials::{CredentialEntryConfig, CredentialStore};
 pub use decisions::{DecisionError, DecisionQueue, HoldInfo, PendingSummary, DEFAULT_HOLD_TIMEOUT};
 pub use grpc::{ResolveError, StraitHostService};
 pub use listener::{serve, serve_with_service, ShutdownSignal};

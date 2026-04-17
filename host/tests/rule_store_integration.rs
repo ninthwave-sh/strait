@@ -41,6 +41,7 @@ fn test_config(sock: PathBuf, port: u16, db: PathBuf) -> HostConfig {
         socket_mode: DEFAULT_SOCKET_MODE,
         rules_db: db,
         observations_log: obs,
+        credentials: Vec::new(),
     }
 }
 

@@ -217,6 +217,10 @@ async fn spawn_proxy(
         ca_cert_out,
         host_rpc,
         Arc::new(strait_agent::observations::NoopSink),
+        // Loopback tests exercise allow/deny only, not credential
+        // injection. The no-op injector keeps the request unmodified
+        // so the echo-server assertions still apply.
+        Arc::new(strait_agent::credential_injector::NoopCredentialInjector),
         Some(upstream_addr),
         Some(no_verify_client_config()),
         10 * 1024 * 1024,

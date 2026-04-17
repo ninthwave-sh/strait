@@ -62,6 +62,7 @@ fn test_config(sock: PathBuf, port: u16, rules_db: PathBuf) -> HostConfig {
         socket_mode: DEFAULT_SOCKET_MODE,
         rules_db,
         observations_log,
+        credentials: Vec::new(),
     }
 }
 

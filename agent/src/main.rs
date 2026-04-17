@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use strait_agent::config::AgentConfig;
+use strait_agent::credential_injector::NoopCredentialInjector;
 use strait_agent::entrypoint;
 use strait_agent::observations::NoopSink;
 use strait_agent::proxy::{self, PromptDenyClient, ProxyConfig};
@@ -143,6 +144,12 @@ fn run_proxy(config: &AgentConfig, policy: PathBuf, ca_cert: PathBuf) -> anyhow:
         // Test harnesses and downstream orchestrators can build their
         // own `ProxyConfig` and inject a live `HostStreamingSink`.
         observation_sink: Arc::new(NoopSink),
+        // The agent does not yet register a session at boot (H-HCP-5
+        // wires RegisterContainer on startup), so we ship the no-op
+        // credential injector here. Every allowed outbound forwards
+        // without injected credentials until that work item lands. The
+        // production path is strait_agent::RpcCredentialInjector.
+        credential_injector: Arc::new(NoopCredentialInjector),
         test_upstream_override: None,
         test_upstream_tls: None,
         max_body_size: 10 * 1024 * 1024,

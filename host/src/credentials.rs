@@ -1,9 +1,10 @@
 //! Credential store: runtime types, trait abstraction, secret resolution, and AWS host parsing.
 //!
-//! The TOML parsing for credential entries lives in [`crate::config`]. This
-//! module keeps the runtime types ([`CredentialStore`], [`BearerCredential`]),
-//! the [`Credential`] trait, and the [`resolve_entry`] logic that reads secrets
-//! from their sources (currently only environment variables).
+//! Both the TOML parsing for credential entries ([`CredentialEntryConfig`])
+//! and the runtime types ([`CredentialStore`], [`BearerCredential`],
+//! [`Credential`], [`CredentialKind`]) live here. The host `HostConfig`
+//! exposes a `credentials: Vec<CredentialEntryConfig>` field that the
+//! `strait-host` binary resolves into a [`CredentialStore`] at startup.
 //!
 //! The [`Credential`] trait abstracts over different authentication methods.
 //! Each implementation knows how to produce the HTTP headers needed for its
@@ -48,8 +49,61 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 
 use anyhow::Context as _;
+use serde::Deserialize;
 
-use crate::config::CredentialEntryConfig;
+// ---------------------------------------------------------------------------
+// Credential entry config (TOML shape)
+// ---------------------------------------------------------------------------
+
+/// `[[credential]]` array entry -- a single credential for header injection.
+///
+/// Exactly one of `host` or `host_pattern` must be set:
+/// - `host`: exact hostname match (e.g. `"api.github.com"`)
+/// - `host_pattern`: glob pattern with leading wildcard (e.g. `"*.amazonaws.com"`)
+///
+/// Supported credential types:
+/// - `"bearer"` (default) -- injects a single static header/value pair.
+/// - `"aws-sigv4"` -- signs the request with AWS Signature Version 4.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialEntryConfig {
+    /// Exact hostname this credential applies to (e.g. `"api.github.com"`).
+    /// Mutually exclusive with `host_pattern`.
+    pub host: Option<String>,
+    /// Hostname glob pattern for pattern-based matching (e.g. `"*.amazonaws.com"`).
+    /// Mutually exclusive with `host`.
+    pub host_pattern: Option<String>,
+    /// HTTP header name to inject (e.g. `"Authorization"`).
+    /// Required for `"bearer"` type; ignored for `"aws-sigv4"`.
+    #[serde(default)]
+    pub header: String,
+    /// Prefix prepended to the resolved secret value (e.g. `"token "`).
+    /// Only used by `"bearer"` type.
+    #[serde(default)]
+    pub value_prefix: String,
+    /// Source type. Currently only `"env"` is supported.
+    pub source: String,
+    /// Environment variable name (required when `source = "env"` and type is `"bearer"`).
+    pub env_var: Option<String>,
+    /// Credential type: `"bearer"` (default) or `"aws-sigv4"`.
+    #[serde(rename = "type", default = "default_credential_type")]
+    pub credential_type: String,
+
+    // --- AWS SigV4-specific fields (optional, type = "aws-sigv4" only) ---
+    /// Environment variable for the AWS access key ID.
+    /// Defaults to `"AWS_ACCESS_KEY_ID"`.
+    pub access_key_id_var: Option<String>,
+    /// Environment variable for the AWS secret access key.
+    /// Defaults to `"AWS_SECRET_ACCESS_KEY"`.
+    pub secret_access_key_var: Option<String>,
+    /// Environment variable for the optional AWS session token.
+    /// Defaults to `"AWS_SESSION_TOKEN"`.
+    pub session_token_var: Option<String>,
+}
+
+fn default_credential_type() -> String {
+    "bearer".to_string()
+}
 
 // ---------------------------------------------------------------------------
 // AWS host parsing
@@ -148,11 +202,52 @@ fn strip_service_qualifier(service: &str) -> String {
 // Credential trait and implementations
 // ---------------------------------------------------------------------------
 
+/// Shape of a credential the host hands back over the `FetchCredential` RPC.
+///
+/// The agent applies each variant differently:
+/// - [`CredentialKind::Header`]: remove any outgoing header with the same
+///   name (case-insensitive) and add this one.
+/// - [`CredentialKind::Signed`]: overwrite method, URL, and headers with
+///   the signed versions. Body bytes are unchanged -- the signed headers
+///   already commit to the body via `x-amz-content-sha256`.
+/// - [`CredentialKind::None`]: no credential configured for this
+///   (host, action); the agent proceeds unsigned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialKind {
+    /// Single header injection (bearer, basic, api-key).
+    Header {
+        /// HTTP header name (e.g. "Authorization").
+        name: String,
+        /// Fully computed header value (e.g. "token ghp_…").
+        value: String,
+    },
+    /// Full signed-request rewrite (AWS SigV4).
+    Signed {
+        /// Signed HTTP method (verbatim).
+        method: String,
+        /// Full signed URL, e.g. `https://api.example.com/path?query`.
+        url: String,
+        /// Complete header set to send. Original headers are merged in,
+        /// then the signing headers replace any same-named predecessors.
+        headers: Vec<(String, String)>,
+    },
+    /// No credential configured for this request.
+    None,
+}
+
 /// Trait for credential injection into HTTP requests.
 ///
-/// Each implementation produces the HTTP headers needed to authenticate a
-/// request. The caller is responsible for removing any existing headers with
-/// the same names before injecting the returned headers.
+/// Each implementation produces the HTTP headers (or signed request)
+/// needed to authenticate a request.
+///
+/// Two entry points:
+/// - [`Credential::inject`] returns the raw headers to add. Host-side
+///   callers that already have the request body bytes (for example the
+///   legacy in-process MITM pipeline in `src/mitm.rs`) keep using this.
+/// - [`Credential::fetch_for_request`] returns a [`CredentialKind`] so
+///   the `FetchCredential` RPC can serialise the result directly. The
+///   in-container agent uses this path; it never ships body bytes to the
+///   host, only the pre-computed `body_sha256_hex`.
 pub trait Credential: Debug + Send + Sync {
     /// Returns the headers to inject for this credential, or `None` if the
     /// credential does not apply to this request.
@@ -163,6 +258,24 @@ pub trait Credential: Debug + Send + Sync {
         headers: &[(String, String)],
         body: Option<&[u8]>,
     ) -> Option<Vec<(String, String)>>;
+
+    /// Produce a [`CredentialKind`] for the `FetchCredential` RPC.
+    ///
+    /// `body_sha256_hex` is the lowercase hex-encoded SHA-256 of the
+    /// request body. Empty body means `sha256("")`. SigV4 uses this
+    /// digest directly; bearer credentials ignore it.
+    ///
+    /// The `host` argument is the authoritative hostname for the request
+    /// (the agent sends it separately over the RPC). SigV4 uses it to
+    /// construct the canonical URL and to route service/region lookup.
+    fn fetch_for_request(
+        &self,
+        host: &str,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body_sha256_hex: &str,
+    ) -> CredentialKind;
 }
 
 /// A bearer-token credential that injects a single header with a static value.
@@ -196,6 +309,20 @@ impl Credential for BearerCredential {
     ) -> Option<Vec<(String, String)>> {
         Some(vec![(self.header.clone(), self.value.clone())])
     }
+
+    fn fetch_for_request(
+        &self,
+        _host: &str,
+        _method: &str,
+        _path: &str,
+        _headers: &[(String, String)],
+        _body_sha256_hex: &str,
+    ) -> CredentialKind {
+        CredentialKind::Header {
+            name: self.header.clone(),
+            value: self.value.clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +332,7 @@ impl Credential for BearerCredential {
 /// Holds all resolved credentials, keyed by hostname or hostname pattern.
 ///
 /// Lookup priority: exact hostname match first, then pattern-based fallback.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CredentialStore {
     /// Map from exact hostname to resolved credential.
     exact: HashMap<String, Box<dyn Credential>>,
@@ -214,6 +341,32 @@ pub struct CredentialStore {
 }
 
 impl CredentialStore {
+    /// Empty store -- every lookup returns `None`. Used by the default
+    /// `StraitHostService::new()` constructor and by tests.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Fetch the credential shape for an in-container agent request.
+    ///
+    /// Combines [`CredentialStore::get`] with
+    /// [`Credential::fetch_for_request`] so the `FetchCredential` RPC
+    /// handler can be a single `store.fetch_for_request(...)` call.
+    /// Returns [`CredentialKind::None`] when no entry matches the host.
+    pub fn fetch_for_request(
+        &self,
+        host: &str,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body_sha256_hex: &str,
+    ) -> CredentialKind {
+        match self.get(host) {
+            Some(cred) => cred.fetch_for_request(host, method, path, headers, body_sha256_hex),
+            None => CredentialKind::None,
+        }
+    }
+
     /// Build a credential store from parsed config entries.
     ///
     /// All credential sources (env vars) are resolved eagerly at startup.

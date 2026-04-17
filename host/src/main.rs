@@ -18,7 +18,10 @@ use tracing::{error, info, warn};
 use strait_host::config::{
     default_config_path, HostConfig, DEFAULT_SOCKET_MODE, DEFAULT_TCP_LISTEN, DEFAULT_UNIX_SOCKET,
 };
-use strait_host::listener::{serve, ShutdownSignal};
+use strait_host::credentials::CredentialStore;
+use strait_host::grpc::StraitHostService;
+use strait_host::listener::{serve_with_service, ShutdownSignal};
+use strait_host::rule_store::RuleStore;
 
 // ── CLI ──────────────────────────────────────────────────────────────
 
@@ -128,11 +131,30 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         unix_socket = %cfg.unix_socket.display(),
         tcp_listen = %cfg.tcp_listen,
         socket_mode = format!("0o{:o}", cfg.socket_mode),
+        rules_db = %cfg.rules_db.display(),
+        credential_entries = cfg.credentials.len(),
         default_unix = DEFAULT_UNIX_SOCKET,
         default_tcp = DEFAULT_TCP_LISTEN,
         default_mode = format!("0o{:o}", DEFAULT_SOCKET_MODE),
         "configured",
     );
+
+    // Open the persistent rule store before we bind anything, so a bad
+    // `rules_db` path fails fast instead of mid-session. H-HCP-3 ships
+    // the SQLite-backed store; H-HCP-1's `serve()` also opens it, but
+    // we bypass `serve()` to layer the credential store in.
+    let rules = RuleStore::open(&cfg.rules_db)
+        .with_context(|| format!("opening rule store {}", cfg.rules_db.display()))?;
+
+    // Resolve every credential entry up front. Env-var lookup happens
+    // here, not on the first `FetchCredential` RPC, so misconfiguration
+    // fails the host at startup rather than surfacing as an opaque
+    // `NoCredential` to the agent mid-session.
+    let credentials = Arc::new(
+        CredentialStore::from_entries(&cfg.credentials)
+            .context("resolving [[credential]] entries")?,
+    );
+    let service = StraitHostService::with_rule_store_and_credentials(Arc::new(rules), credentials);
 
     let shutdown = ShutdownSignal::new();
     let current_cfg = Arc::new(Mutex::new(cfg.clone()));
@@ -143,10 +165,13 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     // SIGHUP → reload config from disk. Listener rebinding is intentionally
     // out of scope for H-HCP-1; the reload updates the in-memory snapshot
     // so operators can confirm the file parses, and logs the new values.
+    // Credential-store reload is deferred to a follow-up: the store is
+    // captured by `serve_with_service` and rebuilding it means rebuilding
+    // the service, which the H-HCP-1 listener doesn't support yet.
     spawn_sighup_listener(config_path.clone(), current_cfg.clone());
 
     // Run the listeners until shutdown.
-    serve(&cfg, shutdown.clone()).await?;
+    serve_with_service(&cfg, shutdown.clone(), service).await?;
     info!(target: "strait_host", "shutdown complete");
     Ok(())
 }

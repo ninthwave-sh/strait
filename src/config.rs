@@ -220,55 +220,12 @@ impl PolicyConfig {
     }
 }
 
-/// `[[credential]]` array entry — a single credential for header injection.
-///
-/// Exactly one of `host` or `host_pattern` must be set:
-/// - `host`: exact hostname match (e.g. `"api.github.com"`)
-/// - `host_pattern`: glob pattern with leading wildcard (e.g. `"*.amazonaws.com"`)
-///
-/// Supported credential types:
-/// - `"bearer"` (default) — injects a single static header/value pair.
-/// - `"aws-sigv4"` — signs the request with AWS Signature Version 4.
-#[derive(Debug, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct CredentialEntryConfig {
-    /// Exact hostname this credential applies to (e.g. `"api.github.com"`).
-    /// Mutually exclusive with `host_pattern`.
-    pub host: Option<String>,
-    /// Hostname glob pattern for pattern-based matching (e.g. `"*.amazonaws.com"`).
-    /// Mutually exclusive with `host`.
-    pub host_pattern: Option<String>,
-    /// HTTP header name to inject (e.g. `"Authorization"`).
-    /// Required for `"bearer"` type; ignored for `"aws-sigv4"`.
-    #[serde(default)]
-    pub header: String,
-    /// Prefix prepended to the resolved secret value (e.g. `"token "`).
-    /// Only used by `"bearer"` type.
-    #[serde(default)]
-    pub value_prefix: String,
-    /// Source type. Currently only `"env"` is supported.
-    pub source: String,
-    /// Environment variable name (required when `source = "env"` and type is `"bearer"`).
-    pub env_var: Option<String>,
-    /// Credential type: `"bearer"` (default) or `"aws-sigv4"`.
-    #[serde(rename = "type", default = "default_credential_type")]
-    pub credential_type: String,
-
-    // --- AWS SigV4-specific fields (optional, type = "aws-sigv4" only) ---
-    /// Environment variable for the AWS access key ID.
-    /// Defaults to `"AWS_ACCESS_KEY_ID"`.
-    pub access_key_id_var: Option<String>,
-    /// Environment variable for the AWS secret access key.
-    /// Defaults to `"AWS_SECRET_ACCESS_KEY"`.
-    pub secret_access_key_var: Option<String>,
-    /// Environment variable for the optional AWS session token.
-    /// Defaults to `"AWS_SESSION_TOKEN"`.
-    pub session_token_var: Option<String>,
-}
-
-fn default_credential_type() -> String {
-    "bearer".to_string()
-}
+// `CredentialEntryConfig` now lives in the `strait-host` crate, which owns
+// the credential store after the H-HCP-4 move. Re-export it here so
+// `crate::config::CredentialEntryConfig` keeps resolving for existing
+// callers (`src/mitm.rs`, `src/launch.rs`, and host-side tests) during the
+// in-container rewrite transition.
+pub use strait_host::credentials::CredentialEntryConfig;
 
 /// `[audit]` section — audit log file configuration.
 #[derive(Debug, Deserialize, Clone)]

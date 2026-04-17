@@ -47,6 +47,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 use tracing::{info, warn};
 
+use crate::credential_injector::{CredentialInjector, CredentialOutcome, NoopCredentialInjector};
 use crate::observations::{NoopSink, ObservationSink};
 
 /// Placeholder host-control-plane RPC verdict.
@@ -142,6 +143,12 @@ pub struct ProxyConfig {
     /// production, wire a [`crate::observations::HostStreamingSink`] that
     /// forwards events to `strait-host`.
     pub observation_sink: Arc<dyn ObservationSink>,
+    /// Credential fetcher the proxy consults on every allowed outbound.
+    /// Defaults to [`NoopCredentialInjector`], which returns "no
+    /// credential" and causes the proxy to forward requests unmodified.
+    /// Production builds wire in [`crate::RpcCredentialInjector`] after
+    /// a successful `RegisterContainer`.
+    pub credential_injector: Arc<dyn CredentialInjector>,
     /// Test-only override: when `Some`, the proxy dials this address
     /// instead of the one recovered from `SO_ORIGINAL_DST`. Production
     /// code leaves this `None`.
@@ -155,7 +162,8 @@ pub struct ProxyConfig {
 }
 
 impl ProxyConfig {
-    /// Build a default `ProxyConfig` with the placeholder RPC client.
+    /// Build a default `ProxyConfig` with the placeholder RPC client and
+    /// the no-op credential injector.
     pub fn new(listen_addr: SocketAddr, policy_path: PathBuf, ca_cert_out: PathBuf) -> Self {
         Self {
             listen_addr,
@@ -163,6 +171,7 @@ impl ProxyConfig {
             ca_cert_out,
             host_rpc: Arc::new(PromptDenyClient),
             observation_sink: Arc::new(NoopSink),
+            credential_injector: Arc::new(NoopCredentialInjector),
             test_upstream_override: None,
             test_upstream_tls: None,
             max_body_size: 10 * 1024 * 1024,
@@ -177,6 +186,7 @@ pub struct ProxyState {
     pub policy: PolicyEngine,
     pub host_rpc: Arc<dyn HostRpcClient>,
     pub observation_sink: Arc<dyn ObservationSink>,
+    pub credential_injector: Arc<dyn CredentialInjector>,
     pub test_upstream_override: Option<SocketAddr>,
     pub test_upstream_tls: Option<Arc<ClientConfig>>,
     pub max_body_size: usize,
@@ -190,6 +200,7 @@ pub async fn run(cfg: ProxyConfig) -> anyhow::Result<()> {
         cfg.ca_cert_out.clone(),
         cfg.host_rpc.clone(),
         cfg.observation_sink.clone(),
+        cfg.credential_injector.clone(),
         cfg.test_upstream_override,
         cfg.test_upstream_tls.clone(),
         cfg.max_body_size,
@@ -212,6 +223,7 @@ pub fn build_state(
     ca_cert_out: PathBuf,
     host_rpc: Arc<dyn HostRpcClient>,
     observation_sink: Arc<dyn ObservationSink>,
+    credential_injector: Arc<dyn CredentialInjector>,
     test_upstream_override: Option<SocketAddr>,
     test_upstream_tls: Option<Arc<ClientConfig>>,
     max_body_size: usize,
@@ -233,6 +245,7 @@ pub fn build_state(
         policy,
         host_rpc,
         observation_sink,
+        credential_injector,
         test_upstream_override,
         test_upstream_tls,
         max_body_size,
@@ -456,6 +469,30 @@ where
         request_start,
     );
 
+    // Credential injection. The policy allowed the request, so we
+    // round-trip to the host for whatever secret material this specific
+    // outbound needs. The agent never caches; every allowed request
+    // calls `FetchCredential` fresh. On RPC failure the injector fails
+    // open (returns `None`), which the proxy applies below.
+    let injection = state
+        .credential_injector
+        .fetch(
+            sni_host,
+            &action,
+            &request.method,
+            &request.path,
+            &request.headers,
+            request.body.as_deref(),
+        )
+        .await
+        .context("credential injector failed")?;
+
+    // Effective outbound method/path/headers after applying the
+    // credential outcome. `Signed` rewrites method and URL; `Header`
+    // replaces any same-named header; `None` leaves everything alone.
+    let (effective_method, effective_path, effective_headers) =
+        apply_credential(&request, sni_host, injection);
+
     // Forward upstream. In tests we dial the echo-server address and use
     // a NoVerify client config; in production we dial `original_dst` with
     // a webpki-roots-backed client config.
@@ -481,8 +518,8 @@ where
     // Reconstruct the request line + headers + body and write it to the
     // upstream. Format matches the ported pipeline in src/mitm.rs so the
     // shape is familiar to anyone reviewing both.
-    let mut forwarded = format!("{} {} HTTP/1.1\r\n", request.method, request.path);
-    for (name, value) in &request.headers {
+    let mut forwarded = format!("{effective_method} {effective_path} HTTP/1.1\r\n");
+    for (name, value) in &effective_headers {
         forwarded.push_str(&format!("{name}: {value}\r\n"));
     }
     forwarded.push_str("\r\n");
@@ -529,6 +566,49 @@ fn emit_network_observation(
         },
     };
     sink.emit(event);
+}
+
+/// Apply a [`CredentialOutcome`] to the parsed request, producing the
+/// method, path, and header set the proxy should send upstream.
+///
+/// Pulled out of `forward_one_request` so the unit tests can exercise
+/// the edit logic without standing up a TLS server.
+fn apply_credential(
+    request: &ParsedRequest,
+    sni_host: &str,
+    outcome: CredentialOutcome,
+) -> (String, String, Vec<(String, String)>) {
+    match outcome {
+        CredentialOutcome::None => (
+            request.method.clone(),
+            request.path.clone(),
+            request.headers.clone(),
+        ),
+        CredentialOutcome::Header { name, value } => {
+            let mut headers = request.headers.clone();
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&name));
+            headers.push((name, value));
+            (request.method.clone(), request.path.clone(), headers)
+        }
+        CredentialOutcome::Signed {
+            method,
+            url,
+            headers,
+        } => {
+            // Extract the path (+ query) from the signed URL. Host-side
+            // signing built this URL as `https://<sni>{path}`, so we
+            // strip the `https://<sni>` prefix if present. If the URL is
+            // unexpected we fall back to the original path rather than
+            // dropping the request -- the signature was built over the
+            // canonical URI, so either value round-trips to the same
+            // upstream, and mismatches surface as a 403 from AWS.
+            let path = url
+                .strip_prefix(&format!("https://{sni_host}"))
+                .map(str::to_string)
+                .unwrap_or_else(|| request.path.clone());
+            (method, path, headers)
+        }
+    }
 }
 
 fn default_upstream_tls_config() -> Arc<ClientConfig> {
@@ -835,5 +915,112 @@ mod tests {
         let mut reader = BufReader::new(&input[..]);
         let err = read_http_request(&mut reader, 1024).await.unwrap_err();
         assert!(err.to_string().contains("unsupported HTTP version"));
+    }
+
+    // ── apply_credential tests ────────────────────────────────────────
+
+    fn parsed_request_fixture() -> ParsedRequest {
+        ParsedRequest {
+            method: "GET".to_string(),
+            path: "/repos".to_string(),
+            headers: vec![
+                ("Host".to_string(), "api.github.com".to_string()),
+                ("Accept".to_string(), "application/json".to_string()),
+            ],
+            body: None,
+        }
+    }
+
+    #[test]
+    fn apply_credential_none_leaves_request_unchanged() {
+        let req = parsed_request_fixture();
+        let (method, path, headers) =
+            apply_credential(&req, "api.github.com", CredentialOutcome::None);
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/repos");
+        assert_eq!(headers, req.headers);
+    }
+
+    #[test]
+    fn apply_credential_header_adds_authorization_when_absent() {
+        let req = parsed_request_fixture();
+        let out = CredentialOutcome::Header {
+            name: "Authorization".to_string(),
+            value: "token gh_abc".to_string(),
+        };
+        let (method, path, headers) = apply_credential(&req, "api.github.com", out);
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/repos");
+        // Original two headers remain, Authorization is appended.
+        assert_eq!(headers.len(), 3);
+        let auth = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .unwrap();
+        assert_eq!(auth.1, "token gh_abc");
+    }
+
+    #[test]
+    fn apply_credential_header_replaces_existing_same_name_case_insensitive() {
+        let mut req = parsed_request_fixture();
+        // Client set their own Authorization header; the credential
+        // injector must stomp on it so the container can't leak an
+        // ambient secret.
+        req.headers
+            .push(("authorization".to_string(), "leaked".to_string()));
+        let out = CredentialOutcome::Header {
+            name: "Authorization".to_string(),
+            value: "token gh_abc".to_string(),
+        };
+        let (_, _, headers) = apply_credential(&req, "api.github.com", out);
+        let auth_values: Vec<&String> = headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(auth_values.len(), 1, "duplicate Authorization headers");
+        assert_eq!(auth_values[0], "token gh_abc");
+    }
+
+    #[test]
+    fn apply_credential_signed_rewrites_method_path_headers() {
+        let req = parsed_request_fixture();
+        let out = CredentialOutcome::Signed {
+            method: "GET".to_string(),
+            url: "https://s3.us-east-1.amazonaws.com/bucket/key".to_string(),
+            headers: vec![
+                ("Host".to_string(), "s3.us-east-1.amazonaws.com".to_string()),
+                (
+                    "Authorization".to_string(),
+                    "AWS4-HMAC-SHA256 ...".to_string(),
+                ),
+                ("X-Amz-Date".to_string(), "20240115T120000Z".to_string()),
+            ],
+        };
+        let (method, path, headers) = apply_credential(&req, "s3.us-east-1.amazonaws.com", out);
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/bucket/key");
+        assert_eq!(headers.len(), 3);
+        assert!(headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-amz-date")));
+        // Original Accept header is gone -- signed request is authoritative.
+        assert!(!headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("accept")));
+    }
+
+    #[test]
+    fn apply_credential_signed_falls_back_to_request_path_on_bad_url() {
+        let req = parsed_request_fixture();
+        let out = CredentialOutcome::Signed {
+            method: "GET".to_string(),
+            // URL doesn't match the SNI host -- fall back to the
+            // pre-signed path rather than shipping a nonsensical URL.
+            url: "https://other-host.example/whatever".to_string(),
+            headers: vec![],
+        };
+        let (_, path, _) = apply_credential(&req, "s3.us-east-1.amazonaws.com", out);
+        assert_eq!(path, "/repos");
     }
 }

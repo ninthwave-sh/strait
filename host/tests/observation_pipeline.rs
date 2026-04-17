@@ -56,6 +56,7 @@ fn test_config(dir: &std::path::Path) -> HostConfig {
         socket_mode: DEFAULT_SOCKET_MODE,
         rules_db: dir.join("rules.db"),
         observations_log: dir.join("observations.jsonl"),
+        credentials: Vec::new(),
     }
 }
 

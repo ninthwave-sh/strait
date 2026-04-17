@@ -39,6 +39,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 webpki-roots = "1"
 
+# Privilege-drop + capability handling are only meaningful on Linux.
+# The agent binary ultimately ships inside a Linux container; these deps
+# are gated so `cargo test` still works on macOS / other dev hosts.
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = "0.5"
+libc = "0.2"
+nix = { version = "0.29", features = ["user", "process", "fs"] }
+
 [dev-dependencies]
 rcgen = { version = "0.13", features = ["pem"] }
 tempfile = "3"

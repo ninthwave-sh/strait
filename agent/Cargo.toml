@@ -16,6 +16,8 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+http = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 rustls = "0.23"
 serde = { version = "1", features = ["derive"] }
@@ -27,9 +29,12 @@ serde_json = "1"
 # into `proxy.rs` so the new SO_ORIGINAL_DST entry path is a first-class
 # part of the agent crate.
 strait = { path = ".." }
+strait-proto = { path = "../proto" }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 toml = "0.8"
+tonic = { version = "0.12", features = ["transport"] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 webpki-roots = "1"

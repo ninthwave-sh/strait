@@ -14,13 +14,22 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+async-stream = "0.3"
 clap = { version = "4", features = ["derive"] }
+futures-core = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+prost = "0.13"
 serde = { version = "1", features = ["derive"] }
+strait-proto = { path = "../proto" }
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 toml = "0.8"
+tonic = { version = "0.12", features = ["transport"] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 [dev-dependencies]
+strait-agent = { path = "../agent" }
 tempfile = "3"

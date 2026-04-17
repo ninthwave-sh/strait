@@ -1,0 +1,237 @@
+syntax = "proto3";
+
+// strait host control-plane RPC surface.
+//
+// Two callers use this protocol:
+//   1. strait-agent (in-container) calls the host over a bind-mounted Unix
+//      domain socket. The agent is the primary client; every RPC below is
+//      reachable over that transport.
+//   2. The desktop app calls the host over a loopback TCP port. It uses a
+//      subset of the RPCs (RegisterContainer and StreamObservations are not
+//      exposed to the desktop in practice; Heartbeat, SubmitDecision, and the
+//      streaming surfaces are).
+//
+// All RPCs after RegisterContainer expect a session_id assigned by the host
+// at registration time. Heartbeat tolerates an empty session_id so a freshly
+// spawned agent can confirm the host is reachable before it registers.
+//
+// Field numbers are stable; do not renumber. New fields take fresh numbers.
+// No reserved ranges yet; the first deprecated field will add one.
+
+package strait.host.v1;
+
+service StraitHost {
+  // Register a new in-container agent session. Must be the first call on a
+  // fresh agent connection. Returns a session_id the agent attaches to every
+  // subsequent RPC.
+  rpc RegisterContainer(RegisterContainerRequest) returns (RegisterContainerResponse);
+
+  // Hold-and-resume decision. The agent forwards a blocked request; the host
+  // blocks until the operator decides, or until the client cancels. Called
+  // once per blocked prompt.
+  rpc SubmitDecision(SubmitDecisionRequest) returns (SubmitDecisionResponse);
+
+  // Fetch credential material for an allowed request. The host may return a
+  // pre-computed header value (bearer, basic) or a fully signed request
+  // (SigV4). Credentials never leave the host disk.
+  rpc FetchCredential(FetchCredentialRequest) returns (FetchCredentialResponse);
+
+  // Stream rule changes from the host to a registered agent. Delivers an
+  // initial snapshot terminated by RuleEvent.Kind.KIND_SNAPSHOT_END, then
+  // follows with live updates until the stream is cancelled.
+  rpc StreamRules(StreamRulesRequest) returns (stream RuleEvent);
+
+  // Stream observations from the agent to the host. The host acks at stream
+  // close with per-observation counts.
+  rpc StreamObservations(stream ObservationEvent) returns (StreamObservationsAck);
+
+  // Lightweight keep-alive. Safe to call with an empty session_id before
+  // RegisterContainer completes; if session_id is set, the host refreshes
+  // the session's last-seen timestamp.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// ---- RegisterContainer ----
+
+message RegisterContainerRequest {
+  // Docker/Podman container id. Opaque to the host.
+  string container_id = 1;
+  // Human-readable container name, for display in the desktop UI.
+  string container_name = 2;
+  // Hostname inside the container; optional, used for session labelling.
+  string hostname = 3;
+  // Semver of the shipping strait-agent binary, for protocol diagnostics.
+  string agent_version = 4;
+  // Free-form labels the sandbox runtime wants to attach.
+  repeated string labels = 5;
+}
+
+message RegisterContainerResponse {
+  // Session id the agent must attach to every subsequent RPC. Uniquely
+  // identifies this (container, agent boot) pair on the host.
+  string session_id = 1;
+  // Cedar scope the host will apply to this session by default. Additional
+  // scopes may be layered in via StreamRules.
+  string default_scope = 2;
+  // Host's wall-clock time at registration, in Unix milliseconds.
+  int64 registered_at_unix_ms = 3;
+  // Resume token the agent should pass to StreamRules. An empty value means
+  // "start from snapshot".
+  string rules_resume_token = 4;
+}
+
+// ---- SubmitDecision ----
+
+message SubmitDecisionRequest {
+  string session_id = 1;
+  // Client-generated id. Used to correlate response with request when the
+  // agent pipelines multiple outstanding decisions.
+  string request_id = 2;
+  // HTTP method of the blocked request, upper-cased.
+  string method = 3;
+  // HTTP host header value (server name), as seen by the proxy.
+  string host = 4;
+  // Absolute path + query, URL-encoded, as seen by the proxy.
+  string path = 5;
+  // Request headers as key-value pairs. Multi-valued headers are joined by
+  // comma per RFC 7230. Sensitive headers are redacted by the agent before
+  // transmission.
+  map<string, string> headers = 6;
+  // Wall-clock time the agent observed the block, in Unix milliseconds.
+  int64 observed_at_unix_ms = 7;
+  // Short human summary the host may display to the operator.
+  string explanation = 8;
+}
+
+enum Verdict {
+  VERDICT_UNSPECIFIED = 0;
+  // Allow this one request only.
+  VERDICT_ALLOW_ONCE = 1;
+  // Allow this host+action for the remainder of the session.
+  VERDICT_ALLOW_SESSION = 2;
+  // Persist a rule that allows the host+action going forward.
+  VERDICT_ALLOW_PERSIST = 3;
+  // Deny this request; the agent returns a proxy-generated error.
+  VERDICT_DENY = 4;
+  // Host timed out before producing a verdict; agent should fail closed.
+  VERDICT_TIMEOUT = 5;
+}
+
+message SubmitDecisionResponse {
+  string request_id = 1;
+  Verdict verdict = 2;
+  // Human-readable justification; the agent surfaces this in logs.
+  string reason = 3;
+  int64 decided_at_unix_ms = 4;
+  // If the host pre-fetched credential material as part of the decision
+  // (so the agent can avoid a follow-up FetchCredential round trip), it is
+  // delivered here. Absent on deny and on "allow without injection".
+  InjectedCredential credential = 5;
+}
+
+message InjectedCredential {
+  // Name of the HTTP header to inject, e.g. "Authorization".
+  string header_name = 1;
+  // Fully computed header value. Opaque to the agent; the agent writes it
+  // verbatim, never parses or caches it.
+  string header_value = 2;
+}
+
+// ---- FetchCredential ----
+
+message FetchCredentialRequest {
+  string session_id = 1;
+  // Target host the credential applies to (matches the SubmitDecision host).
+  string host = 2;
+  // Cedar action id, e.g. "http:GET".
+  string action = 3;
+  // HTTP method and path for SigV4 canonical-request construction.
+  string method = 4;
+  string path = 5;
+  // SHA-256 of the outbound request body, as raw bytes. Empty means "no body
+  // / empty body".
+  bytes body_sha256 = 6;
+  // Request headers the agent would send, minus any Authorization header.
+  map<string, string> headers = 7;
+}
+
+message FetchCredentialResponse {
+  oneof kind {
+    // Simple header injection (bearer, basic, api-key).
+    HeaderCredential header = 1;
+    // Full request rewrite (SigV4). The agent must replace method, url, and
+    // headers with the signed versions exactly.
+    SignedRequest signed = 2;
+    // No credential configured for this host+action. Agent proceeds unsigned.
+    NoCredential none = 3;
+  }
+}
+
+message HeaderCredential {
+  string header_name = 1;
+  string header_value = 2;
+}
+
+message SignedRequest {
+  string method = 1;
+  string url = 2;
+  map<string, string> headers = 3;
+}
+
+message NoCredential {}
+
+// ---- StreamRules ----
+
+message StreamRulesRequest {
+  string session_id = 1;
+  // Last version_token the agent observed. Empty means "snapshot + follow".
+  string resume_token = 2;
+}
+
+message RuleEvent {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_ADD = 1;
+    KIND_UPDATE = 2;
+    KIND_REMOVE = 3;
+    // Marker emitted exactly once after the initial snapshot has been fully
+    // delivered. Agent may clear its pending-load flag on this event.
+    KIND_SNAPSHOT_END = 4;
+  }
+  Kind kind = 1;
+  string rule_id = 2;
+  string scope = 3;
+  // Cedar policy source, as stored by the host.
+  string cedar_source = 4;
+  string version_token = 5;
+}
+
+// ---- StreamObservations ----
+
+message ObservationEvent {
+  string session_id = 1;
+  string observation_id = 2;
+  int64 observed_at_unix_ms = 3;
+  // JSON-encoded observation payload. Schema matches the on-disk JSONL
+  // format the current agent writes in observe.rs.
+  string raw_json = 4;
+}
+
+message StreamObservationsAck {
+  uint64 accepted = 1;
+  uint64 rejected = 2;
+}
+
+// ---- Heartbeat ----
+
+message HeartbeatRequest {
+  // Optional before RegisterContainer; required after.
+  string session_id = 1;
+  int64 sent_at_unix_ms = 2;
+  map<string, string> labels = 3;
+}
+
+message HeartbeatResponse {
+  int64 received_at_unix_ms = 1;
+  int64 server_time_unix_ms = 2;
+}

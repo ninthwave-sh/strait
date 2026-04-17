@@ -1,22 +1,32 @@
 //! Listener wiring for `strait-host`.
 //!
-//! Binds a Unix domain socket for the in-container proxy and a TCP socket
-//! for the desktop app, then accepts connections until a shutdown signal
-//! fires. Connection handling is intentionally stubbed -- this crate wires
-//! up the process skeleton; the real protocol lives in H-HCP-2.
+//! Binds a Unix domain socket for the in-container agent and a TCP socket
+//! for the desktop app, then serves the strait host-control-plane gRPC
+//! service on both until a shutdown signal fires.
+//!
+//! Two listeners, one service instance: both tonic servers share a single
+//! `StraitHostService` value so session counters stay coherent no matter
+//! which transport a client used. The gRPC service trait's auto-generated
+//! server wrapper is also Clone, so each tonic `Server::builder()` gets its
+//! own shallow copy.
 
-use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use anyhow::{Context, Result};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use anyhow::{Context as AnyhowContext, Result};
+use strait_proto::v1::strait_host_server::StraitHostServer;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{watch, Notify};
-use tracing::{debug, info, warn};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::server::{Connected, UdsConnectInfo};
+use tonic::transport::Server as TonicServer;
+use tracing::{info, warn};
 
 use crate::config::HostConfig;
+use crate::grpc::StraitHostService;
 
 /// Shutdown signal shared by the listeners. Drop it to close listeners;
 /// call [`ShutdownSignal::trigger`] to request graceful termination.
@@ -54,8 +64,9 @@ impl ShutdownSignal {
         self.drained.notified().await;
     }
 
-    /// Notify waiters that a listener has drained. Called internally when
-    /// both listeners exit. Tests can use this to wait for graceful exit.
+    /// Notify waiters that the listeners have drained. Called internally
+    /// when both listeners exit. Tests can use this to wait for graceful
+    /// exit without polling process state.
     fn signal_drained(&self) {
         self.drained.notify_waiters();
     }
@@ -67,10 +78,23 @@ impl Default for ShutdownSignal {
     }
 }
 
-/// Run the host listeners. Blocks until `shutdown` fires and both listeners
-/// have stopped accepting. On return, the Unix socket file has been removed
-/// and the TCP listener has been dropped.
+/// Run the host listeners using the default production service.
+///
+/// Blocks until `shutdown` fires and both listeners have stopped accepting.
+/// On return, the Unix socket file has been removed and the TCP listener
+/// has been dropped.
 pub async fn serve(cfg: &HostConfig, shutdown: ShutdownSignal) -> Result<()> {
+    serve_with_service(cfg, shutdown, StraitHostService::new()).await
+}
+
+/// Run the host listeners with a caller-provided service implementation.
+///
+/// Integration tests use this to inject an alternative `StraitHost` impl
+/// (for example one that echoes `SubmitDecision` requests back as verdicts).
+pub async fn serve_with_service<S>(cfg: &HostConfig, shutdown: ShutdownSignal, svc: S) -> Result<()>
+where
+    S: strait_proto::v1::strait_host_server::StraitHost,
+{
     let unix = bind_unix(&cfg.unix_socket, cfg.socket_mode)
         .with_context(|| format!("binding unix socket {}", cfg.unix_socket.display()))?;
     info!(
@@ -90,24 +114,56 @@ pub async fn serve(cfg: &HostConfig, shutdown: ShutdownSignal) -> Result<()> {
         "listening on tcp",
     );
 
+    // Shared server wrapper. `StraitHostServer` is Clone, so each listener
+    // owns a cheap copy that talks to the same underlying service value.
+    let server = StraitHostServer::new(svc);
+
+    // Each listener has its own shutdown future; both observe the same
+    // underlying watch channel.
+    let unix_shutdown = shutdown_future(shutdown.subscribe());
+    let tcp_shutdown = shutdown_future(shutdown.subscribe());
+
     let unix_path = cfg.unix_socket.clone();
-    let unix_rx = shutdown.subscribe();
-    let unix_task = tokio::spawn(unix_accept_loop(unix, unix_path.clone(), unix_rx));
+    let unix_incoming = uds_incoming(unix);
 
-    let tcp_rx = shutdown.subscribe();
-    let tcp_task = tokio::spawn(tcp_accept_loop(tcp, tcp_rx));
+    let unix_task = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let result = TonicServer::builder()
+                .add_service(server)
+                .serve_with_incoming_shutdown(unix_incoming, unix_shutdown)
+                .await;
+            if let Err(e) = result {
+                warn!(target: "strait_host::listener", error = %e, "unix grpc server exited with error");
+            }
+        })
+    };
 
-    // Wait for both accept loops to exit.
+    let tcp_incoming = TcpListenerStream::new(tcp);
+    let tcp_task = {
+        let server = server.clone();
+        tokio::spawn(async move {
+            let result = TonicServer::builder()
+                .add_service(server)
+                .serve_with_incoming_shutdown(tcp_incoming, tcp_shutdown)
+                .await;
+            if let Err(e) = result {
+                warn!(target: "strait_host::listener", error = %e, "tcp grpc server exited with error");
+            }
+        })
+    };
+
+    // Wait for both listener tasks to exit.
     let (u, t) = tokio::join!(unix_task, tcp_task);
     if let Err(e) = u {
-        warn!(target: "strait_host::listener", error = %e, "unix accept task panicked");
+        warn!(target: "strait_host::listener", error = %e, "unix listener task panicked");
     }
     if let Err(e) = t {
-        warn!(target: "strait_host::listener", error = %e, "tcp accept task panicked");
+        warn!(target: "strait_host::listener", error = %e, "tcp listener task panicked");
     }
 
-    // Best-effort cleanup of the socket file; the listener drop already did
-    // the close, but the file entry can linger.
+    // Best-effort cleanup of the socket file; tonic drops the listener and
+    // the socket FD but the filesystem entry can linger.
     if unix_path.exists() {
         let _ = std::fs::remove_file(&unix_path);
     }
@@ -117,16 +173,17 @@ pub async fn serve(cfg: &HostConfig, shutdown: ShutdownSignal) -> Result<()> {
 }
 
 /// Bind the Unix listener, removing any stale socket file and creating the
-/// parent directory if needed. Sets the socket's permission bits to
-/// `mode` so only the owning user can connect.
+/// parent directory if needed. Sets the socket's permission bits to `mode`
+/// so only the owning user can connect.
 fn bind_unix(path: &Path, mode: u32) -> Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating parent dir {}", parent.display()))?;
         }
     }
-    // Remove stale socket file from a previous run. Ignore "not found".
     match std::fs::remove_file(path) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -138,7 +195,6 @@ fn bind_unix(path: &Path, mode: u32) -> Result<UnixListener> {
     let listener = UnixListener::bind(path)
         .with_context(|| format!("bind unix listener {}", path.display()))?;
 
-    // chmod the socket. Umask may have stripped the bits we asked for.
     let perms = std::fs::Permissions::from_mode(mode);
     std::fs::set_permissions(path, perms)
         .with_context(|| format!("chmod unix socket {}", path.display()))?;
@@ -146,102 +202,87 @@ fn bind_unix(path: &Path, mode: u32) -> Result<UnixListener> {
     Ok(listener)
 }
 
-async fn unix_accept_loop(
+/// Convert a tokio `UnixListener` into a stream of tonic-compatible
+/// connections. The stream yields `UnixConn` values wrapping each accepted
+/// `UnixStream` so tonic can read peer credentials via `UdsConnectInfo`.
+fn uds_incoming(
     listener: UnixListener,
-    path: PathBuf,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    loop {
-        tokio::select! {
-            biased;
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() { break; }
-            }
-            accept = listener.accept() => {
-                match accept {
-                    Ok((stream, _addr)) => {
-                        debug!(target: "strait_host::listener", path = %path.display(), "unix connection accepted");
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream).await {
-                                debug!(target: "strait_host::listener", error = %e, "unix connection handler error");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        warn!(target: "strait_host::listener", error = %e, "unix accept error");
-                    }
-                }
+) -> impl tokio_stream::Stream<Item = std::io::Result<UnixConn>> {
+    async_stream::stream! {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => yield Ok(UnixConn(stream)),
+                Err(e) => yield Err(e),
             }
         }
     }
-    debug!(target: "strait_host::listener", path = %path.display(), "unix accept loop exited");
 }
 
-async fn tcp_accept_loop(listener: TcpListener, mut shutdown: watch::Receiver<bool>) {
-    loop {
-        tokio::select! {
-            biased;
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() { break; }
-            }
-            accept = listener.accept() => {
-                match accept {
-                    Ok((stream, addr)) => {
-                        debug!(target: "strait_host::listener", %addr, "tcp connection accepted");
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream).await {
-                                debug!(target: "strait_host::listener", error = %e, "tcp connection handler error");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        warn!(target: "strait_host::listener", error = %e, "tcp accept error");
-                    }
-                }
-            }
-        }
+/// Tonic-compatible wrapper around a `tokio::net::UnixStream`. Implements
+/// `Connected` so `tonic::transport::Server::serve_with_incoming` can
+/// expose peer credentials to RPC handlers via `UdsConnectInfo`.
+#[derive(Debug)]
+pub(crate) struct UnixConn(tokio::net::UnixStream);
+
+impl Connected for UnixConn {
+    type ConnectInfo = UdsConnectInfo;
+
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.0.connect_info()
     }
-    debug!(target: "strait_host::listener", "tcp accept loop exited");
 }
 
-/// Stubbed heartbeat handler. Reads one inbound frame, writes an `OK\n`
-/// acknowledgement, and closes. The real protocol (gRPC over both sockets)
-/// lands in H-HCP-2; this handler exists so smoke tests can confirm both
-/// listeners are reachable end to end.
-async fn handle_connection<S>(stream: S) -> std::io::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    let (mut r, mut w) = tokio::io::split(stream);
-    let mut buf = [0u8; 256];
-    let n = r.read(&mut buf).await?;
-    if n > 0 {
-        w.write_all(b"OK\n").await?;
-        w.flush().await?;
+// tokio's UnixStream already implements Connected via a blanket tonic impl,
+// but that blanket impl only lights up inside tonic-internal contexts. We
+// forward explicitly above so external callers can obtain the info.
+
+impl AsyncRead for UnixConn {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
     }
-    let _ = w.shutdown().await;
-    Ok(())
 }
 
-// Expose typed variants for callers that already have a concrete stream.
-// These are thin wrappers over the generic handler and exist mostly for
-// symmetry with future protocol-aware handlers.
-#[allow(dead_code)]
-async fn handle_unix(stream: UnixStream) -> std::io::Result<()> {
-    handle_connection(stream).await
+impl AsyncWrite for UnixConn {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
 }
 
-#[allow(dead_code)]
-async fn handle_tcp(stream: TcpStream) -> std::io::Result<()> {
-    handle_connection(stream).await
+/// Build a future that resolves when the shutdown watch flips to `true`.
+/// Tonic's `serve_with_incoming_shutdown` takes any future; we want the
+/// first `true` to win so the future resolves promptly on shutdown.
+async fn shutdown_future(mut rx: watch::Receiver<bool>) {
+    // If the signal is already set, return immediately.
+    if *rx.borrow() {
+        return;
+    }
+    // Otherwise wait for the next change. We ignore errors: a closed sender
+    // just means the signal source is gone, which is also "time to stop".
+    let _ = rx.changed().await;
 }
 
-/// Return the effective TCP listener address (for logging and tests). The
-/// caller passes the configured value; when the configured port is 0 the
-/// kernel assigns one at bind time, so tests that need the real port should
-/// obtain it from `TcpListener::local_addr` instead.
+/// Return the effective TCP listener address (for logging). The caller
+/// passes the configured value; when the configured port is 0 the kernel
+/// assigns one at bind time, so tests that need the real port should obtain
+/// it from `TcpListener::local_addr` instead.
 #[allow(dead_code)]
-pub fn describe_tcp(addr: SocketAddr) -> String {
+pub fn describe_tcp(addr: std::net::SocketAddr) -> String {
     format!("{addr}")
 }
 
@@ -250,10 +291,9 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
     use std::time::Duration;
+    use strait_proto::v1::strait_host_client::StraitHostClient;
+    use strait_proto::v1::{HeartbeatRequest, RegisterContainerRequest};
     use tempfile::tempdir;
-    use tokio::io::AsyncReadExt;
-    use tokio::net::TcpStream as TokioTcpStream;
-    use tokio::net::UnixStream as TokioUnixStream;
     use tokio::time::timeout;
 
     fn test_config(dir: &Path) -> HostConfig {
@@ -262,6 +302,24 @@ mod tests {
             tcp_listen: "127.0.0.1:0".parse().unwrap(),
             socket_mode: 0o600,
         }
+    }
+
+    async fn connect_unix(path: std::path::PathBuf) -> StraitHostClient<tonic::transport::Channel> {
+        use hyper_util::rt::TokioIo;
+        use tonic::transport::{Endpoint, Uri};
+        use tower::service_fn;
+        let endpoint = Endpoint::try_from("http://strait-host.local").unwrap();
+        let channel = endpoint
+            .connect_with_connector(service_fn(move |_: Uri| {
+                let path = path.clone();
+                async move {
+                    let s = tokio::net::UnixStream::connect(&path).await?;
+                    Ok::<_, std::io::Error>(TokioIo::new(s))
+                }
+            }))
+            .await
+            .expect("connect");
+        StraitHostClient::new(channel)
     }
 
     #[tokio::test]
@@ -291,7 +349,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_sockets_accept_stub_heartbeat() {
+    async fn unix_listener_serves_heartbeat_rpc() {
         let dir = tempdir().unwrap();
         let cfg = test_config(dir.path());
         let unix_path = cfg.unix_socket.clone();
@@ -306,33 +364,35 @@ mod tests {
             if unix_path.exists() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(unix_path.exists(), "unix socket never appeared");
 
-        // The TCP port is ephemeral; we bound :0, so a test can't predict
-        // the port. For this test we pass an explicit port via the config
-        // by re-binding on a known address instead.
-        // To keep things simple, reserve a port ourselves and rebind the
-        // server: easier to just connect by asking the OS for a port we
-        // know won't conflict.
-        // Workaround: pick a port ahead of time by binding a throwaway
-        // listener and dropping it, then use that port in the config.
-        // This test path is covered by `tcp_listener_accepts_with_reserved_port`
-        // below; here we focus on the unix half.
-
-        // Unix: send a stub heartbeat and confirm the "OK" response.
-        let mut u = TokioUnixStream::connect(&unix_path)
+        let mut client = connect_unix(unix_path.clone()).await;
+        let resp = client
+            .heartbeat(HeartbeatRequest {
+                sent_at_unix_ms: 777,
+                ..Default::default()
+            })
             .await
-            .expect("unix connect");
-        u.write_all(b"HEARTBEAT\n").await.unwrap();
-        u.shutdown().await.unwrap();
-        let mut resp = Vec::new();
-        u.read_to_end(&mut resp).await.unwrap();
-        assert_eq!(resp, b"OK\n");
+            .expect("heartbeat rpc")
+            .into_inner();
+        assert_eq!(resp.received_at_unix_ms, 777);
+        assert!(resp.server_time_unix_ms >= 0);
+
+        // A follow-up RegisterContainer RPC over the same channel proves
+        // the transport keeps the connection alive between calls.
+        let reg = client
+            .register_container(RegisterContainerRequest {
+                container_id: "c1".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("register rpc")
+            .into_inner();
+        assert!(reg.session_id.starts_with("sess-"));
 
         shutdown.trigger();
-        // serve() should exit quickly.
         let r = timeout(Duration::from_secs(2), server).await;
         assert!(r.is_ok(), "server did not exit within 2s");
     }
@@ -355,20 +415,28 @@ mod tests {
         let server = tokio::spawn(async move { serve(&server_cfg, s).await });
 
         // Wait for TCP to bind.
-        let mut connected: Option<TokioTcpStream> = None;
         for _ in 0..100 {
-            if let Ok(s) = TokioTcpStream::connect(tcp_addr).await {
-                connected = Some(s);
+            if tokio::net::TcpStream::connect(tcp_addr).await.is_ok() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let mut t = connected.expect("tcp connect");
-        t.write_all(b"HEARTBEAT\n").await.unwrap();
-        t.shutdown().await.unwrap();
-        let mut resp = Vec::new();
-        t.read_to_end(&mut resp).await.unwrap();
-        assert_eq!(resp, b"OK\n");
+
+        let channel = tonic::transport::Endpoint::try_from(format!("http://{tcp_addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .expect("tcp connect");
+        let mut client = StraitHostClient::new(channel);
+        let resp = client
+            .heartbeat(HeartbeatRequest {
+                sent_at_unix_ms: 9,
+                ..Default::default()
+            })
+            .await
+            .expect("heartbeat rpc")
+            .into_inner();
+        assert_eq!(resp.received_at_unix_ms, 9);
 
         shutdown.trigger();
         let r = timeout(Duration::from_secs(2), server).await;
@@ -389,7 +457,7 @@ mod tests {
             if cfg.unix_socket.exists() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
         let t0 = std::time::Instant::now();

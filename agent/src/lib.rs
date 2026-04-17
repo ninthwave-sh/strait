@@ -20,12 +20,16 @@
 //!   as the new way to learn the original destination. Exposes
 //!   [`proxy::run`] for the binary and [`proxy::handle_connection`] for
 //!   integration tests.
+//! - [`host_client`]: gRPC client for the host control plane. Connects
+//!   over the bind-mounted Unix domain socket shared with `strait-host`.
 //!
 //! Future phases (H-ICDP-2, H-ICDP-4) will fill in the entrypoint
 //! privilege-drop flow and container-side CA trust injection.
 
 pub mod config;
+pub mod host_client;
 pub mod proxy;
 pub mod so_original_dst;
 
 pub use config::AgentConfig;
+pub use host_client::{connect_unix, HostClient, HostClientError};

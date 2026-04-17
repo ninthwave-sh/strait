@@ -12,6 +12,13 @@ export interface SessionRailEntry {
   alerted: boolean;
   /** True for the session currently bound to the right-hand detail pane. */
   active: boolean;
+  /**
+   * True for the session the onboarding overlay pinned as the operator's
+   * "first container." Rendered as a small chip on the rail row so that
+   * first-run operators can tell at a glance which container the tour is
+   * narrating.
+   */
+  pinned?: boolean;
 }
 
 export interface SessionRailProps {
@@ -69,7 +76,8 @@ export function SessionRail({ entries, loading, now, onSelect }: SessionRailProp
           const classes = [
             'session-row',
             entry.active ? 'active' : '',
-            entry.alerted ? 'alerted' : ''
+            entry.alerted ? 'alerted' : '',
+            entry.pinned ? 'pinned' : ''
           ]
             .filter(Boolean)
             .join(' ');
@@ -84,6 +92,11 @@ export function SessionRail({ entries, loading, now, onSelect }: SessionRailProp
               >
                 <div className="session-row-main">
                   <strong className="session-row-label">{label}</strong>
+                  {entry.pinned ? (
+                    <span className="session-row-pin" title="Pinned for the first-run tour">
+                      Pinned
+                    </span>
+                  ) : null}
                   <span className="session-row-mode">{entry.session.mode}</span>
                 </div>
                 <div className="session-row-meta">

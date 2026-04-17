@@ -205,12 +205,14 @@ pub fn apply(name: &str, output_dir: &Path) -> anyhow::Result<PresetLayout> {
     Ok(layout)
 }
 
-/// Onboarding block emitted at launch startup when the operator has
-/// opted into a devcontainer launch path.
+/// Onboarding block surfaced on the first-run path (desktop shell or CLI
+/// scaffolding) when the operator is spinning up a devcontainer-backed
+/// session for the first time.
 ///
 /// Kept small and specific on purpose: the goal is to make the trust
 /// boundary and the follow-up loop legible without walking the operator
-/// through the whole product.
+/// through the whole product. The canonical narrative is in
+/// `docs/getting-started.md`; these lines are the short-form reminder.
 pub fn devcontainer_onboarding_lines() -> Vec<String> {
     vec![
         "First run? The container trust boundary is local to this session.".to_string(),

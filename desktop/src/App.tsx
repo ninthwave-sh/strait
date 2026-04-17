@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { resolveBridge, type DesktopBridge } from './bridge';
+import { Onboarding } from './Onboarding';
 import { SessionRail, sessionLabel, type SessionRailEntry } from './Sessions';
 import type {
   BlockedBatch,
@@ -9,6 +10,64 @@ import type {
   DesktopSnapshot,
   SessionSummary
 } from './types';
+
+const ONBOARDING_DISMISS_STORAGE_KEY = 'strait-desktop.onboarding.dismissed';
+
+function readDismissedFromStorage(): boolean {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return false;
+  }
+  try {
+    return window.localStorage.getItem(ONBOARDING_DISMISS_STORAGE_KEY) === 'true';
+  } catch {
+    // Some harnesses (including the fixture preload) refuse localStorage
+    // access. Failing closed here just means the overlay is visible, which
+    // is the safe default for a first-run hint.
+    return false;
+  }
+}
+
+function writeDismissedToStorage(dismissed: boolean) {
+  if (typeof window === 'undefined' || !window.localStorage) {
+    return;
+  }
+  try {
+    if (dismissed) {
+      window.localStorage.setItem(ONBOARDING_DISMISS_STORAGE_KEY, 'true');
+    } else {
+      window.localStorage.removeItem(ONBOARDING_DISMISS_STORAGE_KEY);
+    }
+  } catch {
+    // localStorage is a nice-to-have; if it is not writable the onboarding
+    // overlay will reappear on the next desktop start, which is strictly a
+    // minor annoyance rather than a correctness issue.
+  }
+}
+
+/**
+ * Picks the session the desktop pins to the onboarding walkthrough. The
+ * earliest `firstSeenAtUnixMs` wins so first-run operators always look at
+ * the same row while the tour is live. Sessions with no timestamp (which
+ * should not happen in production but does in fixtures) sort last.
+ */
+export function pickPinnedSession(sessions: SessionSummary[]): SessionSummary | null {
+  if (sessions.length === 0) {
+    return null;
+  }
+  let best: SessionSummary | null = null;
+  for (const session of sessions) {
+    if (!best) {
+      best = session;
+      continue;
+    }
+    const bestTs = best.firstSeenAtUnixMs ?? Number.POSITIVE_INFINITY;
+    const candidateTs = session.firstSeenAtUnixMs ?? Number.POSITIVE_INFINITY;
+    if (candidateTs < bestTs) {
+      best = session;
+    }
+  }
+  return best;
+}
 
 const EMPTY_SNAPSHOT: DesktopSnapshot = {
   enabled: false,
@@ -110,6 +169,12 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
   const [customTtls, setCustomTtls] = useState<Record<string, string>>({});
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [seenBlockedIds, setSeenBlockedIds] = useState<Record<string, true>>({});
+  // Onboarding overlay state. `persistedCount` advances the tour past the
+  // final step; `dismissed` hides the overlay outright. Both are local to
+  // the desktop shell because the host has no concept of per-operator tour
+  // progress.
+  const [onboardingDismissed, setOnboardingDismissed] = useState<boolean>(readDismissedFromStorage);
+  const [persistedCount, setPersistedCount] = useState<number>(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -253,15 +318,23 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
     return counts;
   }, [batchesBySession]);
 
+  const pinnedSession = useMemo(() => pickPinnedSession(snapshot.sessions), [snapshot.sessions]);
+
+  // The pinned chip only matters while the onboarding tour is active. Once
+  // the operator has persisted a rule or explicitly skipped the tour, the
+  // chip goes away so the rail stays uncluttered.
+  const showPin = !onboardingDismissed && persistedCount === 0;
+
   const sessionEntries = useMemo<SessionRailEntry[]>(
     () =>
       snapshot.sessions.map((session) => ({
         session,
         pendingCount: pendingCountsBySession.get(session.sessionId) ?? 0,
         alerted: Boolean(alertedSessionIds[session.sessionId]),
-        active: session.sessionId === activeSessionId
+        active: session.sessionId === activeSessionId,
+        pinned: showPin && session.sessionId === pinnedSession?.sessionId
       })),
-    [activeSessionId, alertedSessionIds, pendingCountsBySession, snapshot.sessions]
+    [activeSessionId, alertedSessionIds, pendingCountsBySession, pinnedSession, showPin, snapshot.sessions]
   );
 
   const selectedBatch =
@@ -294,6 +367,13 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
           }
           return next;
         });
+        if (action === 'persist') {
+          // A successful persist advances the onboarding tour from the
+          // `persist` step to `done`. We count rather than flip a boolean so
+          // that additional persists after the tour ends are still
+          // observable in case we want to surface them later.
+          setPersistedCount((current) => current + 1);
+        }
       } catch (error) {
         setErrorMessage(error instanceof Error ? error.message : 'Decision failed.');
       } finally {
@@ -331,6 +411,17 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
     0
   );
 
+  const handleDismissOnboarding = useCallback(() => {
+    setOnboardingDismissed(true);
+    writeDismissedToStorage(true);
+  }, []);
+
+  const handleFocusPinned = useCallback(() => {
+    if (pinnedSession) {
+      handleSelectSession(pinnedSession.sessionId);
+    }
+  }, [handleSelectSession, pinnedSession]);
+
   return (
     <div className="app-shell">
       <header className="header">
@@ -358,6 +449,18 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
 
       {errorMessage ? <div className="error-banner">{errorMessage}</div> : null}
       {snapshot.lastError ? <div className="warning-banner">{snapshot.lastError}</div> : null}
+
+      <Onboarding
+        connected={snapshot.connected}
+        lastError={snapshot.lastError}
+        sessions={snapshot.sessions}
+        pendingCount={totalPending}
+        pinnedSession={pinnedSession}
+        persistedCount={persistedCount}
+        dismissed={onboardingDismissed}
+        onDismiss={handleDismissOnboarding}
+        onFocusPinned={handleFocusPinned}
+      />
 
       <main className="content-grid">
         <SessionRail

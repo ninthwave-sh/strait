@@ -62,6 +62,12 @@ class MockBridge implements DesktopBridge {
 describe('desktop shell', () => {
   beforeEach(() => {
     vi.useRealTimers();
+    // App.tsx persists the onboarding-dismissed flag to localStorage. jsdom
+    // keeps one storage instance per worker, so a test that dismisses the
+    // tour would leak into later tests that assume the overlay is visible.
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.clear();
+    }
   });
 
   afterEach(() => {
@@ -284,6 +290,70 @@ describe('desktop shell', () => {
       expect(within(alertsPanel).getByText('hooks.slack.com')).toBeInTheDocument();
     });
     expect(within(alertsPanel).queryByText('api.github.com')).toBeNull();
+  });
+
+  it('shows the first-run tour and pins the earliest registered container', async () => {
+    const pinned = buildSession({
+      sessionId: 'session-first',
+      containerName: 'alpha',
+      firstSeenAtUnixMs: 1_000
+    });
+    const other = buildSession({
+      sessionId: 'session-second',
+      containerName: 'beta',
+      firstSeenAtUnixMs: 5_000
+    });
+    const bridge = new MockBridge(
+      buildSnapshot({
+        sessions: [other, pinned],
+        blockedRequests: []
+      })
+    );
+
+    render(<App bridge={bridge} />);
+
+    // The tour panel is live and the rail tags alpha as "Pinned" even though
+    // beta appears first in the sessions array -- pinning is by
+    // firstSeenAtUnixMs, not array order.
+    expect(await screen.findByRole('region', { name: 'First-run walkthrough' })).toBeInTheDocument();
+    const alphaRow = screen.getByRole('button', { name: /Focus session alpha/ });
+    expect(within(alphaRow).getByText('Pinned')).toBeInTheDocument();
+    const betaRow = screen.getByRole('button', { name: /Focus session beta/ });
+    expect(within(betaRow).queryByText('Pinned')).toBeNull();
+  });
+
+  it('replaces the tour with a celebration after the operator persists a rule', async () => {
+    const bridge = new MockBridge(buildSnapshot());
+    render(<App bridge={bridge} />);
+
+    // Click Persist on the seed blocked request.
+    fireEvent.click(await screen.findByRole('button', { name: 'Persist' }));
+
+    await waitFor(() => {
+      expect(bridge.decisions.at(-1)?.action).toBe('persist');
+    });
+
+    // The tour moves to the "done" card, which is the only place the
+    // "Close tour" button exists.
+    expect(await screen.findByRole('button', { name: 'Close tour' })).toBeInTheDocument();
+  });
+
+  it('keeps the host-missing prompt in the tour when the control plane is offline', async () => {
+    const bridge = new MockBridge(
+      buildSnapshot({
+        connected: false,
+        sessions: [],
+        blockedRequests: [],
+        lastError: 'UNAVAILABLE: connect ENOENT /tmp/strait-control.sock'
+      })
+    );
+    render(<App bridge={bridge} />);
+
+    const tour = await screen.findByRole('region', { name: 'First-run walkthrough' });
+    expect(within(tour).getByText(/Start the host control plane/)).toBeInTheDocument();
+    // The raw error text is still surfaced (for operators who want the
+    // detail) but only as parenthetical copy, not as the top-line message.
+    expect(within(tour).getByText(/cannot reach/)).toBeInTheDocument();
   });
 
   it('auto-denies expired alerts after the countdown reaches zero', async () => {

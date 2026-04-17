@@ -82,10 +82,12 @@ async fn connect_unix(path: PathBuf) -> StraitHostClient<Channel> {
 }
 
 fn test_config(sock: PathBuf, port: u16) -> HostConfig {
+    let db = sock.with_extension("rules.db");
     HostConfig {
         unix_socket: sock,
         tcp_listen: format!("127.0.0.1:{port}").parse().unwrap(),
         socket_mode: DEFAULT_SOCKET_MODE,
+        rules_db: db,
     }
 }
 
@@ -323,14 +325,14 @@ async fn default_service_returns_unimplemented_for_deferred_rpcs() {
         .expect_err("should be unimplemented");
     assert_eq!(err.code(), tonic::Code::Unimplemented);
 
-    // StreamRules: server-streaming. The initial call fails with
-    // Unimplemented before any messages flow; the client sees the status
-    // code on the outer Result.
+    // StreamRules: server-streaming. Now implemented (H-HCP-3); an empty
+    // session_id still yields InvalidArgument, which proves the server is
+    // validating the request before opening a stream.
     let err = client
         .stream_rules(StreamRulesRequest::default())
         .await
-        .expect_err("should be unimplemented");
-    assert_eq!(err.code(), tonic::Code::Unimplemented);
+        .expect_err("empty session_id must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
     // StreamObservations: client-streaming. Empty outbound stream; server
     // returns Unimplemented immediately.

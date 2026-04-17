@@ -27,6 +27,7 @@ use tracing::{info, warn};
 
 use crate::config::HostConfig;
 use crate::grpc::StraitHostService;
+use crate::rule_store::RuleStore;
 
 /// Shutdown signal shared by the listeners. Drop it to close listeners;
 /// call [`ShutdownSignal::trigger`] to request graceful termination.
@@ -83,8 +84,20 @@ impl Default for ShutdownSignal {
 /// Blocks until `shutdown` fires and both listeners have stopped accepting.
 /// On return, the Unix socket file has been removed and the TCP listener
 /// has been dropped.
+///
+/// The persistent rule store is opened from `cfg.rules_db`; tests that need
+/// a throwaway store can construct a `StraitHostService` manually and call
+/// [`serve_with_service`] instead.
 pub async fn serve(cfg: &HostConfig, shutdown: ShutdownSignal) -> Result<()> {
-    serve_with_service(cfg, shutdown, StraitHostService::new()).await
+    let rules = RuleStore::open(&cfg.rules_db)
+        .with_context(|| format!("opening rule store {}", cfg.rules_db.display()))?;
+    info!(
+        target: "strait_host::listener",
+        path = %cfg.rules_db.display(),
+        "rule store ready",
+    );
+    let svc = StraitHostService::with_rule_store(Arc::new(rules));
+    serve_with_service(cfg, shutdown, svc).await
 }
 
 /// Run the host listeners with a caller-provided service implementation.
@@ -301,6 +314,7 @@ mod tests {
             unix_socket: dir.join("host.sock"),
             tcp_listen: "127.0.0.1:0".parse().unwrap(),
             socket_mode: 0o600,
+            rules_db: dir.join("rules.db"),
         }
     }
 

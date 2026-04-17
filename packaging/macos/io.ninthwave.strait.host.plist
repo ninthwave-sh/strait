@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd template for the strait-host control plane.
+
+  Installed to ~/Library/LaunchAgents/io.ninthwave.strait.host.plist by
+  `brew services start strait` (the Homebrew formula in Formula/strait.rb
+  generates an equivalent plist automatically). Keep this template in
+  sync with the formula's `service do` block so manual installs match
+  brew-managed installs.
+
+  The placeholder paths `@STRAIT_BIN@` and `@LOG_DIR@` are replaced by
+  the install flow; the Homebrew formula substitutes its own
+  `opt_bin/"strait-host"` and `var/"log"` values and does not use this
+  file verbatim. The Linux installer does not use this file at all.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.ninthwave.strait.host</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@STRAIT_BIN@/strait-host</string>
+        <string>serve</string>
+    </array>
+
+    <!-- Run on load (and on reboot) and keep running. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Restart the service at most every 5 seconds so crash loops do
+         not saturate the machine. -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>@LOG_DIR@/strait-host.log</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG_DIR@/strait-host.log</string>
+
+    <!-- Keep the environment minimal; strait-host reads
+         $HOME/.config/strait/host.toml at startup. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>

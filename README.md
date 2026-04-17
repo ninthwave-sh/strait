@@ -43,6 +43,30 @@ Cedar policies control network egress:
 
 Strait's trust boundary is **container-local**. No machine-wide CA install is required. A session-local CA is generated at startup and trusted only inside the container that owns the session. When the session ends, the CA is gone.
 
+## Installing `strait-host`
+
+The host control plane runs outside the container. Install it on the machine that runs your devcontainers.
+
+### macOS (Homebrew)
+
+```bash
+brew install ninthwave-io/tap/strait
+sudo $(brew --prefix strait)/share/strait/setup-socket-dir.sh
+brew services start strait
+```
+
+`brew services start` writes a launchd entry at `~/Library/LaunchAgents/io.ninthwave.strait.host.plist` and boots `strait-host` on load. The `setup-socket-dir.sh` step grants your user write access to `/var/run/strait/` so the host can bind its Unix socket without root.
+
+### Linux (tarball + systemd user unit)
+
+```bash
+curl -LO https://github.com/ninthwave-io/strait/releases/latest/download/strait-linux.tar.gz
+tar -xzf strait-linux.tar.gz && cd strait-linux
+./packaging/linux/install.sh
+```
+
+The installer drops the binaries under `~/.local/bin`, writes a systemd user unit at `~/.config/systemd/user/strait-host.service`, seeds `~/.config/strait/host.toml`, and enables the unit with `systemctl --user enable --now strait-host.service`. When systemd is unavailable it prints a foreground-run command instead. Run `./packaging/linux/uninstall.sh` to reverse the install.
+
 ## Quick start
 
 ### 1. Scaffold a devcontainer with a starter policy

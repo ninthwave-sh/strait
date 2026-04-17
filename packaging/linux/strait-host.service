@@ -1,0 +1,39 @@
+# strait-host user-mode systemd service.
+#
+# Installed by packaging/linux/install.sh to
+# ~/.config/systemd/user/strait-host.service. Runs the host control
+# plane as the invoking user; there is no system-wide install path.
+# Keep this unit in the user manager so the socket directory, rule
+# store, and observations log inherit the user's uid/gid by default.
+#
+# Enable and start with:
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now strait-host.service
+#
+# The install script also writes a matching host.toml stub at
+# $HOME/.config/strait/host.toml and prepares /var/run/strait/ with the
+# user's ownership; no service-level tweaks are needed for the defaults.
+
+[Unit]
+Description=strait host control plane
+Documentation=https://github.com/ninthwave-io/strait
+# Wait for the network stack so the desktop TCP listener can bind; the
+# unix socket alone would not need this, but it costs nothing.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %h expands to the user's home dir at start time. The install script
+# places the binary at ~/.local/bin by default; override by editing
+# this unit or passing --prefix to the installer.
+ExecStart=%h/.local/bin/strait-host serve
+Restart=on-failure
+RestartSec=2s
+# Ask systemd to keep journal lines intact rather than rate-limiting
+# our structured JSON logs.
+LogRateLimitIntervalSec=0
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

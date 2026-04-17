@@ -1,0 +1,32 @@
+# Docker image for the M-ICDP-6 invariants integration tests.
+#
+# Used by `agent/tests/invariants.rs` to exercise the three architecture
+# invariants from `docs/designs/in-container-rewrite.md`:
+#
+#   1. The agent user cannot read the host control-plane socket or modify
+#      iptables rules.
+#   2. The iptables REDIRECT catches raw TCP from the agent user regardless
+#      of whether `HTTPS_PROXY` is set in the environment.
+#   3. The agent user cannot signal the root-owned proxy process.
+#
+# The build context is populated at test time: the harness copies the
+# freshly-built `strait-agent` binary next to this Dockerfile before
+# invoking `docker build`. Keep the COPY step last so every other layer
+# is cacheable across test runs.
+FROM debian:stable-slim
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      iptables \
+      iproute2 \
+      procps \
+      ca-certificates \
+      netcat-openbsd \
+ && rm -rf /var/lib/apt/lists/*
+
+# uid 1001 matches the `testagent` identity used by every other
+# in-container-data-plane test so we can share expectations about
+# `--uid-owner` iptables matches across the suite.
+RUN useradd -m -u 1001 testagent
+
+COPY strait-agent /usr/local/bin/strait-agent
+RUN chmod +x /usr/local/bin/strait-agent

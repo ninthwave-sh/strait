@@ -6,19 +6,20 @@
 //!   H-ICDP-2) verify `CAP_NET_ADMIN`, install iptables OUTPUT REDIRECT
 //!   rules for the configured ports to the proxy port, then drop
 //!   privileges to the configured agent user and exec the agent command.
-//! - `proxy` -- MITM proxy. Will (in H-ICDP-3) host the pipeline moved
-//!   out of the top-level crate's `src/mitm.rs`, using `SO_ORIGINAL_DST`
-//!   to recover the intended destination after the REDIRECT.
-//!
-//! This skeleton only wires up clap, loads the startup config, prints
-//! a stub message, and exits successfully. No iptables work, no socket
-//! listening, no privilege drop.
+//! - `proxy` -- MITM proxy ported from the top-level crate's
+//!   `src/mitm.rs`. Accepts REDIRECT'd TCP connections, recovers the
+//!   original destination via `SO_ORIGINAL_DST`, terminates TLS with the
+//!   session-local CA, evaluates Cedar policy, and forwards upstream
+//!   (H-ICDP-3).
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use strait_agent::config::AgentConfig;
+use strait_agent::proxy::{self, PromptDenyClient, ProxyConfig};
 
 #[derive(Parser)]
 #[command(
@@ -57,9 +58,20 @@ enum Commands {
     },
     /// In-container MITM proxy.
     ///
-    /// Not implemented in this skeleton (H-ICDP-3). Currently prints the
-    /// parsed config and exits.
-    Proxy,
+    /// Accepts TCP connections rerouted by iptables REDIRECT, recovers
+    /// the original destination via `SO_ORIGINAL_DST`, terminates TLS
+    /// with the session-local CA, evaluates the Cedar policy, and
+    /// forwards upstream.
+    Proxy {
+        /// Path to the Cedar policy file.
+        #[arg(long, value_name = "PATH")]
+        policy: PathBuf,
+        /// Path to export the session CA cert (PEM) so the container
+        /// entrypoint can inject it into the trust store before language
+        /// runtimes start. The CA private key stays in process memory.
+        #[arg(long, value_name = "PATH")]
+        ca_cert: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -97,12 +109,31 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 println!("  child command    = {command:?}");
             }
+            Ok(())
         }
-        Commands::Proxy => {
-            println!("strait-agent: mode=proxy (skeleton; H-ICDP-3 fills this in)");
-            println!("  proxy_port       = {}", config.proxy_port);
-            println!("  host_socket      = {}", config.host_socket.display());
-        }
+        Commands::Proxy { policy, ca_cert } => run_proxy(&config, policy, ca_cert),
     }
-    Ok(())
+}
+
+fn run_proxy(config: &AgentConfig, policy: PathBuf, ca_cert: PathBuf) -> anyhow::Result<()> {
+    // Bind to all interfaces inside the container. iptables REDIRECT
+    // rewrites the destination to (127.0.0.1, proxy_port), but binding
+    // to 0.0.0.0 also works and matches what docker port-forwarding
+    // tests expect.
+    let listen_addr: SocketAddr = format!("0.0.0.0:{}", config.proxy_port)
+        .parse()
+        .expect("proxy port yields a valid sockaddr");
+    let proxy_cfg = ProxyConfig {
+        listen_addr,
+        policy_path: policy,
+        ca_cert_out: ca_cert,
+        host_rpc: Arc::new(PromptDenyClient),
+        test_upstream_override: None,
+        test_upstream_tls: None,
+        max_body_size: 10 * 1024 * 1024,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(proxy::run(proxy_cfg))
 }

@@ -16,10 +16,24 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+rustls = "0.23"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Path dep on the top-level strait crate so the agent can reuse the Cedar
+# policy engine and the session-local CA. Kept narrow on purpose: the agent
+# must stay small, so we only pull in what's needed for policy eval and
+# leaf cert issuance. The full MITM pipeline is ported (not re-exported)
+# into `proxy.rs` so the new SO_ORIGINAL_DST entry path is a first-class
+# part of the agent crate.
+strait = { path = ".." }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
+webpki-roots = "1"
 
 [dev-dependencies]
+rcgen = { version = "0.13", features = ["pem"] }
 tempfile = "3"

@@ -3053,11 +3053,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
+ "rcgen",
+ "rustls 0.23.37",
  "serde",
+ "serde_json",
+ "strait",
  "tempfile",
+ "tokio",
+ "tokio-rustls 0.26.4",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]

@@ -34,6 +34,7 @@
 //! Future phase (H-ICDP-4) will fill in container-side CA trust injection.
 
 pub mod config;
+pub mod decision_client;
 pub mod entrypoint;
 pub mod host_client;
 #[cfg(target_os = "linux")]
@@ -42,4 +43,5 @@ pub mod proxy;
 pub mod so_original_dst;
 
 pub use config::AgentConfig;
+pub use decision_client::{HostDecisionClient, DEFAULT_CALL_TIMEOUT};
 pub use host_client::{connect_unix, HostClient, HostClientError};

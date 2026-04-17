@@ -3,18 +3,23 @@
 //! This module wires the generated `strait_proto::v1::StraitHost` service
 //! trait to a concrete implementation. The following RPCs are live today:
 //!
-//!   * `RegisterContainer` and `Heartbeat` -- minimal session management
-//!     shipped in H-HCP-2.
-//!   * `StreamRules` -- multi-container rule store backed by SQLite, shipped
-//!     in H-HCP-3. Delivers an initial snapshot terminated by
+//!   * `RegisterContainer` and `Heartbeat` -- session management shipped
+//!     in H-HCP-2.
+//!   * `StreamRules` -- multi-container rule store backed by SQLite,
+//!     shipped in H-HCP-3. Delivers an initial snapshot terminated by
 //!     `KIND_SNAPSHOT_END` and then tails a broadcast channel for live
 //!     updates, filtering by scope so default-scope rules reach every
 //!     subscribing session and session-scope rules reach only their owner.
+//!   * `SubmitDecision` -- hold-and-resume decision queue plus the
+//!     persist action, shipped in H-HCP-6. Blocked requests park on the
+//!     queue until an operator resolves them; if a matching persisted
+//!     rule already exists the call short-circuits with
+//!     `Verdict::AllowPersist` without ever touching the queue.
 //!
-//! `SubmitDecision`, `FetchCredential`, and `StreamObservations` still
-//! return `Status::unimplemented` with a pointer to the follow-on work item.
+//! `FetchCredential` and `StreamObservations` still return
+//! `Status::unimplemented` with a pointer to the follow-on work item.
 //!
-//! Tests that need a different behaviour (for example an echoing
+//! Tests that need different behaviour (for example an echoing
 //! `SubmitDecision` stub for latency measurements) can define their own
 //! `StraitHost` impl; this struct is just the default production handler.
 
@@ -29,13 +34,14 @@ use strait_proto::v1::{
     rule_event, FetchCredentialRequest, FetchCredentialResponse, HeartbeatRequest,
     HeartbeatResponse, ObservationEvent, RegisterContainerRequest, RegisterContainerResponse,
     RuleEvent, StreamObservationsAck, StreamRulesRequest, SubmitDecisionRequest,
-    SubmitDecisionResponse,
+    SubmitDecisionResponse, Verdict,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::warn;
 
-use crate::rule_store::{Rule, RuleChange, RuleStore};
+use crate::decisions::{DecisionError, DecisionQueue, HoldInfo, PendingSummary};
+use crate::rule_store::{Rule, RuleAction, RuleChange, RuleDuration, RuleStore};
 
 /// Production implementation of the `StraitHost` gRPC service.
 ///
@@ -46,28 +52,42 @@ use crate::rule_store::{Rule, RuleChange, RuleStore};
 #[derive(Debug, Clone)]
 pub struct StraitHostService {
     sessions: Arc<AtomicU64>,
+    decisions: Arc<DecisionQueue>,
     rules: Arc<RuleStore>,
 }
 
+impl Default for StraitHostService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StraitHostService {
-    /// Fresh service with an in-memory rule store. The in-memory store is
-    /// convenient for tests and for smoke-check invocations; production
-    /// callers use [`StraitHostService::with_rule_store`] and point the
-    /// store at a persistent file.
+    /// Fresh service with an in-memory rule store and a default decision
+    /// queue. The in-memory store is convenient for tests and smoke-check
+    /// invocations; production callers use
+    /// [`StraitHostService::with_state`] to plug in a persistent store.
     pub fn new() -> Self {
         let rules = RuleStore::in_memory().expect("in-memory rule store should always open");
-        Self::with_rule_store(Arc::new(rules))
+        Self::with_state(Arc::new(DecisionQueue::default()), Arc::new(rules))
     }
 
-    /// Build a service around a caller-provided rule store. Use this to
-    /// share one store across listeners or between this service and other
-    /// rule-producing code paths (the desktop app editor, the hold-and-
-    /// resume decision handler, and so on).
-    pub fn with_rule_store(rules: Arc<RuleStore>) -> Self {
+    /// Build a service that shares the supplied decision queue and rule
+    /// store with other subsystems (the desktop-facing resolver, the
+    /// rule-stream implementation, etc.).
+    pub fn with_state(decisions: Arc<DecisionQueue>, rules: Arc<RuleStore>) -> Self {
         Self {
             sessions: Arc::new(AtomicU64::new(0)),
+            decisions,
             rules,
         }
+    }
+
+    /// Back-compat convenience: build a service with just a rule store and
+    /// the default decision queue. Used by the binary entry point and
+    /// pre-existing tests.
+    pub fn with_rule_store(rules: Arc<RuleStore>) -> Self {
+        Self::with_state(Arc::new(DecisionQueue::default()), rules)
     }
 
     /// Number of `RegisterContainer` calls served since the process started.
@@ -76,19 +96,78 @@ impl StraitHostService {
         self.sessions.load(Ordering::Relaxed)
     }
 
+    /// Shared decision queue handle, for desktop-side resolvers and tests.
+    pub fn decision_queue(&self) -> Arc<DecisionQueue> {
+        self.decisions.clone()
+    }
+
     /// Borrow the rule store the service is wired to. Callers can use this
     /// to insert rules from elsewhere and watch them flow through
     /// `StreamRules` to connected agents.
     pub fn rule_store(&self) -> &Arc<RuleStore> {
         &self.rules
     }
-}
 
-impl Default for StraitHostService {
-    fn default() -> Self {
-        Self::new()
+    /// Resolve a held `SubmitDecision` request with an operator verdict.
+    ///
+    /// When the verdict is [`Verdict::AllowPersist`], the matched
+    /// `(host, action)` is written into the rule store under
+    /// [`RuleStore::DEFAULT_SCOPE`] before the waiter is unparked; that way
+    /// a second in-flight request from any session that matches the newly
+    /// persisted rule short-circuits in `submit_decision` without bothering
+    /// the operator again.
+    ///
+    /// This is the library-level hook the desktop app and test harnesses
+    /// drive. The proto-level "operator" surface will be added in a later
+    /// item (for example M-HCP-7); until then, callers embed the host
+    /// crate to reach this entry point.
+    pub fn resolve_decision(
+        &self,
+        request_id: &str,
+        verdict: Verdict,
+    ) -> Result<PendingSummary, ResolveError> {
+        if matches!(verdict, Verdict::AllowPersist) {
+            // Look up the pending info so we know what to persist.
+            let info = self
+                .decisions
+                .pending_info(request_id)
+                .ok_or(ResolveError::Decision(DecisionError::UnknownRequest))?;
+            persist_allow_rule(
+                &self.rules,
+                RuleStore::DEFAULT_SCOPE,
+                &info.host,
+                &info.action,
+            )
+            .map_err(|e| ResolveError::Persist(e.to_string()))?;
+        }
+        self.decisions
+            .resolve(request_id, verdict)
+            .map_err(ResolveError::Decision)
     }
 }
+
+/// Error surfaced by [`StraitHostService::resolve_decision`].
+#[derive(Debug)]
+pub enum ResolveError {
+    /// The decision queue rejected the resolve.
+    Decision(DecisionError),
+    /// The rule store could not persist the rule. The `String` is the
+    /// underlying error message; we avoid leaking `anyhow::Error` into the
+    /// public surface so this type stays `Clone`-ish in the future if we
+    /// need it to be.
+    Persist(String),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decision(d) => write!(f, "{d}"),
+            Self::Persist(m) => write!(f, "persist rule: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
 
 /// Stream type returned by server-streaming RPCs. Boxed so the production
 /// impl and any test double share a single type.
@@ -117,12 +196,68 @@ impl StraitHost for StraitHostService {
 
     async fn submit_decision(
         &self,
-        _request: Request<SubmitDecisionRequest>,
+        request: Request<SubmitDecisionRequest>,
     ) -> Result<Response<SubmitDecisionResponse>, Status> {
-        // Hold-and-resume lands in H-HCP-6 (retargeted H-CSM-3/4).
-        Err(Status::unimplemented(
-            "SubmitDecision is implemented in H-HCP-6",
-        ))
+        let inner = request.into_inner();
+        if inner.request_id.is_empty() {
+            return Err(Status::invalid_argument("request_id must be set"));
+        }
+        if inner.host.is_empty() {
+            return Err(Status::invalid_argument("host must be set"));
+        }
+        let action = if inner.method.is_empty() {
+            "http:*".to_string()
+        } else {
+            format!("http:{}", inner.method.to_ascii_uppercase())
+        };
+
+        // Fast path: a persisted rule already covers this request. Rules
+        // land under default scope or the session's own scope; the rule
+        // store's `get` is keyed by the rule_id convention used on
+        // persist. We look up both scopes explicitly rather than scanning
+        // every rule in the store.
+        if let Some(rule) =
+            lookup_persisted_allow(&self.rules, &inner.session_id, &inner.host, &action)
+                .map_err(|e| Status::internal(format!("rule lookup: {e:#}")))?
+        {
+            return Ok(Response::new(SubmitDecisionResponse {
+                request_id: inner.request_id,
+                verdict: Verdict::AllowPersist as i32,
+                reason: format!("matched persisted rule {}", rule.rule_id),
+                decided_at_unix_ms: now_unix_ms(),
+                credential: None,
+            }));
+        }
+
+        // Slow path: park the request until an operator decides or the
+        // hold window elapses. The queue enforces the timeout; a missing
+        // operator therefore falls through to Verdict::Timeout, which the
+        // agent treats as default-deny.
+        let info = HoldInfo {
+            session_id: inner.session_id.clone(),
+            host: inner.host.clone(),
+            action: action.clone(),
+            method: inner.method.clone(),
+            path: inner.path.clone(),
+            explanation: inner.explanation.clone(),
+            observed_at_unix_ms: inner.observed_at_unix_ms,
+        };
+        let verdict = self.decisions.hold(&inner.request_id, info).await;
+        let reason = match verdict {
+            Verdict::Timeout => "no operator responded before timeout".to_string(),
+            Verdict::Deny => "operator denied".to_string(),
+            Verdict::AllowOnce => "operator allowed for this request".to_string(),
+            Verdict::AllowSession => "operator allowed for the session".to_string(),
+            Verdict::AllowPersist => "operator persisted allow rule".to_string(),
+            Verdict::Unspecified => String::new(),
+        };
+        Ok(Response::new(SubmitDecisionResponse {
+            request_id: inner.request_id,
+            verdict: verdict as i32,
+            reason,
+            decided_at_unix_ms: now_unix_ms(),
+            credential: None,
+        }))
     }
 
     async fn fetch_credential(
@@ -252,6 +387,71 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Compose the conventional rule id for a `(scope, host, action)` triple
+/// persisted via the `SubmitDecision` → `AllowPersist` flow. The id is
+/// stable so a second persist for the same triple upserts the existing
+/// row, and a lookup at `submit_decision` time can find the rule without
+/// scanning every entry in the store.
+fn persisted_allow_rule_id(scope: &str, host: &str, action: &str) -> String {
+    let host = host.to_ascii_lowercase();
+    format!("persist-allow:{scope}:{host}:{action}")
+}
+
+/// Cedar source for a single persist-allow rule. The rule is intentionally
+/// narrow: the decision pipeline already routes on `(host, action)`, so a
+/// broadly-worded `permit` that always fires is exactly what the host
+/// evaluator wants once the agent has matched the request against this
+/// rule id. Richer Cedar grammar belongs to operator-authored rules, not
+/// to the implicit persist button.
+fn persist_cedar_source(host: &str, action: &str) -> String {
+    format!("// auto-persisted allow for {host} / {action}\npermit(principal, action, resource);\n")
+}
+
+fn persist_allow_rule(
+    rules: &RuleStore,
+    scope: &str,
+    host: &str,
+    action: &str,
+) -> anyhow::Result<Rule> {
+    let rule_id = persisted_allow_rule_id(scope, host, action);
+    rules.upsert(Rule {
+        rule_id,
+        scope: scope.to_string(),
+        cedar_source: persist_cedar_source(host, action),
+        action: RuleAction::Allow,
+        duration: RuleDuration::Persist,
+        ttl_unix_ms: None,
+        version_token: String::new(),
+    })
+}
+
+/// Look up a persisted-allow rule that covers `(session_id, host, action)`.
+/// Checks the session-scoped rule first (narrower wins), then the
+/// default-scoped rule. Returns `Ok(None)` when neither exists so
+/// `submit_decision` falls back to the hold queue.
+fn lookup_persisted_allow(
+    rules: &RuleStore,
+    session_id: &str,
+    host: &str,
+    action: &str,
+) -> anyhow::Result<Option<Rule>> {
+    if !session_id.is_empty() {
+        let id = persisted_allow_rule_id(session_id, host, action);
+        if let Some(rule) = rules.get(&id)? {
+            if matches!(rule.action, RuleAction::Allow) {
+                return Ok(Some(rule));
+            }
+        }
+    }
+    let id = persisted_allow_rule_id(RuleStore::DEFAULT_SCOPE, host, action);
+    if let Some(rule) = rules.get(&id)? {
+        if matches!(rule.action, RuleAction::Allow) {
+            return Ok(Some(rule));
+        }
+    }
+    Ok(None)
+}
+
 fn rule_add_event(rule: &Rule) -> RuleEvent {
     RuleEvent {
         kind: rule_event::Kind::Add as i32,
@@ -308,8 +508,7 @@ fn event_for_session(change: &RuleChange, session_id: &str) -> Option<RuleEvent>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rule_store::{RuleAction, RuleDuration};
-    use strait_proto::v1::Verdict;
+    use std::time::Duration;
     use tokio_stream::StreamExt;
 
     fn test_rule(id: &str, scope: &str) -> Rule {
@@ -345,6 +544,7 @@ mod tests {
             .into_inner();
         assert_ne!(a.session_id, b.session_id, "session ids should differ");
         assert_eq!(svc.sessions_registered(), 2);
+        assert_eq!(a.default_scope, RuleStore::DEFAULT_SCOPE);
     }
 
     #[tokio::test]
@@ -358,13 +558,169 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_rpcs_still_return_unimplemented() {
+    async fn submit_decision_rejects_empty_request_id() {
         let svc = StraitHostService::new();
         let err = svc
-            .submit_decision(Request::new(SubmitDecisionRequest::default()))
+            .submit_decision(Request::new(SubmitDecisionRequest {
+                host: "api.github.com".into(),
+                method: "GET".into(),
+                ..Default::default()
+            }))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn submit_decision_short_circuits_on_persisted_rule() {
+        let decisions = Arc::new(DecisionQueue::new(Duration::from_millis(50)));
+        let rules = Arc::new(RuleStore::in_memory().unwrap());
+        // Pre-seed the rule the way resolve_decision(AllowPersist) would.
+        persist_allow_rule(
+            &rules,
+            RuleStore::DEFAULT_SCOPE,
+            "api.github.com",
+            "http:GET",
+        )
+        .unwrap();
+        let svc = StraitHostService::with_state(decisions, rules);
+
+        let resp = svc
+            .submit_decision(Request::new(SubmitDecisionRequest {
+                session_id: "sess-any".into(),
+                request_id: "r1".into(),
+                method: "GET".into(),
+                host: "api.github.com".into(),
+                path: "/".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.verdict, Verdict::AllowPersist as i32);
+        assert!(resp.reason.contains("persisted rule"));
+    }
+
+    #[tokio::test]
+    async fn submit_decision_times_out_with_no_responder() {
+        let decisions = Arc::new(DecisionQueue::new(Duration::from_millis(30)));
+        let rules = Arc::new(RuleStore::in_memory().unwrap());
+        let svc = StraitHostService::with_state(decisions, rules);
+
+        let resp = svc
+            .submit_decision(Request::new(SubmitDecisionRequest {
+                session_id: "sess".into(),
+                request_id: "r-timeout".into(),
+                method: "GET".into(),
+                host: "api.github.com".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.verdict, Verdict::Timeout as i32);
+        assert!(!resp.reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submit_decision_resolves_when_operator_allows_session() {
+        let decisions = Arc::new(DecisionQueue::new(Duration::from_secs(5)));
+        let rules = Arc::new(RuleStore::in_memory().unwrap());
+        let svc = StraitHostService::with_state(decisions.clone(), rules);
+
+        let svc_bg = svc.clone();
+        let handle = tokio::spawn(async move {
+            svc_bg
+                .submit_decision(Request::new(SubmitDecisionRequest {
+                    session_id: "sess".into(),
+                    request_id: "r-session".into(),
+                    method: "GET".into(),
+                    host: "api.github.com".into(),
+                    ..Default::default()
+                }))
+                .await
+        });
+
+        // Wait for the hold to register before resolving.
+        for _ in 0..50 {
+            if decisions.pending_info("r-session").is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        svc.resolve_decision("r-session", Verdict::AllowSession)
+            .unwrap();
+        let resp = handle.await.unwrap().unwrap().into_inner();
+        assert_eq!(resp.verdict, Verdict::AllowSession as i32);
+    }
+
+    #[tokio::test]
+    async fn resolve_with_persist_writes_rule() {
+        let decisions = Arc::new(DecisionQueue::new(Duration::from_secs(5)));
+        let rules = Arc::new(RuleStore::in_memory().unwrap());
+        let svc = StraitHostService::with_state(decisions.clone(), rules.clone());
+
+        let svc_bg = svc.clone();
+        let handle = tokio::spawn(async move {
+            svc_bg
+                .submit_decision(Request::new(SubmitDecisionRequest {
+                    session_id: "sess".into(),
+                    request_id: "r-persist".into(),
+                    method: "GET".into(),
+                    host: "api.github.com".into(),
+                    ..Default::default()
+                }))
+                .await
+        });
+
+        for _ in 0..50 {
+            if decisions.pending_info("r-persist").is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let summary = svc
+            .resolve_decision("r-persist", Verdict::AllowPersist)
+            .unwrap();
+        assert_eq!(summary.host, "api.github.com");
+        assert_eq!(summary.action, "http:GET");
+
+        let resp = handle.await.unwrap().unwrap().into_inner();
+        assert_eq!(resp.verdict, Verdict::AllowPersist as i32);
+
+        // A fresh SubmitDecision from any session should now hit the
+        // persisted rule and short-circuit.
+        let followup = svc
+            .submit_decision(Request::new(SubmitDecisionRequest {
+                session_id: "sess-other".into(),
+                request_id: "r-follow".into(),
+                method: "GET".into(),
+                host: "api.github.com".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(followup.verdict, Verdict::AllowPersist as i32);
+    }
+
+    #[tokio::test]
+    async fn resolve_unknown_request_returns_error() {
+        let svc = StraitHostService::new();
+        let err = svc
+            .resolve_decision("does-not-exist", Verdict::AllowOnce)
+            .unwrap_err();
+        match err {
+            ResolveError::Decision(DecisionError::UnknownRequest) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unimplemented_rpcs_return_unimplemented() {
+        let svc = StraitHostService::new();
         let err = svc
             .fetch_credential(Request::new(FetchCredentialRequest::default()))
             .await
@@ -483,5 +839,13 @@ mod tests {
         // Defense-in-depth: if someone adds a new Verdict variant above
         // `Unspecified`, proto3 semantics change. Lock the default value.
         assert_eq!(Verdict::default(), Verdict::Unspecified);
+    }
+
+    #[test]
+    fn persisted_allow_rule_id_is_lowercase_and_scoped() {
+        let a = persisted_allow_rule_id("default", "API.github.COM", "http:GET");
+        let b = persisted_allow_rule_id("default", "api.github.com", "http:GET");
+        assert_eq!(a, b, "host should be case-insensitive");
+        assert!(a.starts_with("persist-allow:default:"));
     }
 }

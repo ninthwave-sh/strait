@@ -4,7 +4,7 @@ Strait is the network policy layer for devcontainers. Keep `devcontainer.json` f
 
 This doc is the public companion to [`docs/designs/devcontainer-strategy.md`](designs/devcontainer-strategy.md). It explains where strait fits relative to the [Development Containers spec](https://containers.dev/) and Claude Code's [reference devcontainer](https://code.claude.com/docs/en/devcontainer).
 
-> **Heads up (2026-04-17):** the architecture is mid-rewrite. The strategy doc now describes an in-container data plane with iptables REDIRECT and a host-side control plane, and `strait launch` is being removed. The examples and migration steps below still reflect the older host-side proxy model and will be rewritten once Phase 1 of [`designs/in-container-rewrite.md`](designs/in-container-rewrite.md) lands.
+> **Architecture note (2026-04-17):** the in-container data plane has landed. Strait no longer orchestrates Docker or Podman from the host; container lifecycle belongs to your devcontainer tooling (VS Code Dev Containers, the devcontainer CLI, sandcastle, direct `docker run`). Strait ships a devcontainer feature at `ghcr.io/ninthwave-io/strait` that installs the in-container agent and iptables redirect rules. The strategy is described in [`designs/in-container-rewrite.md`](designs/in-container-rewrite.md); the onboarding walkthrough that uses this model lives in [`getting-started.md`](getting-started.md).
 
 ## Start here: incompatibilities and migration calls
 
@@ -12,10 +12,11 @@ If you are starting from Claude Code's reference devcontainer, make these decisi
 
 | `devcontainer.json` field | Strait position | What to do |
 | --- | --- | --- |
-| `forwardPorts` | Rejected by strait's network model | Remove it. Strait runs containers with `--network=none`, so inbound port forwarding does not fit the model. If the agent needs outbound API access, express that as Cedar policy instead. |
-| `runArgs` that add privilege, such as `--privileged`, `--cap-add=NET_ADMIN`, `--cap-add=NET_RAW`, or `--network=host` | Rejected | Remove them. These flags let the container bypass the gateway and proxy path that strait depends on. |
-| `privileged: true` / `capAdd` | Rejected | Remove them for the same reason. Strait needs a non-privileged container boundary. |
-| `mounts` | Not a strait policy feature | Keep them in `devcontainer.json`. Devcontainer owns filesystem shape; strait does not translate mounts into Cedar rules. |
+| `forwardPorts` | Supported | Keep them if you need inbound port forwarding. Strait's policy layer is outbound-only; inbound traffic is unaffected. |
+| `runArgs: ["--privileged"]`, `"--network=host"` | Rejected | Remove them. `--privileged` and host networking both let the container bypass the in-container proxy that strait depends on. |
+| `--cap-add=NET_ADMIN` | Required | The strait feature declares `capAdd: [NET_ADMIN]`. Any runtime that cannot grant `NET_ADMIN` at container start cannot run strait (see [`bring-your-own-sandbox.md`](bring-your-own-sandbox.md) for the matrix). |
+| `--cap-add=NET_RAW` | Not needed | Remove it. strait's iptables REDIRECT rules only need `NET_ADMIN`. |
+| `mounts` | Not a strait policy feature | Keep them in `devcontainer.json`. Devcontainer owns filesystem shape; strait does not translate mounts into Cedar rules. Mount the host control-plane socket here (see the feature's README). |
 
 Once strait is in place, remove `init-firewall.sh` and the `postStartCommand` that calls it. Keeping both works against the point of the migration: the iptables script is less expressive, requires extra container privileges, and duplicates the network policy job that strait is taking over.
 
@@ -53,7 +54,7 @@ That setup is a good baseline, but it stays at the firewall layer:
 | Environment contract | `devcontainer.json` + Dockerfile | `devcontainer.json` stays the environment contract |
 | Network rule source | Shell script that writes iptables/ipset rules | `policy.cedar` plus `strait.toml` |
 | Permission granularity | Domain and IP allowlist | HTTP method, host, path, and agent identity |
-| Privilege model | Needs extra container capabilities to edit firewall state | Keeps the proxy on the host and the container on `--network=none` |
+| Privilege model | Needs extra container capabilities to edit firewall state | Requires `NET_ADMIN` inside the container (for iptables REDIRECT). Agent workloads run as a non-root user and cannot modify iptables state after the entrypoint drops privileges. |
 | Change loop | Edit shell script, rebuild or restart container | Observe, generate, review, then reload or relaunch with policy |
 | Audit trail | Firewall verification and container logs | Structured audit log and live session surfaces |
 | Recommendation | Good status quo for a simple allowlist | Prefer strait when you need request-level network policy. Remove `init-firewall.sh` once strait is in place. |
@@ -66,8 +67,8 @@ Read them side by side like this:
 
 | Claude Code reference | Strait equivalent |
 | --- | --- |
-| `postStartCommand: "sudo /usr/local/bin/init-firewall.sh"` | `strait launch --policy ... --config ...` with Cedar rules for outbound requests |
-| `runArgs: ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW"]` | No privileged networking flags |
+| `postStartCommand: "sudo /usr/local/bin/init-firewall.sh"` | Devcontainer feature `ghcr.io/ninthwave-io/strait`: installs the in-container agent and applies Cedar policy at container start |
+| `runArgs: ["--cap-add=NET_ADMIN", "--cap-add=NET_RAW"]` | `NET_ADMIN` is added by the feature's `capAdd`. `NET_RAW` is unnecessary |
 | `mounts`, `workspaceMount`, `workspaceFolder`, `remoteUser`, `containerEnv` | Stay in `devcontainer.json` |
 | Domain/IP allowlist in shell | Request-level allowlist in Cedar |
 
@@ -185,11 +186,12 @@ If you already have a Claude Code style devcontainer, the intended migration is:
 
 1. Keep your devcontainer image, `remoteUser`, mounts, and editor settings.
 2. Delete `postStartCommand: "sudo /usr/local/bin/init-firewall.sh"`.
-3. Delete privileged networking `runArgs`.
-4. Add `strait.toml` and `policy.cedar`.
-5. Launch the agent through strait.
+3. Delete `--cap-add=NET_RAW`. `NET_ADMIN` stays -- the strait feature declares it via `capAdd`.
+4. Add the strait devcontainer feature to `features` in your `devcontainer.json`, and add a bind mount for the host control-plane socket.
+5. Add a starter `policy.cedar` (the `strait preset apply claude-code-devcontainer` command writes one next to your devcontainer files).
+6. Reopen the project in its container. The feature's entrypoint installs iptables REDIRECT rules and hands off to your normal command.
 
-Today, the closest repo example is [`examples/claude-code/README.md`](../examples/claude-code/README.md). The planned `--devcontainer` reader is described in [`docs/designs/devcontainer-strategy.md`](designs/devcontainer-strategy.md).
+Step-by-step onboarding, including the desktop shell tour, lives in [`getting-started.md`](getting-started.md). The feature's option list is documented in [`features/strait/README.md`](../features/strait/README.md).
 
 ## Recommendation
 

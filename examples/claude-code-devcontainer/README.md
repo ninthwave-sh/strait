@@ -9,10 +9,9 @@ repeatable flow.
 - `.devcontainer/devcontainer.json` drives the container environment.
 - `strait.toml` configures MITM hosts and credential injection.
 - `policy.cedar` is the starting network policy (GitHub + npm).
-- The in-container `strait-agent` proxy (phase 1 of the ongoing rewrite)
-  enforces policy inside the container. The host-side `strait launch`
-  orchestrator has been retired -- container lifecycle is handled by
-  your devcontainer tooling.
+- The in-container `strait-agent` proxy enforces policy inside the
+  container. Container lifecycle is handled by your devcontainer
+  tooling; strait does not orchestrate Docker or Podman from the host.
 
 No machine-wide CA install happens at any point. The session CA lives
 inside the container and is removed when the session ends.

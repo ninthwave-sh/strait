@@ -1,4 +1,4 @@
-//! Built-in launch presets.
+//! Built-in devcontainer presets.
 //!
 //! A preset bundles the three files an operator needs for a supported
 //! first-run flow -- a devcontainer.json, a strait.toml, and a Cedar
@@ -6,13 +6,14 @@
 //!
 //! Presets are the operator-ergonomics entry point for the devcontainer
 //! trust boundary. A new user runs `strait preset apply <name> <dir>`,
-//! gets a complete working setup, and launches with
-//! `strait launch --devcontainer ... --config ... --policy ...` from
-//! inside the extracted directory.
+//! gets a complete working setup, and then runs the extracted
+//! devcontainer with their usual tooling (VS Code, devcontainer CLI,
+//! sandcastle, etc.). strait no longer ships a host-side orchestrator;
+//! container lifecycle is the user's responsibility.
 //!
 //! Presets deliberately do NOT own runtime behavior. They are a thin
-//! distribution mechanism: once the files are on disk, the rest of the
-//! launch flow is unchanged and every knob is editable.
+//! distribution mechanism: once the files are on disk, every knob is
+//! editable.
 //!
 //! # Relationship to templates
 //!
@@ -81,17 +82,17 @@ pub struct PresetLayout {
 ///
 /// The other files in a preset (devcontainer.json, strait.toml, README.md)
 /// are safe to overwrite -- they do not accumulate user state. The policy
-/// file, however, is a durable record of persisted decisions made via
-/// `strait session persist-decision`. Overwriting it silently would
-/// discard rules the operator opted into keeping.
+/// file, however, is a durable record of persisted decisions. Overwriting
+/// it silently would discard rules the operator opted into keeping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyWriteMode {
     /// Always overwrite `policy.cedar`. Used by `strait preset apply`,
     /// which extracts a fresh starter policy for the operator to edit.
     Overwrite,
-    /// Preserve `policy.cedar` if it already exists. Used by the
-    /// `strait launch --preset` cache so persisted decisions accumulate
-    /// across relaunches instead of being reset every run.
+    /// Preserve `policy.cedar` if it already exists. Reserved for callers
+    /// that keep a long-lived cache of a preset and need persisted
+    /// decisions to accumulate across runs.
+    #[allow(dead_code)]
     PreserveIfExists,
 }
 
@@ -174,7 +175,7 @@ pub fn unknown_preset_error(name: &str) -> anyhow::Error {
 
 /// Print the list of presets to stdout.
 pub fn print_list() {
-    println!("Available launch presets:\n");
+    println!("Available devcontainer presets:\n");
     for preset in PRESETS {
         println!("  {:<30} {}", preset.name, preset.description);
     }
@@ -182,8 +183,8 @@ pub fn print_list() {
     println!("Apply a preset:");
     println!("  strait preset apply <name> <output-dir>");
     println!();
-    println!("Launch with an applied preset:");
-    println!("  strait launch --preset <name> -- <command> [args...]");
+    println!("Then launch the extracted devcontainer with your usual tooling (VS Code,");
+    println!("devcontainer CLI, sandcastle, or direct docker run).");
 }
 
 /// Apply a preset by name.
@@ -216,9 +217,7 @@ pub fn devcontainer_onboarding_lines() -> Vec<String> {
         "  - The session CA is bind-mounted read-only at /strait/ca.pem and removed on exit."
             .to_string(),
         "  - Blocked requests are held open and surface as live decisions.".to_string(),
-        "  - Approve once via `strait session persist-decision --session <ID> <BLOCKED_ID>`,"
-            .to_string(),
-        "    or from the desktop control plane, to write a durable Cedar rule.".to_string(),
+        "  - Approve from the desktop control plane to write a durable Cedar rule.".to_string(),
         "  - Persisted rules land in your policy.cedar and survive across relaunches.".to_string(),
         "  - Re-run the same command in a new session to confirm the rule persisted.".to_string(),
     ]
@@ -404,9 +403,9 @@ mod tests {
 
     #[test]
     fn apply_preserve_mode_keeps_existing_policy() {
-        // `strait launch --preset` points at the same cache directory
-        // on every invocation. Persisted decisions land in the cached
-        // policy.cedar; the second apply must not overwrite them.
+        // Callers that keep a long-lived cache of an applied preset need
+        // persisted decisions to accumulate across applies. The second
+        // apply in PreserveIfExists mode must not overwrite them.
         let dir = tempfile::tempdir().unwrap();
         let preset = find("claude-code-devcontainer").unwrap();
 
@@ -519,8 +518,10 @@ mod tests {
             "onboarding should describe the blocked-request hold: {lines:?}"
         );
         assert!(
-            lines.iter().any(|line| line.contains("persist-decision")),
-            "onboarding should point operators at persist-decision: {lines:?}"
+            lines
+                .iter()
+                .any(|line| line.contains("desktop control plane") || line.contains("durable")),
+            "onboarding should point operators at a persist path: {lines:?}"
         );
         assert!(
             lines.iter().any(|line| line.contains("new session")),

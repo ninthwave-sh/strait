@@ -12,14 +12,13 @@ repository = "https://github.com/ninthwave-io/strait"
 readme = "README.md"
 
 [dependencies]
-prost = "0.13"
 hudsucker = { version = "0.22", features = ["rustls-client"] }
 cedar-policy = "4"
 rcgen = { version = "0.13", features = ["pem"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
@@ -36,7 +35,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 toml = "0.8"
 anyhow = "1"
-bollard = "0.18"
 aws-sigv4 = "1"
 aws-credential-types = "1"
 aws-smithy-runtime-api = "1"
@@ -45,22 +43,12 @@ hex = "0.4"
 arc-swap = "1"
 tempfile = "3"
 terminal_size = "0.4"
-futures-util = "0.3"
 libc = "0.2"
 signal-hook = "0.3"
-tar = "0.4"
-tokio-stream = { version = "0.1", features = ["net"] }
-tonic = { version = "0.12", features = ["transport", "tls"] }
-tonic-health = "0.12"
-tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
 tempfile = "3"
 libc = "0.2"
-
-[build-dependencies]
-protoc-bin-vendored = "3"
-tonic-build = "0.12"
 
 [[bin]]
 name = "mock-tui-fixture"

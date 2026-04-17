@@ -2,9 +2,9 @@
 
 > **Early development.** Strait is pre-v1, under active development, and not yet distributed or stable. APIs, config formats, and CLI flags will change. Not recommended for production use.
 
-strait is the network policy layer for devcontainers. Replace your iptables allowlist with a Cedar policy engine, live request-level decisions, and a desktop control plane.
+strait is the network policy layer for devcontainers. It pairs a container-scoped MITM proxy with a Cedar policy engine, request-level decisions, and (soon) a desktop control plane.
 
-Strait uses a container-scoped MITM proxy and Cedar to control outbound HTTP access from a devcontainer-style runtime. That owned runtime boundary is deliberate: request-level visibility without machine-wide CA trust needs a boundary we control.
+The host-side launcher has been retired. strait no longer orchestrates Docker or Podman itself. Container lifecycle is your responsibility: use the devcontainer feature (landing in a later phase), sandcastle, direct `docker run`, or any other devcontainer-compatible tool. strait provides the policy, the proxy, and the tooling that sits on top.
 
 ## The problem
 
@@ -12,32 +12,26 @@ Security teams need to answer one question: *what should this agent be allowed t
 
 Strait replaces coarse iptables allowlists with Cedar. Observe what an agent actually does, generate a network policy from that behavior, then enforce it.
 
-We explored a host-scoped pivot after looking closely at `nono`. The learning was useful, but it reinforced the original architecture: if you want MITM-level request control across everything the agent does, without mandating machine-wide CA trust, you need a runtime boundary you own. For Strait, that boundary is still the container.
-
-## How it works
+## Architecture at a glance
 
 ```
-  ┌──────────────────────────────────────────────────────┐
-  │          Container (Docker/Podman/OrbStack)          │
-  │                                                      │
-  │  ┌──────────────┐     ┌──────────────────────┐       │
-  │  │ AI Agent     │────▶│ Strait Proxy (MITM)  │──▶ API│
-  │  │ (your cmd)   │     │ Cedar eval + creds   │       │
-  │  │ [full TTY]   │     └──────────────────────┘       │
-  │  └──────────────┘                                    │
-  └──────────────────────┬───────────────────────────────┘
-                         │ observations
-  ┌──────────────────────▼───────────────────────────────┐
-  │  Strait Host Process                                 │
-  │   - Container lifecycle management                   │
-  │   - Local control API (session.info/watch.attach)    │
-  │   - gRPC control service for desktop clients         │
-  │   - Observation stream (Unix socket + JSONL)         │
-  │   - strait session watch - colored live event viewer │
-  │   - strait generate - Cedar policy from observations │
-  │   - strait test --replay - policy verification       │
-  └──────────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────┐
+  │              Container (your devcontainer)            │
+  │                                                       │
+  │  ┌──────────────┐     ┌──────────────────────┐        │
+  │  │ Agent        │────▶│ strait-agent proxy   │──▶ API │
+  │  │ (your cmd)   │     │ MITM + Cedar eval    │        │
+  │  └──────────────┘     └──────────────────────┘        │
+  └──────────────────────────┬────────────────────────────┘
+                             │ gRPC
+  ┌──────────────────────────▼────────────────────────────┐
+  │  strait-host (long-lived host process)                │
+  │   - Rule store, decisions, credentials, audit         │
+  │   - Desktop-facing gRPC API                           │
+  └───────────────────────────────────────────────────────┘
 ```
+
+Phase 1 of the rewrite has landed or is landing the in-container data plane (`strait-agent`). Phase 2 is landing the host control plane (`strait-host`). The top-level `strait` binary in this crate still ships the proxy, Cedar policy tooling, and preset scaffolding.
 
 Cedar policies control network egress:
 
@@ -45,165 +39,42 @@ Cedar policies control network egress:
 - **Identity-aware rules** - Use Cedar to scope requests by method, host, path, and agent identity instead of maintaining a shell-script allowlist.
 - **Devcontainer fit** - Keep image build, mounts, users, and editor settings in `devcontainer.json`. Use strait for outbound HTTP policy.
 
-Standalone proxy sessions still exist as a secondary mode for debugging and integrations, and they publish the same session control surfaces. They are useful infrastructure, but the primary product story is devcontainers plus request-level network policy.
-
 ## Trust boundary
 
-Strait's trust boundary is **container-local**. No machine-wide CA install is required for the primary `strait launch` runtime.
-
-What happens at launch:
-
-1. A session-local CA is generated on the host and written to a private temporary file, then bind-mounted read-only into the container at `/strait/ca.pem`. Nothing is added to the host's system trust store.
-2. An entrypoint script inside the container concatenates the image's system CA bundle (Debian, Alpine, or RHEL layout -- whichever the image ships) with the session CA and writes the result to `/tmp/strait-ca-bundle.pem`. If the CA source is unreadable the entrypoint fails loudly instead of falling back to host-wide trust.
-3. The container's trust env vars (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`) are all pointed at the augmented bundle, so OpenSSL, Node, and Python-based agents pick up the session CA automatically.
-4. The container's proxy env vars (`HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy`) are all pointed at the in-container gateway at `http://127.0.0.1:3128`.
-5. The container runs with `--network=none`. The only network path off the container is through the bind-mounted Unix socket that the `strait-gateway` binary forwards to the host proxy. Direct TCP bypass is not possible.
-
-When the session ends, the bind-mounted CA and the container are removed. The host's system trust store is untouched, and there is no step in the supported launch flow that tells an operator to install the CA anywhere on the host.
-
-`strait launch` and `strait session info` both print this trust boundary diagnostic when a session starts or is inspected, so it is always visible when debugging a failed launch.
-
-Standalone proxy mode (`strait proxy`) does **not** share this container-local guarantee: that mode depends on the host's trust configuration for whichever client points at it. See [Standalone proxy mode](#standalone-proxy-mode) for the tradeoff.
+Strait's trust boundary is **container-local**. No machine-wide CA install is required. A session-local CA is generated at startup and trusted only inside the container that owns the session. When the session ends, the CA is gone.
 
 ## Quick start
 
-### First run with a devcontainer
-
-The shortest path from "I just installed strait" to "my agent runs inside the container trust boundary" is the bundled `claude-code-devcontainer` preset. It ships a working `.devcontainer/devcontainer.json`, a `strait.toml`, and a starter Cedar policy for GitHub and npm together.
-
-Apply the preset into an empty directory and launch:
+### 1. Scaffold a devcontainer with a starter policy
 
 ```bash
 strait preset list
 strait preset apply claude-code-devcontainer ./my-agent
-cd my-agent
-strait launch \
-  --devcontainer .devcontainer/devcontainer.json \
-  --config strait.toml \
-  --policy policy.cedar \
-  -- curl -fsS https://api.github.com/zen
 ```
 
-Or skip the extract step and let `--preset` do the wiring for you:
+This writes `.devcontainer/devcontainer.json`, `strait.toml`, and a starter `policy.cedar` into `./my-agent`. Open the directory in your devcontainer tool of choice.
+
+See [`examples/claude-code-devcontainer/README.md`](examples/claude-code-devcontainer/README.md) for the full walkthrough.
+
+### 2. Run the standalone proxy (optional)
+
+Outside a devcontainer, the standalone proxy mode is useful for local integrations and debugging:
 
 ```bash
-strait launch --preset claude-code-devcontainer -- curl -fsS https://api.github.com/zen
+strait proxy --config strait.toml
 ```
 
-`--preset` runs in enforce mode using the preset's starter policy. If you want to edit the policy, pick a different mode (`--observe` / `--warn`), or run the same files from a directory you own, use `strait preset apply` first.
+The proxy runs the MITM pipeline, evaluates Cedar policy on every request, injects credentials on allowed requests, and streams observations. This mode depends on the pointing client's trust configuration — it does not share the container-local guarantee above.
 
-Startup prints an onboarding block that names the container trust boundary, explains that blocked requests are held open as live decisions, and tells you where the session-local CA lives (`/strait/ca.pem`, removed on exit). No machine-wide CA install happens at any point.
-
-For the full walkthrough -- running the control service, attaching the desktop shell, approving a blocked request, and confirming persistence in a second session -- see [`examples/claude-code-devcontainer/README.md`](examples/claude-code-devcontainer/README.md).
-
-### Launch an interactive session
+### 3. Observe what an agent does
 
 ```bash
-strait launch --observe -- ./my-agent
+strait init --observe 5m --config strait.toml --output-dir ./policy-draft
 ```
 
-`strait launch` starts the agent in a container, prints a stable session ID, and publishes two local Unix sockets:
+Starts the proxy in observation mode for five minutes, then generates `policy.cedar` and `policy.cedarschema` from the recorded traffic. Dynamic path segments (UUIDs, hashes) are collapsed to wildcards automatically.
 
-- a control socket used by `strait session info|reload-policy|replace-policy|stop`
-- an observation socket used by `strait session watch`
-
-In a second terminal, target the running session directly:
-
-```bash
-strait session list
-strait session info --session <SESSION_ID>
-strait session watch --session <SESSION_ID>
-```
-
-`strait session info` reports the session ID, mode, control socket, observation socket, and container identity when present. `strait session watch` renders the live event stream for that session, including lifecycle events such as `container:start`, live control-plane events such as `policy:reload`, and PTY resize events such as `tty:resize`.
-
-The older `strait watch` command remains as a compatibility alias, but session-targeted commands are the primary interface for live launch management.
-
-### Run the gRPC control service
-
-`strait` also ships a gRPC control service for desktop clients and remote operators. The protobuf contract lives in `proto/control.proto` and is designed to be remote-capable from the start: endpoint fields carry generic transport information instead of assuming localhost.
-
-Local-only service:
-
-```bash
-strait service start --socket /tmp/strait-control.sock
-strait service status --socket /tmp/strait-control.sock
-strait service stop --socket /tmp/strait-control.sock
-```
-
-Managed launch plus control service in one process:
-
-```bash
-strait service start \
-  --socket /tmp/strait-control.sock \
-  --observe \
-  --image ubuntu:24.04 \
-  --output /tmp/service-observations.jsonl \
-  -- ./my-agent
-```
-
-The gRPC service exposes:
-
-- `ListSessions` and `GetSessionStatus` for published session discovery
-- `StreamBlockedRequests` for blocked-request events
-- `SubmitDecision` for deny, allow-once, allow-session, bounded-TTL, and persist actions
-- `Subscribe` for live session inventory, status changes, and session event streams
-
-Remote operators can optionally expose the same service on mTLS-authenticated TCP with `--tcp-listen`, `--tls-cert`, `--tls-key`, and `--tls-client-ca`.
-
-### Run the desktop shell
-
-The first desktop control plane lives in `desktop/`. It is a thin Electron shell over the gRPC control service with:
-
-- system tray presence with quick session access
-- live blocked-request alerts with hold countdowns
-- host-level batching for related blocked requests
-- deny, allow-once, allow-session, persist, and custom TTL actions
-
-From the repo root:
-
-```bash
-cd desktop
-npm install
-npm run shell
-```
-
-By default the shell connects to the same Unix socket path that `strait service start` uses locally. Override with `STRAIT_CONTROL_SOCKET=/path/to/control-service.sock` if needed.
-
-### Understand the live-update boundary
-
-Live policy mutation is available through the local control API:
-
-```bash
-strait session reload-policy --session <SESSION_ID>
-strait session replace-policy --session <SESSION_ID> ./policy.cedar
-```
-
-These commands apply network policy changes live for the running session.
-
-Supported live loop:
-
-1. Update HTTP rules in `policy.cedar`.
-2. Run `strait session replace-policy --session <SESSION_ID> ./policy.cedar`.
-3. Keep the same interactive session running while new network decisions take effect.
-
-### Observe what an agent does
-
-```bash
-strait launch --observe -- ./my-agent
-```
-
-Observe mode allows everything, records activity to `observations.jsonl`, and still publishes the same session control surfaces for inspection and watch.
-
-### Generate a policy from observations
-
-```bash
-strait generate observations.jsonl
-```
-
-Produces `policy.cedar` covering exactly what the agent did. Dynamic path segments (UUIDs, hashes) are collapsed to wildcards automatically.
-
-### Review the policy
+### 4. Review the policy
 
 ```bash
 strait explain policy.cedar
@@ -211,69 +82,21 @@ strait explain policy.cedar
 
 Human-readable summary of what the policy allows and denies.
 
-### Enforce the policy
+### 5. Verify the policy against observations
 
 ```bash
-strait launch --policy policy.cedar -- ./my-agent
+strait test --replay observations.jsonl --policy policy.cedar
 ```
 
-Same agent, same container, now with enforcement. Known actions succeed. Novel actions get denied.
+Replays every recorded event against the policy and reports mismatches. Exits non-zero if the policy would have denied something the agent actually did.
 
-### Progressive enforcement
-
-```
-  OBSERVE ──▶ GENERATE ──▶ WARN ──▶ ENFORCE
-     │                       │         │
-     │  (no policy,          │  (log   │  (block
-     │   log everything)     │  what   │   violations)
-     │                       │  would  │
-     │                       │  block) │
-```
-
-Use `--warn` as an intermediate step: it loads the policy and logs violations without blocking.
+### 6. Diff two policies
 
 ```bash
-strait launch --warn policy.cedar -- ./my-agent
+strait diff old-policy.cedar new-policy.cedar
 ```
 
-### Mock-TUI smoke flow (macOS-first, with gateway prerequisite)
-
-This repo ships a deterministic PTY fixture for local dogfooding. A repo-local `strait launch` also needs a Linux `strait-gateway` binary for the container architecture. On macOS, the host-native gateway binary is Mach-O and cannot run inside the Linux container, so build the Linux gateway first.
-
-Common targets:
-
-- Apple Silicon Docker/OrbStack defaulting to arm64 containers: `aarch64-unknown-linux-musl`
-- Intel Docker Desktop or amd64 containers: `x86_64-unknown-linux-musl`
-
-From the repo root:
-
-```bash
-cargo build --bin strait --bin mock-tui-fixture
-cargo zigbuild --release --package strait-gateway --target <linux-target>
-target/debug/strait launch \
-  --observe \
-  --image ubuntu:24.04 \
-  --output /tmp/mock-tui-observations.jsonl \
-  -- "$(pwd)/target/debug/mock-tui-fixture"
-```
-
-`strait launch` discovers the cross-built gateway from the normal Cargo target layout, so the `cargo zigbuild` artifact is the required prerequisite for this repo-local smoke flow.
-
-Then validate the interactive path manually:
-
-1. Copy the printed `Session ID` from the launch terminal.
-2. In a second terminal, run `target/debug/strait session info --session <SESSION_ID>` and confirm the control and observation sockets are published.
-3. In that second terminal, run `target/debug/strait session watch --session <SESSION_ID>`.
-4. Back in the launch terminal, type `through-strait` and press Enter. The fixture should echo an `input` event and the watch terminal should continue streaming the same session.
-5. Resize the launch terminal window. The fixture should redraw and the watch terminal should show a `tty:resize` event with the new `COLSxROWS` and `signal` as the source.
-6. Type `exit` to end the fixture cleanly.
-
-What to verify:
-
-- session watch stays attached to the targeted session for the whole interaction
-- passthrough PTY I/O works end to end
-- resize is visible as a runtime event
-- the observation log at `/tmp/mock-tui-observations.jsonl` contains `container_start`, `container_stop`, and `tty_resized`
+Semantic diff showing added, removed, and unchanged permissions. Useful during code review.
 
 ## Cedar policies
 
@@ -322,42 +145,26 @@ source = "env"
 
 The agent never sees real secrets. If a request is denied by policy, credentials are not injected. This prevents exfiltration via prompt injection.
 
-## Standalone proxy mode
-
-Strait also runs as a standalone HTTPS proxy without containers, for debugging, local integrations, or experimentation with the policy and observation surfaces:
-
-```bash
-strait proxy --config strait.toml
-```
-
-Features in proxy mode today: MITM with Cedar policy evaluation, credential injection (bearer + AWS SigV4), live session control sockets, observation streaming, structured JSON audit logging, health check endpoint, SIGHUP policy hot-reload, and git-hosted policies with automatic polling.
-
-This mode shares the same session publication and watch surfaces as the primary `strait` runtime, but it is not the primary enforcement story because host trust and subprocess coverage vary by client.
-
 ## Docs and examples
 
-- [Devcontainer comparison](docs/devcontainer.md) - where strait fits relative to the devcontainer spec and Claude Code's `init-firewall.sh` setup
+- [Devcontainer comparison](docs/devcontainer.md) - where strait fits relative to the devcontainer spec
 - [Devcontainer strategy](docs/designs/devcontainer-strategy.md) - architecture rationale for the network-only devcontainer framing
-- [Claude Code devcontainer dogfood](examples/claude-code-devcontainer/README.md) - phase-1 first-run path: devcontainer.json + strait.toml + policy.cedar bundled as the `claude-code-devcontainer` preset
-- [Claude Code example](examples/claude-code/README.md) - run Claude Code inside a strait-managed container
+- [In-container rewrite](docs/designs/in-container-rewrite.md) - active migration plan from the host-side launcher to the in-container data plane
+- [Claude Code devcontainer dogfood](examples/claude-code-devcontainer/README.md) - the bundled `claude-code-devcontainer` preset
 
 ## Policy tooling
 
 ```bash
-strait preset list                                 # list built-in launch presets
+strait preset list                                  # list bundled devcontainer presets
 strait preset apply claude-code-devcontainer <dir>  # extract a preset's files into <dir>
-strait template list                              # list built-in starter policies
-strait template apply github-org-readonly          # apply a template
-strait session list                                # list active Strait sessions
-strait session info --session <id>                 # inspect one running session
-strait session watch --session <id>                # stream live events for one session
-strait session reload-policy --session <id>        # reload network policy in place
-strait session replace-policy --session <id> policy.cedar  # replace network policy in place
-strait session stop --session <id>                 # stop one running session
-strait explain policy.cedar                        # human-readable summary
-strait diff old-policy.cedar new-policy.cedar      # semantic permission diff
+strait template list                                # list built-in starter policies
+strait template apply github-org-readonly           # apply a template
+strait init --observe 5m --config strait.toml       # observe for 5m, generate a policy
+strait generate observations.jsonl                  # generate policy from an existing log
+strait explain policy.cedar                         # human-readable summary
+strait diff old-policy.cedar new-policy.cedar       # semantic permission diff
 strait test --replay observations.jsonl --policy policy.cedar  # verify policy
-strait watch                                       # compatibility alias for newest session
+strait proxy --config strait.toml                   # run the standalone HTTPS proxy
 ```
 
 ## Use cases
@@ -369,10 +176,10 @@ strait watch                                       # compatibility alias for new
 
 ## Known limitations
 
-- **Network enforcement requires a container runtime** - containers run with `--network=none` (no network interfaces). Traffic reaches the proxy through a gateway binary that communicates over a bind-mounted Unix socket. Direct TCP bypass is not possible inside the container, but the enforcement only applies when running under `strait launch`.
-- **Trust is container-local, not host-wide** - the session CA is only injected inside the container. Standalone `strait proxy` sessions rely on whatever trust configuration the pointing client already has; only `strait launch` gives you the "no machine-wide CA install" guarantee.
+- **No host-side container orchestration** - `strait launch` has been retired. Run your devcontainer with any devcontainer-compatible tool; the in-container `strait-agent` (landing in the ongoing rewrite) will provide enforcement inside the container.
+- **Trust is container-local** - the session CA is only trusted inside the container. Standalone `strait proxy` sessions rely on whatever trust configuration the pointing client has.
 - **Devcontainer config stays outside strait** - image build, mounts, users, editor settings, and lifecycle hooks still belong in `devcontainer.json`.
-- **Policy scope is network-only** - strait does not add separate Cedar rules for filesystem mounts or executable availability.
+- **Policy scope is network-only** - strait controls outbound HTTP. Filesystem and process rules are out of scope.
 
 ## Install
 

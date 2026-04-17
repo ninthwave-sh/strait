@@ -307,16 +307,9 @@ async fn default_service_returns_unimplemented_for_deferred_rpcs() {
 
     let mut client = connect_unix(sock).await;
 
-    // SubmitDecision: unary. The server returns Unimplemented; the round
-    // trip is the transport working and the status code being surfaced.
-    let err = client
-        .submit_decision(SubmitDecisionRequest {
-            request_id: "r1".into(),
-            ..Default::default()
-        })
-        .await
-        .expect_err("should be unimplemented");
-    assert_eq!(err.code(), tonic::Code::Unimplemented);
+    // SubmitDecision is now implemented in H-HCP-6. We only check the
+    // other RPCs here; the SubmitDecision behaviour has dedicated
+    // coverage in `tests/decisions.rs`.
 
     // FetchCredential: unary.
     let err = client

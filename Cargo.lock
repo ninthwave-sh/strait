@@ -3053,16 +3053,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "http 1.4.0",
+ "hyper-util",
  "libc",
  "rcgen",
  "rustls 0.23.37",
  "serde",
  "serde_json",
  "strait",
+ "strait-proto",
  "tempfile",
  "tokio",
  "tokio-rustls 0.26.4",
  "toml",
+ "tonic",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
  "webpki-roots 1.0.6",
@@ -3081,14 +3086,33 @@ name = "strait-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "clap",
+ "futures-core",
+ "hyper-util",
  "libc",
+ "prost",
  "serde",
+ "strait-agent",
+ "strait-proto",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "toml",
+ "tonic",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "strait-proto"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "protoc-bin-vendored",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]

@@ -1,19 +1,19 @@
 //! strait-host: host control plane process for strait.
 //!
 //! The host binary is long-lived; it owns the rule store, credential store,
-//! decision queue, and desktop UI RPC. This crate exposes the listener and
-//! configuration primitives so integration tests can drive them without
-//! spawning a subprocess.
+//! decision queue, and desktop UI RPC. This crate exposes the listener,
+//! configuration primitives, and gRPC service so integration tests can drive
+//! them without spawning a subprocess.
 //!
-//! Protocol definitions (gRPC, frame shapes, message types) live in the
-//! sibling H-HCP-2 work item; this crate intentionally ships only the
-//! process skeleton: config loading, listener wiring, logging, and
-//! graceful shutdown.
+//! The wire protocol types live in the sibling `strait-proto` crate; this
+//! crate provides the server-side implementation and the listener wiring.
 
 pub mod config;
+pub mod grpc;
 pub mod listener;
 
 pub use config::{
     default_config_path, HostConfig, DEFAULT_SOCKET_MODE, DEFAULT_TCP_LISTEN, DEFAULT_UNIX_SOCKET,
 };
-pub use listener::{serve, ShutdownSignal};
+pub use grpc::StraitHostService;
+pub use listener::{serve, serve_with_service, ShutdownSignal};

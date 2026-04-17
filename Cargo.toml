@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "gateway"]
+members = [".", "agent", "gateway"]
 resolver = "2"
 
 [package]

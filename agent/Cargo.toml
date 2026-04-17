@@ -1,0 +1,25 @@
+[package]
+name = "strait-agent"
+version = "0.1.0"
+edition = "2021"
+description = "In-container agent binary for strait: entrypoint + MITM proxy"
+license = "Apache-2.0"
+repository = "https://github.com/ninthwave-io/strait"
+
+[[bin]]
+name = "strait-agent"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3"

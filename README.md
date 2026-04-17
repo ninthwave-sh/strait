@@ -150,7 +150,9 @@ The agent never sees real secrets. If a request is denied by policy, credentials
 - [Devcontainer comparison](docs/devcontainer.md) - where strait fits relative to the devcontainer spec
 - [Devcontainer strategy](docs/designs/devcontainer-strategy.md) - architecture rationale for the network-only devcontainer framing
 - [In-container rewrite](docs/designs/in-container-rewrite.md) - active migration plan from the host-side launcher to the in-container data plane
+- [Bring your own sandbox](docs/bring-your-own-sandbox.md) - wire strait into a hand-rolled Dockerfile, sandcastle, or Podman
 - [Claude Code devcontainer dogfood](examples/claude-code-devcontainer/README.md) - the bundled `claude-code-devcontainer` preset
+- [sandcastle example](examples/sandcastle/README.md) - runnable Docker-sandbox example driven by sandcastle
 
 ## Policy tooling
 

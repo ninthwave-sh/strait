@@ -1,0 +1,28 @@
+# strait-host configuration template.
+#
+# Copy to $HOME/.config/strait/host.toml and edit as needed. Every field
+# is optional and missing fields fall back to the documented defaults;
+# uncomment only the ones you actually want to change. The host process
+# loads this file at startup and reloads on SIGHUP.
+
+# ── Listener paths ──────────────────────────────────────────────────────
+#
+# Unix domain socket for in-container proxies. Defaults to
+# /var/run/strait/host.sock; the Homebrew formula and the Linux install
+# script both create this directory with user ownership at install time
+# so strait-host can bind without root.
+# unix_socket = "/var/run/strait/host.sock"
+
+# TCP listener for the desktop app. Keep this on loopback: the protocol
+# is not designed for untrusted networks.
+# tcp_listen = "127.0.0.1:3129"
+
+# Unix socket permission bits. 0600 keeps the socket user-private.
+# socket_mode = 0o600
+
+# ── Persistent state ────────────────────────────────────────────────────
+#
+# SQLite path for the rule store and the JSONL observations log. Defaults
+# live under $HOME/.local/share/strait/.
+# rules_db = "/Users/you/.local/share/strait/rules.db"
+# observations_log = "/Users/you/.local/share/strait/observations.jsonl"

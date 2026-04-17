@@ -356,6 +356,98 @@ describe('desktop shell', () => {
     expect(within(tour).getByText(/cannot reach/)).toBeInTheDocument();
   });
 
+  it('keeps the tour closed across app restarts once a rule has been persisted', async () => {
+    // Seed the shell with an already-persisted completion timestamp. The
+    // earlier M-ONB-1 behaviour reset `persistedCount` to zero on remount,
+    // which would make the overlay reappear for a returning operator.
+    // L-ONB-3 requires the completion bit to survive, so the overlay stays
+    // hidden on this boot without the operator having to click Persist
+    // again.
+    window.localStorage.setItem(
+      'strait-desktop.tutorial.v1',
+      JSON.stringify({ dismissed: true, completedAtUnixMs: 1_700_000_000_000 })
+    );
+    const bridge = new MockBridge(buildSnapshot());
+    render(<App bridge={bridge} />);
+
+    await waitFor(() => {
+      expect(screen.queryByRole('region', { name: 'First-run walkthrough' })).toBeNull();
+    });
+    expect(screen.queryByRole('region', { name: 'Onboarding complete' })).toBeNull();
+    // The header still offers a "Replay tour" affordance so the operator
+    // can review the golden path after they have finished it.
+    expect(screen.getByRole('button', { name: /Reopen the first-run tutorial \(already completed\)/ })).toBeInTheDocument();
+  });
+
+  it('lets a skipped operator reopen the tour from the header', async () => {
+    // A skipped-but-not-completed tour is resumable. The overlay stays
+    // hidden until the operator clicks "Reopen tour", at which point it
+    // picks up wherever the current shell state points to.
+    window.localStorage.setItem(
+      'strait-desktop.tutorial.v1',
+      JSON.stringify({ dismissed: true, completedAtUnixMs: null })
+    );
+    const bridge = new MockBridge(buildSnapshot());
+    render(<App bridge={bridge} />);
+
+    await waitFor(() => {
+      expect(screen.queryByRole('region', { name: 'First-run walkthrough' })).toBeNull();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reopen the first-run tutorial' }));
+
+    expect(await screen.findByRole('region', { name: 'First-run walkthrough' })).toBeInTheDocument();
+  });
+
+  it('keeps real usage unblocked when the tutorial has not been started', async () => {
+    // Regression guard for the L-ONB-3 acceptance criterion: decisions
+    // must still flow through the bridge even if the tutorial is not
+    // open. We dismiss the tour and confirm the Deny path still works.
+    window.localStorage.setItem(
+      'strait-desktop.tutorial.v1',
+      JSON.stringify({ dismissed: true, completedAtUnixMs: null })
+    );
+    const bridge = new MockBridge(buildSnapshot());
+    render(<App bridge={bridge} />);
+
+    // Tour is gone, but the blocked-request card and its Deny button are
+    // still live in the alerts panel.
+    expect(screen.queryByRole('region', { name: 'First-run walkthrough' })).toBeNull();
+    fireEvent.click(await screen.findByRole('button', { name: 'Deny' }));
+
+    await waitFor(() => {
+      expect(bridge.decisions.at(-1)?.action).toBe('deny');
+    });
+  });
+
+  it('covers the tutorial steps by keyboard alone', async () => {
+    const bridge = new MockBridge(
+      buildSnapshot({
+        connected: false,
+        sessions: [],
+        blockedRequests: [],
+        lastError: 'UNAVAILABLE: connect ENOENT /tmp/strait-control.sock'
+      })
+    );
+    render(<App bridge={bridge} />);
+
+    const list = await screen.findByRole('list', { name: 'Tutorial steps' });
+    // Arrow-down walks from host-missing through persist without any
+    // mouse interaction; the active descendant tracks the focused step.
+    expect(list.getAttribute('aria-activedescendant')).toBe('onboarding-step-host-missing');
+    fireEvent.keyDown(list, { key: 'ArrowDown' });
+    expect(list.getAttribute('aria-activedescendant')).toBe('onboarding-step-no-session');
+    fireEvent.keyDown(list, { key: 'ArrowDown' });
+    expect(list.getAttribute('aria-activedescendant')).toBe('onboarding-step-observe');
+    fireEvent.keyDown(list, { key: 'ArrowDown' });
+    expect(list.getAttribute('aria-activedescendant')).toBe('onboarding-step-decide');
+    fireEvent.keyDown(list, { key: 'ArrowDown' });
+    expect(list.getAttribute('aria-activedescendant')).toBe('onboarding-step-persist');
+    // And the Skip tour button is reachable by Tab order (it carries a
+    // plain text label so a screen reader announces it as a button).
+    expect(screen.getByRole('button', { name: 'Skip tour' })).toBeInTheDocument();
+  });
+
   it('auto-denies expired alerts after the countdown reaches zero', async () => {
     const bridge = new MockBridge(
       buildSnapshot({

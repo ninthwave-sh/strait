@@ -3,6 +3,13 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { resolveBridge, type DesktopBridge } from './bridge';
 import { Onboarding } from './Onboarding';
 import { SessionRail, sessionLabel, type SessionRailEntry } from './Sessions';
+import {
+  markCompleted as markTutorialCompleted,
+  markDismissed as markTutorialDismissed,
+  readTutorialState,
+  reopenTutorial,
+  type TutorialState
+} from './tutorialState';
 import type {
   BlockedBatch,
   BlockedRequestSummary,
@@ -10,39 +17,6 @@ import type {
   DesktopSnapshot,
   SessionSummary
 } from './types';
-
-const ONBOARDING_DISMISS_STORAGE_KEY = 'strait-desktop.onboarding.dismissed';
-
-function readDismissedFromStorage(): boolean {
-  if (typeof window === 'undefined' || !window.localStorage) {
-    return false;
-  }
-  try {
-    return window.localStorage.getItem(ONBOARDING_DISMISS_STORAGE_KEY) === 'true';
-  } catch {
-    // Some harnesses (including the fixture preload) refuse localStorage
-    // access. Failing closed here just means the overlay is visible, which
-    // is the safe default for a first-run hint.
-    return false;
-  }
-}
-
-function writeDismissedToStorage(dismissed: boolean) {
-  if (typeof window === 'undefined' || !window.localStorage) {
-    return;
-  }
-  try {
-    if (dismissed) {
-      window.localStorage.setItem(ONBOARDING_DISMISS_STORAGE_KEY, 'true');
-    } else {
-      window.localStorage.removeItem(ONBOARDING_DISMISS_STORAGE_KEY);
-    }
-  } catch {
-    // localStorage is a nice-to-have; if it is not writable the onboarding
-    // overlay will reappear on the next desktop start, which is strictly a
-    // minor annoyance rather than a correctness issue.
-  }
-}
 
 /**
  * Picks the session the desktop pins to the onboarding walkthrough. The
@@ -170,10 +144,11 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [seenBlockedIds, setSeenBlockedIds] = useState<Record<string, true>>({});
   // Onboarding overlay state. `persistedCount` advances the tour past the
-  // final step; `dismissed` hides the overlay outright. Both are local to
-  // the desktop shell because the host has no concept of per-operator tour
-  // progress.
-  const [onboardingDismissed, setOnboardingDismissed] = useState<boolean>(readDismissedFromStorage);
+  // final step within a single session; `tutorialState` tracks the durable
+  // "have I already done this?" bits (dismissed, completedAtUnixMs) so a
+  // returning operator is not re-prompted. Both are local to the desktop
+  // shell because the host has no concept of per-operator tour progress.
+  const [tutorialState, setTutorialState] = useState<TutorialState>(() => readTutorialState());
   const [persistedCount, setPersistedCount] = useState<number>(0);
 
   useEffect(() => {
@@ -323,7 +298,7 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
   // The pinned chip only matters while the onboarding tour is active. Once
   // the operator has persisted a rule or explicitly skipped the tour, the
   // chip goes away so the rail stays uncluttered.
-  const showPin = !onboardingDismissed && persistedCount === 0;
+  const showPin = !tutorialState.dismissed && persistedCount === 0 && tutorialState.completedAtUnixMs === null;
 
   const sessionEntries = useMemo<SessionRailEntry[]>(
     () =>
@@ -371,8 +346,13 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
           // A successful persist advances the onboarding tour from the
           // `persist` step to `done`. We count rather than flip a boolean so
           // that additional persists after the tour ends are still
-          // observable in case we want to surface them later.
+          // observable in case we want to surface them later. We also stamp
+          // the durable `completedAtUnixMs` so the tour stays closed across
+          // desktop restarts for returning operators.
           setPersistedCount((current) => current + 1);
+          setTutorialState((current) =>
+            current.completedAtUnixMs ? current : markTutorialCompleted(current, Date.now())
+          );
         }
       } catch (error) {
         setErrorMessage(error instanceof Error ? error.message : 'Decision failed.');
@@ -412,8 +392,20 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
   );
 
   const handleDismissOnboarding = useCallback(() => {
-    setOnboardingDismissed(true);
-    writeDismissedToStorage(true);
+    setTutorialState((current) => {
+      // Dismissing the celebration card is the operator's way of telling us
+      // "I'm done." Stamp `completedAtUnixMs` on that exit so the overlay
+      // stays hidden across restarts even if the persist count was lost
+      // during a reload.
+      if (persistedCount > 0 && current.completedAtUnixMs === null) {
+        return markTutorialCompleted(current, Date.now());
+      }
+      return markTutorialDismissed(current);
+    });
+  }, [persistedCount]);
+
+  const handleReopenTutorial = useCallback(() => {
+    setTutorialState((current) => reopenTutorial(current));
   }, []);
 
   const handleFocusPinned = useCallback(() => {
@@ -432,9 +424,24 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
             {snapshot.sessions.length === 1 ? '' : 's'} · {totalPending} pending
           </p>
         </div>
-        <button className="secondary" onClick={() => void bridge.focusWindow()}>
-          Focus window
-        </button>
+        <div className="header-actions">
+          {tutorialState.dismissed ? (
+            <button
+              className="secondary"
+              onClick={handleReopenTutorial}
+              aria-label={
+                tutorialState.completedAtUnixMs
+                  ? 'Reopen the first-run tutorial (already completed)'
+                  : 'Reopen the first-run tutorial'
+              }
+            >
+              {tutorialState.completedAtUnixMs ? 'Replay tour' : 'Reopen tour'}
+            </button>
+          ) : null}
+          <button className="secondary" onClick={() => void bridge.focusWindow()}>
+            Focus window
+          </button>
+        </div>
       </header>
 
       <section className="status-strip">
@@ -457,7 +464,8 @@ export function App({ bridge: providedBridge }: { bridge?: DesktopBridge }) {
         pendingCount={totalPending}
         pinnedSession={pinnedSession}
         persistedCount={persistedCount}
-        dismissed={onboardingDismissed}
+        completedAtUnixMs={tutorialState.completedAtUnixMs}
+        dismissed={tutorialState.dismissed}
         onDismiss={handleDismissOnboarding}
         onFocusPinned={handleFocusPinned}
       />

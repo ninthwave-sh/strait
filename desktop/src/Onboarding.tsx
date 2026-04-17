@@ -1,3 +1,5 @@
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+
 import type { SessionSummary } from './types';
 
 /** State machine used by the onboarding overlay to pick which step is live. */
@@ -8,21 +10,6 @@ export type OnboardingStage =
   | 'decide'
   | 'persist'
   | 'done';
-
-export interface OnboardingState {
-  /**
-   * When true the overlay is hidden entirely. The operator hides it either by
-   * clicking "Close tour" on the `done` step or by opting out earlier with
-   * "Skip tour".
-   */
-  dismissed: boolean;
-  /**
-   * Count of `persist` decisions we have observed submitted through the
-   * bridge. One persisted rule is enough to progress to `done`; the acceptance
-   * criterion for the rewrite is "leave with a persisted rule."
-   */
-  persistedCount: number;
-}
 
 export interface OnboardingProps {
   connected: boolean;
@@ -38,6 +25,13 @@ export interface OnboardingProps {
    */
   pinnedSession: SessionSummary | null;
   persistedCount: number;
+  /**
+   * Unix milliseconds when the operator finished the tour, or `null` if
+   * they have not yet completed it. The `done` stage is reached when this
+   * is set *or* when `persistedCount` goes above zero; the persisted
+   * timestamp is the bit that survives across desktop restarts.
+   */
+  completedAtUnixMs: number | null;
   dismissed: boolean;
   onDismiss(): void;
   onFocusPinned(): void;
@@ -55,8 +49,9 @@ export function deriveOnboardingStage(params: {
   sessionCount: number;
   pendingCount: number;
   persistedCount: number;
+  completedAtUnixMs?: number | null;
 }): OnboardingStage {
-  if (params.persistedCount > 0) {
+  if ((params.completedAtUnixMs ?? 0) > 0 || params.persistedCount > 0) {
     return 'done';
   }
   if (!params.connected) {
@@ -80,7 +75,7 @@ interface Step {
   body: string;
 }
 
-const STEPS: Step[] = [
+export const TUTORIAL_STEPS: ReadonlyArray<Step> = [
   {
     id: 'host-missing',
     title: 'Start the host control plane',
@@ -89,7 +84,7 @@ const STEPS: Step[] = [
   {
     id: 'no-session',
     title: 'Add the devcontainer feature',
-    body: 'Add `ghcr.io/ninthwave-io/strait` to `features` in your project\'s `.devcontainer/devcontainer.json`, then reopen the project in its container. The feature installs the in-container agent and registers the session with the host.'
+    body: "Add `ghcr.io/ninthwave-io/strait` to `features` in your project's `.devcontainer/devcontainer.json`, then reopen the project in its container. The feature installs the in-container agent and registers the session with the host."
   },
   {
     id: 'observe',
@@ -108,10 +103,18 @@ const STEPS: Step[] = [
   }
 ];
 
+const STEP_ORDER: OnboardingStage[] = [
+  'host-missing',
+  'no-session',
+  'observe',
+  'decide',
+  'persist',
+  'done'
+];
+
 function stepStatus(stepId: OnboardingStage, stage: OnboardingStage): 'complete' | 'current' | 'upcoming' {
-  const order: OnboardingStage[] = ['host-missing', 'no-session', 'observe', 'decide', 'persist', 'done'];
-  const stepIndex = order.indexOf(stepId);
-  const stageIndex = order.indexOf(stage);
+  const stepIndex = STEP_ORDER.indexOf(stepId);
+  const stageIndex = STEP_ORDER.indexOf(stage);
   if (stageIndex > stepIndex) {
     return 'complete';
   }
@@ -130,12 +133,42 @@ export function Onboarding(props: OnboardingProps) {
     connected: props.connected,
     sessionCount: props.sessions.length,
     pendingCount: props.pendingCount,
-    persistedCount: props.persistedCount
+    persistedCount: props.persistedCount,
+    completedAtUnixMs: props.completedAtUnixMs
   });
+
+  // Which step the operator is focused on in the step list. Defaults to the
+  // derived stage (so the panel lands on the actual live step when the tour
+  // opens or resumes) but lets the operator page through the other steps
+  // with the keyboard without losing the "live" highlight.
+  const currentStageIndex = STEP_ORDER.indexOf(stage);
+  const [focusedIndex, setFocusedIndex] = useState<number>(Math.max(0, currentStageIndex));
+  const previousStageRef = useRef<OnboardingStage>(stage);
+  useEffect(() => {
+    // When the derived stage advances we move the keyboard focus forward
+    // to match. This keeps the "you are here" hint aligned with reality
+    // without trapping the operator if they had paged around manually.
+    if (stage !== previousStageRef.current) {
+      const nextIndex = STEP_ORDER.indexOf(stage);
+      if (nextIndex >= 0) {
+        setFocusedIndex(nextIndex);
+      }
+      previousStageRef.current = stage;
+    }
+  }, [stage]);
+
+  const visibleSteps = useMemo(
+    () => TUTORIAL_STEPS.filter((step) => step.id !== 'done'),
+    []
+  );
 
   if (stage === 'done') {
     return (
-      <section className="panel onboarding-panel onboarding-done" aria-label="Onboarding complete">
+      <section
+        className="panel onboarding-panel onboarding-done"
+        role="region"
+        aria-label="Onboarding complete"
+      >
         <div className="panel-header">
           <h2>You persisted your first rule</h2>
           <button className="secondary" onClick={props.onDismiss}>
@@ -145,7 +178,7 @@ export function Onboarding(props: OnboardingProps) {
         <p>
           The rule lives in the host rule store. Future sessions with the same policy
           scope pick it up automatically. You can reopen this tour from the Preferences
-          menu.
+          menu, and it stays closed across desktop restarts.
         </p>
       </section>
     );
@@ -155,13 +188,75 @@ export function Onboarding(props: OnboardingProps) {
     ? props.pinnedSession.containerName
     : props.pinnedSession?.sessionId ?? null;
 
+  const focusedStep = visibleSteps[Math.min(focusedIndex, visibleSteps.length - 1)] ?? visibleSteps[0];
+  const clampedFocusedIndex = Math.min(focusedIndex, visibleSteps.length - 1);
+
+  function moveFocus(delta: number) {
+    setFocusedIndex((current) => {
+      const next = current + delta;
+      if (next < 0) {
+        return 0;
+      }
+      if (next >= visibleSteps.length) {
+        return visibleSteps.length - 1;
+      }
+      return next;
+    });
+  }
+
+  function handleStepListKeyDown(event: ReactKeyboardEvent<HTMLOListElement>) {
+    // Arrow/Home/End navigation on the step list keeps the tour usable
+    // without a mouse. Tab still moves focus to the next interactive
+    // element, so the list itself is a single tab stop.
+    switch (event.key) {
+      case 'ArrowDown':
+      case 'ArrowRight':
+        event.preventDefault();
+        moveFocus(1);
+        break;
+      case 'ArrowUp':
+      case 'ArrowLeft':
+        event.preventDefault();
+        moveFocus(-1);
+        break;
+      case 'Home':
+        event.preventDefault();
+        setFocusedIndex(0);
+        break;
+      case 'End':
+        event.preventDefault();
+        setFocusedIndex(visibleSteps.length - 1);
+        break;
+      default:
+        break;
+    }
+  }
+
   return (
-    <section className="panel onboarding-panel" aria-label="First-run walkthrough">
+    <section className="panel onboarding-panel" role="region" aria-label="First-run walkthrough">
       <div className="panel-header">
         <h2>First-run walkthrough</h2>
-        <button className="secondary" onClick={props.onDismiss}>
-          Skip tour
-        </button>
+        <div className="onboarding-controls">
+          <button
+            className="secondary"
+            onClick={() => moveFocus(-1)}
+            disabled={clampedFocusedIndex <= 0}
+            aria-label="Previous step"
+          >
+            Previous
+          </button>
+          <button
+            className="secondary"
+            onClick={() => moveFocus(1)}
+            disabled={clampedFocusedIndex >= visibleSteps.length - 1}
+            aria-label="Next step"
+          >
+            Next
+          </button>
+          <button className="secondary" onClick={props.onDismiss}>
+            Skip tour
+          </button>
+        </div>
       </div>
 
       {stage === 'host-missing' ? (
@@ -187,11 +282,24 @@ export function Onboarding(props: OnboardingProps) {
         </p>
       ) : null}
 
-      <ol className="onboarding-steps">
-        {STEPS.map((step, index) => {
+      <ol
+        className="onboarding-steps"
+        tabIndex={0}
+        role="list"
+        aria-label="Tutorial steps"
+        aria-activedescendant={`onboarding-step-${focusedStep.id}`}
+        onKeyDown={handleStepListKeyDown}
+      >
+        {visibleSteps.map((step, index) => {
           const status = stepStatus(step.id, stage);
+          const focused = index === clampedFocusedIndex;
           return (
-            <li key={step.id} className={`onboarding-step ${status}`} aria-current={status === 'current' ? 'step' : undefined}>
+            <li
+              key={step.id}
+              id={`onboarding-step-${step.id}`}
+              className={`onboarding-step ${status}${focused ? ' focused' : ''}`}
+              aria-current={status === 'current' ? 'step' : undefined}
+            >
               <span className="onboarding-step-index">{index + 1}</span>
               <div className="onboarding-step-body">
                 <h3>{step.title}</h3>
@@ -201,6 +309,9 @@ export function Onboarding(props: OnboardingProps) {
           );
         })}
       </ol>
+      <p className="onboarding-keyboard-hint">
+        Use the arrow keys to browse steps, or Tab to the Skip tour button to dismiss the walkthrough.
+      </p>
     </section>
   );
 }

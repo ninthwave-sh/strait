@@ -129,7 +129,31 @@ automatically; you will not see the prompt again.
 
 The onboarding tour advances to a **You persisted your first rule**
 card as soon as the persist succeeds. That is the finish line: close
-the tour, keep working.
+the tour, keep working. The shell stamps a completion timestamp into
+local storage, so the tutorial stays hidden the next time you open
+the desktop app. You will not be re-prompted on a returning install.
+
+## Keyboard navigation and resuming the tour
+
+The first-run tutorial is keyboard-accessible from top to bottom:
+
+- **Tab / Shift+Tab** move between interactive controls: Previous
+  step, Next step, Focus pinned container, and Skip tour.
+- **Arrow keys**, **Home**, and **End** walk through the step list
+  once it is focused. The currently active step is annotated with
+  `aria-current="step"` for screen readers, and the keyboard-focused
+  step is tracked via `aria-activedescendant`.
+- **Skip tour** hides the overlay without dismissing it permanently.
+  The header shows a **Reopen tour** button that brings the walk-
+  through back at whichever step the shell state is on; the tour is
+  resumable, not one-shot.
+- After a persisted rule the header button renames itself to
+  **Replay tour**. The tour will not reappear unsolicited, but you
+  can review it any time without clearing your rule store.
+
+If you never start the tour at all, nothing blocks real usage. The
+blocked-request prompts, session rail, and decision buttons all work
+with the overlay hidden.
 
 ## Health checks and common snags
 

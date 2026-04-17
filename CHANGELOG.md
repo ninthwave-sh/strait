@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Removed
+
+- `strait launch` orchestrator, along with the `strait session` and `strait service` command groups. Container lifecycle is now the user's responsibility; use the devcontainer feature (landing in a later phase), sandcastle, or direct `docker run`.
+- `src/launch.rs` and `src/container.rs` modules. The host-side MITM proxy + Docker/Podman lifecycle code is retired in favor of the in-container data plane (`strait-agent`).
+- `src/control.rs` local gRPC control service and the `strait watch` compatibility alias. The replacement lives in the host control plane (`strait-host`), landing in Phase 2 of the in-container rewrite.
+- `bollard` dependency. strait no longer talks to Docker or Podman from the host.
+- `HTTPS_PROXY` env injection inside managed containers. The new in-container data plane uses iptables REDIRECT instead; proxy env vars become a bypass surface rather than a security feature.
+- `examples/claude-code/` (the host-launched Claude Code walkthrough). Replaced by `examples/claude-code-devcontainer/`, which is the bundled `claude-code-devcontainer` preset.
+- `tests/launch_integration.rs` and `tests/control_service_integration.rs`. Integration coverage for the new flow lives under `agent/tests/` and `host/tests/`.
+
 ## v0.2.0
 
 ### Network isolation

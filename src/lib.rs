@@ -9,15 +9,12 @@ use std::sync::Once;
 pub mod audit;
 pub mod ca;
 pub mod config;
-pub mod container;
-pub mod control;
 pub mod credentials;
 pub mod decisions;
 pub mod diff;
 pub mod explain;
 pub mod generate;
 pub mod health;
-pub mod launch;
 pub mod mitm;
 pub mod observe;
 pub mod policy;
@@ -25,7 +22,6 @@ pub mod presets;
 pub mod replay;
 pub mod sigv4;
 pub mod templates;
-pub mod watch;
 
 pub fn ensure_rustls_crypto_provider() {
     static INIT: Once = Once::new();

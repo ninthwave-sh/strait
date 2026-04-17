@@ -1,16 +1,18 @@
 # Claude Code devcontainer dogfood
 
 This example is the phase-1 first-run path. It wires the container trust
-boundary, devcontainer.json, the strait control plane, and the desktop
-shell into one repeatable flow.
+boundary, `devcontainer.json`, and a starter Cedar policy into one
+repeatable flow.
 
 ## What you get
 
 - `.devcontainer/devcontainer.json` drives the container environment.
 - `strait.toml` configures MITM hosts and credential injection.
 - `policy.cedar` is the starting network policy (GitHub + npm).
-- `strait launch --devcontainer` launches the container, injects the
-  session CA, and holds blocked requests for a live decision.
+- The in-container `strait-agent` proxy (phase 1 of the ongoing rewrite)
+  enforces policy inside the container. The host-side `strait launch`
+  orchestrator has been retired -- container lifecycle is handled by
+  your devcontainer tooling.
 
 No machine-wide CA install happens at any point. The session CA lives
 inside the container and is removed when the session ends.
@@ -18,54 +20,52 @@ inside the container and is removed when the session ends.
 ## Prerequisites
 
 - Docker (or Podman / OrbStack)
-- The `strait` binary on your PATH
-- The control service running so the desktop shell can attach
-  (`strait service start --socket /tmp/strait-control.sock`)
-- The desktop shell connected (`cd desktop && npm run shell`)
+- The `strait` binary on your PATH (for policy tooling and scaffolding)
+- A devcontainer-compatible runner: VS Code Dev Containers, the
+  devcontainer CLI, sandcastle, or direct `docker run` using the
+  `.devcontainer/devcontainer.json` in this example
 
-## Run it
+## Scaffold it
 
-From the example directory:
-
-```bash
-strait launch \
-  --devcontainer .devcontainer/devcontainer.json \
-  --config strait.toml \
-  --policy policy.cedar \
-  -- curl -fsS https://api.github.com/zen
-```
-
-Or apply this preset into a scratch directory and launch from there:
+Apply the preset into a scratch directory so you have an editable copy:
 
 ```bash
 strait preset apply claude-code-devcontainer ./my-agent
 cd my-agent
-strait launch \
-  --devcontainer .devcontainer/devcontainer.json \
-  --config strait.toml \
-  --policy policy.cedar \
-  -- curl -fsS https://api.github.com/zen
 ```
+
+## Run it
+
+Open the extracted directory with your devcontainer tool of choice:
+
+- VS Code: "Dev Containers: Reopen in Container"
+- devcontainer CLI: `devcontainer up --workspace-folder .`
+- Direct Docker: build from `.devcontainer/devcontainer.json` and
+  run the resulting image with `strait.toml` + `policy.cedar`
+  available inside the container
+
+Once inside the container, the in-container proxy enforces policy on
+every outbound HTTP request. Allowed requests get credentials injected
+by the proxy; denied requests return HTTP 403 to the agent.
 
 ## Dogfood walkthrough
 
-1. **Trust boundary**: `strait launch` prints the trust boundary
-   diagnostic at startup. The session CA only lives inside the
-   container (`/strait/ca.pem`), the augmented bundle is built at
-   entrypoint (`/tmp/strait-ca-bundle.pem`), and traffic exits through
-   the gateway on `--network=none`.
+1. **Trust boundary**: the session CA only lives inside the container
+   (`/strait/ca.pem`). The augmented bundle is built at entrypoint
+   (`/tmp/strait-ca-bundle.pem`). No host-side CA install.
 2. **Blocked request**: run a request that is not allowed by the
    starter policy, for example `curl -fsS https://example.com` from
-   inside the container. strait holds the request and emits a
+   inside the container. strait denies the request and records a
    `blocked_request` observation event.
-3. **Live decision**: in the desktop shell, pick the batch for
-   `example.com` and click "Persist". The control plane calls
-   `session persist-decision`, which writes a new permit rule into
-   `policy.cedar` atomically and hot-reloads the session.
-4. **Restart loop**: stop the session (`strait session stop`) and
-   launch it again with the same policy file. Repeat the same
-   `curl` -- the persisted rule applies immediately without any
-   manual policy edits.
+3. **Edit the policy**: add a permit rule for the host in question and
+   save `policy.cedar`. The in-container proxy picks up the update.
+4. **Restart loop**: rerun the same request -- the new rule applies
+   without any manual CA install or host-side orchestration.
+
+Once the host control plane (`strait-host`, landing in phase 2) is
+available, blocked requests will surface in the desktop shell as live
+decisions, and persisted rules will flow back to the container over
+gRPC instead of requiring a file edit.
 
 ## Files
 

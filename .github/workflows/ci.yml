@@ -15,30 +15,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Pull Docker images for integration tests
-        run: docker pull ubuntu:24.04
-      - name: Build gateway binary for integration tests
-        run: cargo build -p strait-gateway
-      - run: cargo test --all-features
-      - name: Verify launch integration tests actually ran
-        run: |
-          if ! output=$(cargo test --all-features --test launch_integration 2>&1); then
-            echo "$output"
-            echo "::error::Launch integration tests failed under the CI verification step"
-            exit 1
-          fi
-          echo "$output"
-          # Fail if any test printed the skip message (docker should be available in CI)
-          if echo "$output" | grep -q "Skipping: Docker not available"; then
-            echo "::error::Launch integration tests were skipped — Docker should be available in CI"
-            exit 1
-          fi
-          # Verify the launch integration suite reported passing results.
-          if ! echo "$output" | grep -qE "test result: ok\. [0-9]+ passed"; then
-            echo "::error::Launch integration tests did not report passing results"
-            exit 1
-          fi
-      - run: cargo clippy --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+      - run: cargo clippy --workspace --all-features -- -D warnings
       - run: cargo fmt --check
 
   build:

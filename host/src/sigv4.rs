@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 
 use tracing::warn;
 
-use crate::credentials::{parse_aws_host, Credential};
+use crate::credentials::{parse_aws_host, Credential, CredentialKind};
 
 /// Default environment variable names for AWS credentials.
 pub const DEFAULT_ACCESS_KEY_ID_VAR: &str = "AWS_ACCESS_KEY_ID";
@@ -114,6 +114,45 @@ impl SigV4Credential {
         body: Option<&[u8]>,
         time: SystemTime,
     ) -> Option<Vec<(String, String)>> {
+        let body_bytes = body.unwrap_or(&[]);
+        let body_sha256_hex = sha256_hex(body_bytes);
+        self.sign_core(method, path, headers, &body_sha256_hex, time)
+    }
+
+    /// Sign a request using a caller-supplied body SHA-256 digest.
+    ///
+    /// The in-container agent never ships request bodies to the host. It
+    /// hashes the body locally and sends only the digest over the
+    /// `FetchCredential` RPC, so the host signs using the pre-computed
+    /// digest via this method.
+    ///
+    /// `body_sha256_hex` must be a lowercase hex-encoded SHA-256 (64
+    /// characters). The AWS SigV4 canonical-request construction puts this
+    /// string directly into the `x-amz-content-sha256` header and the
+    /// canonical-request body line.
+    pub fn sign_with_body_hash(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body_sha256_hex: &str,
+        time: SystemTime,
+    ) -> Option<Vec<(String, String)>> {
+        self.sign_core(method, path, headers, body_sha256_hex, time)
+    }
+
+    /// Shared signing core. Both [`sign_request`] (body-bytes path) and
+    /// [`sign_with_body_hash`] (pre-computed digest path) funnel into this
+    /// helper. Uses `SignableBody::Precomputed` so the `aws-sigv4` crate
+    /// never rehashes the body.
+    fn sign_core(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body_sha256_hex: &str,
+        time: SystemTime,
+    ) -> Option<Vec<(String, String)>> {
         // Extract host from request headers
         let host = headers
             .iter()
@@ -162,19 +201,18 @@ impl SigV4Credential {
         // Construct the full URI for signing
         let uri = format!("https://{host}{path}");
 
-        // Compute the content SHA-256 hash. AWS SigV4 requires this header
-        // to be present in signed requests, but the aws-sigv4 crate doesn't
-        // add it to the output headers — it expects the caller to set it.
-        let body_bytes = body.unwrap_or(&[]);
-        let content_sha256 = sha256_hex(body_bytes);
-
         // Add x-amz-content-sha256 to the headers before signing so it's
         // included in the canonical request's signed headers.
         let mut signing_headers: Vec<(String, String)> = headers.to_vec();
-        signing_headers.push(("x-amz-content-sha256".to_string(), content_sha256.clone()));
+        signing_headers.push((
+            "x-amz-content-sha256".to_string(),
+            body_sha256_hex.to_string(),
+        ));
 
-        // Build the signable body and request
-        let signable_body = SignableBody::Bytes(body_bytes);
+        // Build the signable body and request. `Precomputed` tells the
+        // signer to trust the hex digest we're providing instead of
+        // rehashing bytes it does not have.
+        let signable_body = SignableBody::Precomputed(body_sha256_hex.to_string());
         let header_iter = signing_headers
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()));
@@ -221,7 +259,10 @@ impl SigV4Credential {
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case("x-amz-content-sha256"));
         if !has_content_sha {
-            result.push(("x-amz-content-sha256".to_string(), content_sha256));
+            result.push((
+                "x-amz-content-sha256".to_string(),
+                body_sha256_hex.to_string(),
+            ));
         }
 
         Some(result)
@@ -238,10 +279,62 @@ impl Credential for SigV4Credential {
     ) -> Option<Vec<(String, String)>> {
         self.sign_request(method, path, headers, body, SystemTime::now())
     }
+
+    fn fetch_for_request(
+        &self,
+        host: &str,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body_sha256_hex: &str,
+    ) -> CredentialKind {
+        // Ensure the Host header is present so `sign_core` can extract it
+        // and derive service/region. The agent should already include Host
+        // via the headers map, but this is the secrets path so we defend
+        // against a missing entry explicitly.
+        let mut signing_headers: Vec<(String, String)> = headers.to_vec();
+        let has_host = signing_headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("host"));
+        if !has_host {
+            signing_headers.push(("host".to_string(), host.to_string()));
+        }
+
+        let Some(signed_headers) = self.sign_with_body_hash(
+            method,
+            path,
+            &signing_headers,
+            body_sha256_hex,
+            SystemTime::now(),
+        ) else {
+            // parse_aws_host returned None, missing Host, or the signer
+            // failed. Treat as "no credential" rather than surfacing an
+            // error -- the agent will proceed unsigned, and the Cedar
+            // policy still gated the request.
+            return CredentialKind::None;
+        };
+
+        // Merge signing headers into the original header set, replacing
+        // same-named predecessors (case-insensitive). The proto tells the
+        // agent to apply the full headers map verbatim, so we build the
+        // final shape here.
+        let mut merged: Vec<(String, String)> = signing_headers;
+        for (name, _) in &signed_headers {
+            merged.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+        }
+        merged.extend(signed_headers);
+
+        let url = format!("https://{host}{path}");
+        CredentialKind::Signed {
+            method: method.to_string(),
+            url,
+            headers: merged,
+        }
+    }
 }
 
 /// Compute lowercase hex-encoded SHA-256 digest.
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
@@ -776,5 +869,50 @@ mod tests {
             count, 1,
             "should have exactly one x-amz-content-sha256 header, got {count}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Body-hash parity (acceptance criterion: "SigV4 signing produces the
+    // same output as the current src/sigv4.rs for canned inputs")
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sign_with_body_hash_matches_sign_request_for_same_body() {
+        // The in-container agent sends only the body digest over the
+        // FetchCredential RPC, so the host signs via
+        // `sign_with_body_hash`. This test locks in that the two code
+        // paths produce byte-identical output for the same input body.
+        let cred = test_credential();
+        let headers = vec![("Host".to_string(), "s3.us-east-1.amazonaws.com".to_string())];
+        let body = b"payload bytes, non-empty";
+        let body_hex = sha256_hex(body);
+
+        let bytes_sig = cred
+            .sign_request("PUT", "/bucket/key", &headers, Some(body), fixed_time())
+            .expect("sign_request should succeed");
+        let hash_sig = cred
+            .sign_with_body_hash("PUT", "/bucket/key", &headers, &body_hex, fixed_time())
+            .expect("sign_with_body_hash should succeed");
+
+        assert_eq!(
+            bytes_sig, hash_sig,
+            "body-bytes and body-hash signing paths must produce identical headers"
+        );
+    }
+
+    #[test]
+    fn sign_with_body_hash_matches_sign_request_for_empty_body() {
+        let cred = test_credential();
+        let headers = vec![("Host".to_string(), "s3.us-east-1.amazonaws.com".to_string())];
+        let empty_hex = sha256_hex(&[]);
+
+        let bytes_sig = cred
+            .sign_request("GET", "/bucket/key", &headers, None, fixed_time())
+            .expect("sign_request should succeed");
+        let hash_sig = cred
+            .sign_with_body_hash("GET", "/bucket/key", &headers, &empty_hex, fixed_time())
+            .expect("sign_with_body_hash should succeed");
+
+        assert_eq!(bytes_sig, hash_sig);
     }
 }

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::credentials::CredentialEntryConfig;
+
 /// Default Unix socket path for container-side connections.
 pub const DEFAULT_UNIX_SOCKET: &str = "/var/run/strait/host.sock";
 
@@ -40,7 +42,11 @@ pub const DEFAULT_RULES_DB_RELATIVE: &str = ".local/share/strait/rules.db";
 pub const DEFAULT_OBSERVATIONS_RELATIVE: &str = ".local/share/strait/observations.jsonl";
 
 /// Resolved host configuration with defaults filled in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` omits the credential list from the comparison -- credentials
+/// derive through `Deserialize` only, and we don't need value equality on
+/// `CredentialEntryConfig` for any test.
+#[derive(Debug, Clone)]
 pub struct HostConfig {
     /// Filesystem path of the Unix domain socket.
     pub unix_socket: PathBuf,
@@ -52,7 +58,25 @@ pub struct HostConfig {
     pub rules_db: PathBuf,
     /// Filesystem path of the observations JSONL log (M-HCP-5).
     pub observations_log: PathBuf,
+    /// Parsed `[[credential]]` entries from the host config file.
+    ///
+    /// Resolved to a [`crate::credentials::CredentialStore`] at startup
+    /// (see `strait-host/src/main.rs`). Empty by default; every
+    /// `FetchCredential` lookup returns `NoCredential` on an empty list.
+    pub credentials: Vec<CredentialEntryConfig>,
 }
+
+impl PartialEq for HostConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.unix_socket == other.unix_socket
+            && self.tcp_listen == other.tcp_listen
+            && self.socket_mode == other.socket_mode
+        // `credentials` entries are resolved to secrets; comparing TOML
+        // shapes by value adds little and burdens every call site. Skip.
+    }
+}
+
+impl Eq for HostConfig {}
 
 impl HostConfig {
     /// Returns the built-in defaults with no file on disk.
@@ -65,6 +89,7 @@ impl HostConfig {
             socket_mode: DEFAULT_SOCKET_MODE,
             rules_db: default_rules_db_path(),
             observations_log: default_observations_path(),
+            credentials: Vec::new(),
         }
     }
 
@@ -104,6 +129,13 @@ impl HostConfig {
         if let Some(path) = file.observations_log {
             self.observations_log = path;
         }
+        // `[[credential]]` entries accumulate: later loads add to whatever
+        // `self.credentials` already held. In practice the startup path
+        // begins from `defaults()` which has an empty list, so this is a
+        // plain assignment. Kept explicit for SIGHUP reload semantics.
+        if !file.credential.is_empty() {
+            self.credentials = file.credential;
+        }
         Ok(())
     }
 }
@@ -118,6 +150,11 @@ struct HostConfigFile {
     socket_mode: Option<u32>,
     rules_db: Option<PathBuf>,
     observations_log: Option<PathBuf>,
+    /// `[[credential]]` array entries. Optional -- a host with no
+    /// credentials simply returns `NoCredential` from every
+    /// `FetchCredential` RPC.
+    #[serde(default)]
+    credential: Vec<CredentialEntryConfig>,
 }
 
 /// Return the default path for `host.toml`. On Unix this is
@@ -167,6 +204,39 @@ mod tests {
         assert_eq!(cfg.socket_mode, DEFAULT_SOCKET_MODE);
         assert_eq!(cfg.rules_db, default_rules_db_path());
         assert_eq!(cfg.observations_log, default_observations_path());
+        assert!(
+            cfg.credentials.is_empty(),
+            "default credential list should be empty"
+        );
+    }
+
+    #[test]
+    fn credential_entries_parse() {
+        let mut cfg = HostConfig::defaults();
+        cfg.merge_toml(
+            r#"
+            [[credential]]
+            host = "api.github.com"
+            header = "Authorization"
+            value_prefix = "token "
+            source = "env"
+            env_var = "GITHUB_TOKEN"
+
+            [[credential]]
+            host_pattern = "*.amazonaws.com"
+            type = "aws-sigv4"
+            source = "env"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.credentials.len(), 2);
+        assert_eq!(cfg.credentials[0].host.as_deref(), Some("api.github.com"));
+        assert_eq!(cfg.credentials[0].credential_type, "bearer");
+        assert_eq!(
+            cfg.credentials[1].host_pattern.as_deref(),
+            Some("*.amazonaws.com")
+        );
+        assert_eq!(cfg.credentials[1].credential_type, "aws-sigv4");
     }
 
     #[test]

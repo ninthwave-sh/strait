@@ -10,6 +10,11 @@
 //!     `KIND_SNAPSHOT_END` and then tails a broadcast channel for live
 //!     updates, filtering by scope so default-scope rules reach every
 //!     subscribing session and session-scope rules reach only their owner.
+//!   * `FetchCredential` -- credential store lookup shipped in H-HCP-4.
+//!     The service owns a long-lived [`CredentialStore`] resolved from
+//!     env vars at startup; the in-container agent never holds a
+//!     credential across requests, every allowed outbound round-trips
+//!     through this RPC.
 //!   * `SubmitDecision` -- hold-and-resume decision queue plus the
 //!     persist action, shipped in H-HCP-6. Blocked requests park on the
 //!     queue until an operator resolves them; if a matching persisted
@@ -23,8 +28,8 @@
 //!     the configured JSONL log, augmented with top-level `session_id` and
 //!     `container_registration_id` keys.
 //!
-//! `FetchCredential` still returns `Status::unimplemented` with a
-//! pointer to its follow-on work item.
+//! Every service method above is live; there are no `Status::unimplemented`
+//! stubs remaining in this file.
 //!
 //! Tests that need different behaviour (for example an echoing
 //! `SubmitDecision` stub for latency measurements) can define their own
@@ -37,17 +42,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_core::Stream;
 use std::collections::HashMap;
+use strait_proto::v1::fetch_credential_response::Kind as FetchKind;
 use strait_proto::v1::strait_host_server::StraitHost;
 use strait_proto::v1::{
-    rule_event, FetchCredentialRequest, FetchCredentialResponse, HeartbeatRequest,
-    HeartbeatResponse, ObservationEvent, RegisterContainerRequest, RegisterContainerResponse,
-    RuleEvent, StreamObservationsAck, StreamRulesRequest, SubmitDecisionRequest,
-    SubmitDecisionResponse, SubscribeObservationsRequest, Verdict,
+    rule_event, FetchCredentialRequest, FetchCredentialResponse, HeaderCredential,
+    HeartbeatRequest, HeartbeatResponse, NoCredential, ObservationEvent, RegisterContainerRequest,
+    RegisterContainerResponse, RuleEvent, SignedRequest, StreamObservationsAck, StreamRulesRequest,
+    SubmitDecisionRequest, SubmitDecisionResponse, SubscribeObservationsRequest, Verdict,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, warn};
 
+use crate::credentials::{CredentialKind, CredentialStore};
 use crate::decisions::{DecisionError, DecisionQueue, HoldInfo, PendingSummary};
 use crate::observations::ObservationHub;
 use crate::rule_store::{Rule, RuleAction, RuleChange, RuleDuration, RuleStore};
@@ -58,6 +65,12 @@ use crate::rule_store::{Rule, RuleAction, RuleChange, RuleDuration, RuleStore};
 /// the Unix-socket and TCP `tonic::transport::Server` instances. Internal
 /// state is held behind atomics/arcs so neither listener sees the other's
 /// concurrent mutations.
+///
+/// The credential store is held behind `Arc` so all tonic server clones
+/// (Unix-socket and TCP listeners, plus any test server builders) share a
+/// single resolved secret set. The default constructors leave it empty,
+/// which makes every `FetchCredential` lookup return `NoCredential` --
+/// useful for the register/heartbeat/rule-store-only integration tests.
 #[derive(Debug, Clone)]
 pub struct StraitHostService {
     sessions: Arc<AtomicU64>,
@@ -71,6 +84,7 @@ pub struct StraitHostService {
     /// JSONL line and every subscriber delivery is tagged with the
     /// container the registration belongs to.
     registration_ids: Arc<StdMutex<HashMap<String, String>>>,
+    credentials: Arc<CredentialStore>,
 }
 
 impl Default for StraitHostService {
@@ -80,10 +94,12 @@ impl Default for StraitHostService {
 }
 
 impl StraitHostService {
-    /// Fresh service with an in-memory rule store and a default decision
-    /// queue. The in-memory store is convenient for tests and smoke-check
-    /// invocations; production callers use
-    /// [`StraitHostService::with_state`] to plug in a persistent store.
+    /// Fresh service with an in-memory rule store, a default decision
+    /// queue, and an empty credential store. Convenient for tests and
+    /// smoke-check invocations; production callers use
+    /// [`StraitHostService::with_state`] (plus
+    /// [`StraitHostService::with_state_and_credentials`] for the
+    /// credential plane) to plug in persistent stores.
     pub fn new() -> Self {
         let rules = RuleStore::in_memory().expect("in-memory rule store should always open");
         Self::with_state(Arc::new(DecisionQueue::default()), Arc::new(rules))
@@ -91,15 +107,44 @@ impl StraitHostService {
 
     /// Build a service that shares the supplied decision queue and rule
     /// store with other subsystems (the desktop-facing resolver, the
-    /// rule-stream implementation, etc.).
+    /// rule-stream implementation, etc.). The credential store starts
+    /// empty; layer it on with
+    /// [`StraitHostService::with_state_and_credentials`].
     pub fn with_state(decisions: Arc<DecisionQueue>, rules: Arc<RuleStore>) -> Self {
+        Self::with_state_and_credentials(decisions, rules, Arc::new(CredentialStore::empty()))
+    }
+
+    /// Full-fidelity constructor: decision queue + rule store +
+    /// credential store. Production entry point used by the binary.
+    ///
+    /// The credential store resolves every entry up front (env-var
+    /// lookup happens at construction time), so misconfiguration
+    /// surfaces at startup rather than on the first `FetchCredential`
+    /// RPC.
+    pub fn with_state_and_credentials(
+        decisions: Arc<DecisionQueue>,
+        rules: Arc<RuleStore>,
+        credentials: Arc<CredentialStore>,
+    ) -> Self {
         Self {
             sessions: Arc::new(AtomicU64::new(0)),
             decisions,
             rules,
             observations: None,
             registration_ids: Arc::new(StdMutex::new(HashMap::new())),
+            credentials,
         }
+    }
+
+    /// Fresh service backed by an in-memory rule store, default
+    /// decision queue, and the supplied credential store.
+    pub fn with_credentials(credentials: Arc<CredentialStore>) -> Self {
+        let rules = RuleStore::in_memory().expect("in-memory rule store should always open");
+        Self::with_state_and_credentials(
+            Arc::new(DecisionQueue::default()),
+            Arc::new(rules),
+            credentials,
+        )
     }
 
     /// Back-compat convenience: build a service with just a rule store and
@@ -117,6 +162,16 @@ impl StraitHostService {
     pub fn with_observation_hub(mut self, hub: Arc<ObservationHub>) -> Self {
         self.observations = Some(hub);
         self
+    }
+
+    /// Build a service around a caller-provided rule store and
+    /// credential store (default decision queue). Convenience wrapper
+    /// around [`StraitHostService::with_state_and_credentials`].
+    pub fn with_rule_store_and_credentials(
+        rules: Arc<RuleStore>,
+        credentials: Arc<CredentialStore>,
+    ) -> Self {
+        Self::with_state_and_credentials(Arc::new(DecisionQueue::default()), rules, credentials)
     }
 
     /// Number of `RegisterContainer` calls served since the process started.
@@ -142,6 +197,12 @@ impl StraitHostService {
     /// subscribe in-process without going through a gRPC client.
     pub fn observation_hub(&self) -> Option<&Arc<ObservationHub>> {
         self.observations.as_ref()
+    }
+
+    /// Access the service's credential store. Test hook only; production
+    /// code stays on the RPC surface.
+    pub fn credential_store(&self) -> &CredentialStore {
+        &self.credentials
     }
 
     /// Resolve a held `SubmitDecision` request with an operator verdict.
@@ -306,12 +367,65 @@ impl StraitHost for StraitHostService {
 
     async fn fetch_credential(
         &self,
-        _request: Request<FetchCredentialRequest>,
+        request: Request<FetchCredentialRequest>,
     ) -> Result<Response<FetchCredentialResponse>, Status> {
-        // Credential store moves off the agent in H-HCP-4.
-        Err(Status::unimplemented(
-            "FetchCredential is implemented in H-HCP-4",
-        ))
+        let req = request.into_inner();
+        if req.host.is_empty() {
+            return Err(Status::invalid_argument("host must be set"));
+        }
+        if req.method.is_empty() {
+            return Err(Status::invalid_argument("method must be set"));
+        }
+
+        // Normalise the header map to the `(name, value)` Vec the
+        // credential store expects. Header order does not matter for
+        // SigV4 (the signer canonicalises), so a HashMap → Vec
+        // conversion is fine.
+        let headers: Vec<(String, String)> = req.headers.into_iter().collect();
+
+        // Agent sends the body SHA-256 as raw bytes; convert once to the
+        // lowercase-hex representation the AWS signer expects. Empty
+        // bytes mean "empty body" -- hash of empty string.
+        let body_sha256_hex = if req.body_sha256.is_empty() {
+            // SHA-256("") = "e3b0c442..."; compute once to avoid
+            // hard-coding it in two places.
+            crate::sigv4::sha256_hex(&[])
+        } else {
+            hex::encode(&req.body_sha256)
+        };
+
+        let kind = self.credentials.fetch_for_request(
+            &req.host,
+            &req.method,
+            &req.path,
+            &headers,
+            &body_sha256_hex,
+        );
+
+        let resp = match kind {
+            CredentialKind::Header { name, value } => FetchCredentialResponse {
+                kind: Some(FetchKind::Header(HeaderCredential {
+                    header_name: name,
+                    header_value: value,
+                })),
+            },
+            CredentialKind::Signed {
+                method,
+                url,
+                headers,
+            } => FetchCredentialResponse {
+                kind: Some(FetchKind::Signed(SignedRequest {
+                    method,
+                    url,
+                    headers: headers.into_iter().collect(),
+                })),
+            },
+            CredentialKind::None => FetchCredentialResponse {
+                kind: Some(FetchKind::None(NoCredential {})),
+            },
+        };
+
+        Ok(Response::new(resp))
     }
 
     type StreamRulesStream = RuleEventStream;
@@ -861,15 +975,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn unimplemented_rpcs_return_unimplemented() {
-        let svc = StraitHostService::new();
-        let err = svc
-            .fetch_credential(Request::new(FetchCredentialRequest::default()))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-    }
+    // FetchCredential landed in H-HCP-4, SubmitDecision in H-HCP-6, and
+    // StreamRules in H-HCP-3. The only RPC still returning
+    // `Unimplemented` today is `StreamObservations`; it is exercised via
+    // the host integration test suite rather than here because testing a
+    // server-side `Streaming<_>` requires a live transport.
 
     #[tokio::test]
     async fn stream_rules_rejects_empty_session_id() {
@@ -990,5 +1100,251 @@ mod tests {
         let b = persisted_allow_rule_id("default", "api.github.com", "http:GET");
         assert_eq!(a, b, "host should be case-insensitive");
         assert!(a.starts_with("persist-allow:default:"));
+    }
+
+    #[tokio::test]
+    async fn fetch_credential_empty_store_returns_none() {
+        // The default service starts with an empty credential store, so
+        // every lookup must return `NoCredential`. This is the posture a
+        // developer gets on a fresh install before they configure any
+        // `[[credential]]` entries.
+        let svc = StraitHostService::new();
+        let req = FetchCredentialRequest {
+            host: "api.github.com".into(),
+            method: "GET".into(),
+            path: "/".into(),
+            ..Default::default()
+        };
+        let resp = svc
+            .fetch_credential(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+        match resp.kind {
+            Some(FetchKind::None(_)) => {}
+            other => panic!("expected NoCredential, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_credential_rejects_empty_host() {
+        let svc = StraitHostService::new();
+        let err = svc
+            .fetch_credential(Request::new(FetchCredentialRequest {
+                method: "GET".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn fetch_credential_rejects_empty_method() {
+        let svc = StraitHostService::new();
+        let err = svc
+            .fetch_credential(Request::new(FetchCredentialRequest {
+                host: "api.github.com".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn fetch_credential_bearer_returns_header() {
+        use crate::credentials::CredentialEntryConfig;
+        std::env::set_var("STRAIT_TEST_GRPC_BEARER", "gh_test_token");
+
+        let entries = vec![CredentialEntryConfig {
+            host: Some("api.github.com".into()),
+            host_pattern: None,
+            header: "Authorization".into(),
+            value_prefix: "token ".into(),
+            source: "env".into(),
+            env_var: Some("STRAIT_TEST_GRPC_BEARER".into()),
+            credential_type: "bearer".into(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
+        }];
+        let store = Arc::new(CredentialStore::from_entries(&entries).unwrap());
+        let svc = StraitHostService::with_credentials(store);
+
+        let resp = svc
+            .fetch_credential(Request::new(FetchCredentialRequest {
+                host: "api.github.com".into(),
+                method: "GET".into(),
+                path: "/user".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        match resp.kind {
+            Some(FetchKind::Header(h)) => {
+                assert_eq!(h.header_name, "Authorization");
+                assert_eq!(h.header_value, "token gh_test_token");
+            }
+            other => panic!("expected HeaderCredential, got {other:?}"),
+        }
+
+        std::env::remove_var("STRAIT_TEST_GRPC_BEARER");
+    }
+
+    #[tokio::test]
+    async fn fetch_credential_routes_different_hosts_independently() {
+        // Two containers hitting two different bearer credentials must
+        // each get their own header value, proving the store dispatches
+        // by request host rather than by session.
+        use crate::credentials::CredentialEntryConfig;
+        std::env::set_var("STRAIT_TEST_GRPC_GH", "gh_token");
+        std::env::set_var("STRAIT_TEST_GRPC_STRIPE", "sk_stripe");
+
+        let entries = vec![
+            CredentialEntryConfig {
+                host: Some("api.github.com".into()),
+                host_pattern: None,
+                header: "Authorization".into(),
+                value_prefix: "token ".into(),
+                source: "env".into(),
+                env_var: Some("STRAIT_TEST_GRPC_GH".into()),
+                credential_type: "bearer".into(),
+                access_key_id_var: None,
+                secret_access_key_var: None,
+                session_token_var: None,
+            },
+            CredentialEntryConfig {
+                host: Some("api.stripe.com".into()),
+                host_pattern: None,
+                header: "Authorization".into(),
+                value_prefix: "Bearer ".into(),
+                source: "env".into(),
+                env_var: Some("STRAIT_TEST_GRPC_STRIPE".into()),
+                credential_type: "bearer".into(),
+                access_key_id_var: None,
+                secret_access_key_var: None,
+                session_token_var: None,
+            },
+        ];
+        let store = Arc::new(CredentialStore::from_entries(&entries).unwrap());
+        let svc = StraitHostService::with_credentials(store);
+
+        let gh_resp = svc
+            .fetch_credential(Request::new(FetchCredentialRequest {
+                host: "api.github.com".into(),
+                method: "GET".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let stripe_resp = svc
+            .fetch_credential(Request::new(FetchCredentialRequest {
+                host: "api.stripe.com".into(),
+                method: "GET".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        match gh_resp.kind {
+            Some(FetchKind::Header(h)) => assert_eq!(h.header_value, "token gh_token"),
+            other => panic!("expected Header for github, got {other:?}"),
+        }
+        match stripe_resp.kind {
+            Some(FetchKind::Header(h)) => assert_eq!(h.header_value, "Bearer sk_stripe"),
+            other => panic!("expected Header for stripe, got {other:?}"),
+        }
+
+        std::env::remove_var("STRAIT_TEST_GRPC_GH");
+        std::env::remove_var("STRAIT_TEST_GRPC_STRIPE");
+    }
+
+    #[tokio::test]
+    async fn fetch_credential_sigv4_returns_signed_request() {
+        use crate::credentials::CredentialEntryConfig;
+        use std::collections::HashMap;
+
+        std::env::set_var("STRAIT_TEST_GRPC_AWS_AK", "AKIAIOSFODNN7EXAMPLE");
+        std::env::set_var(
+            "STRAIT_TEST_GRPC_AWS_SK",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        );
+        std::env::remove_var("STRAIT_TEST_GRPC_AWS_TOK");
+
+        let entries = vec![CredentialEntryConfig {
+            host: None,
+            host_pattern: Some("*.amazonaws.com".into()),
+            header: String::new(),
+            value_prefix: String::new(),
+            source: "env".into(),
+            env_var: None,
+            credential_type: "aws-sigv4".into(),
+            access_key_id_var: Some("STRAIT_TEST_GRPC_AWS_AK".into()),
+            secret_access_key_var: Some("STRAIT_TEST_GRPC_AWS_SK".into()),
+            session_token_var: Some("STRAIT_TEST_GRPC_AWS_TOK".into()),
+        }];
+        let store = Arc::new(CredentialStore::from_entries(&entries).unwrap());
+        let svc = StraitHostService::with_credentials(store);
+
+        let mut hdrs: HashMap<String, String> = HashMap::new();
+        hdrs.insert("host".into(), "s3.us-east-1.amazonaws.com".into());
+
+        let resp = svc
+            .fetch_credential(Request::new(FetchCredentialRequest {
+                host: "s3.us-east-1.amazonaws.com".into(),
+                method: "GET".into(),
+                path: "/bucket/key".into(),
+                headers: hdrs,
+                // Empty body -- the handler fills in SHA-256("") itself.
+                body_sha256: Vec::new(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        match resp.kind {
+            Some(FetchKind::Signed(sig)) => {
+                assert_eq!(sig.method, "GET");
+                assert_eq!(sig.url, "https://s3.us-east-1.amazonaws.com/bucket/key");
+                let auth = sig
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    .expect("Authorization header present");
+                assert!(
+                    auth.1
+                        .starts_with("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/"),
+                    "unexpected Authorization header: {}",
+                    auth.1
+                );
+                assert!(
+                    auth.1.contains("us-east-1/s3/aws4_request"),
+                    "signed auth should contain scope: {}",
+                    auth.1
+                );
+                assert!(
+                    sig.headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("x-amz-date")),
+                    "X-Amz-Date must be present in signed headers"
+                );
+                assert!(
+                    sig.headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("x-amz-content-sha256")),
+                    "X-Amz-Content-Sha256 must be present in signed headers"
+                );
+            }
+            other => panic!("expected SignedRequest for AWS host, got {other:?}"),
+        }
+
+        std::env::remove_var("STRAIT_TEST_GRPC_AWS_AK");
+        std::env::remove_var("STRAIT_TEST_GRPC_AWS_SK");
     }
 }

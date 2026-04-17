@@ -34,6 +34,7 @@
 //! Future phase (H-ICDP-4) will fill in container-side CA trust injection.
 
 pub mod config;
+pub mod credential_injector;
 pub mod decision_client;
 pub mod entrypoint;
 pub mod host_client;
@@ -44,6 +45,9 @@ pub mod proxy;
 pub mod so_original_dst;
 
 pub use config::AgentConfig;
+pub use credential_injector::{
+    CredentialInjector, CredentialOutcome, NoopCredentialInjector, RpcCredentialInjector,
+};
 pub use decision_client::{HostDecisionClient, DEFAULT_CALL_TIMEOUT};
 pub use host_client::{connect_unix, HostClient, HostClientError};
 pub use observations::{HostStreamingSink, NoopSink, ObservationSink};

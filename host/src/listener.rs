@@ -331,6 +331,7 @@ mod tests {
             socket_mode: 0o600,
             rules_db: dir.join("rules.db"),
             observations_log: dir.join("observations.jsonl"),
+            credentials: Vec::new(),
         }
     }
 

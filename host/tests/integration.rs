@@ -90,6 +90,7 @@ fn test_config(sock: PathBuf, port: u16) -> HostConfig {
         socket_mode: DEFAULT_SOCKET_MODE,
         rules_db: db,
         observations_log: obs,
+        credentials: Vec::new(),
     }
 }
 
@@ -313,12 +314,34 @@ async fn default_service_returns_unimplemented_for_deferred_rpcs() {
     // other RPCs here; the SubmitDecision behaviour has dedicated
     // coverage in `tests/decisions.rs`.
 
-    // FetchCredential: unary.
+    // FetchCredential is implemented in H-HCP-4. A default request has
+    // an empty host; the server rejects it with InvalidArgument so we
+    // still get a round trip that proves transport plus service wiring
+    // without exercising the credential store (which is empty here
+    // anyway).
     let err = client
         .fetch_credential(FetchCredentialRequest::default())
         .await
-        .expect_err("should be unimplemented");
-    assert_eq!(err.code(), tonic::Code::Unimplemented);
+        .expect_err("default request should be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // A well-formed request against the empty default store returns
+    // `NoCredential` -- the agent would then forward the request
+    // unsigned.
+    let resp = client
+        .fetch_credential(FetchCredentialRequest {
+            host: "api.github.com".into(),
+            method: "GET".into(),
+            path: "/".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("fetch_credential over unix socket")
+        .into_inner();
+    match resp.kind {
+        Some(CredKind::None(_)) => {}
+        other => panic!("expected NoCredential from empty store, got {other:?}"),
+    }
 
     // StreamRules: server-streaming. Now implemented (H-HCP-3); an empty
     // session_id still yields InvalidArgument, which proves the server is
@@ -727,4 +750,132 @@ async fn hold_and_resume_honours_client_timeout() {
 
     shutdown.trigger();
     let _ = timeout(Duration::from_secs(2), server).await;
+}
+
+/// End-to-end integration test for the H-HCP-4 acceptance criterion:
+/// "two containers, two different bearer credentials, FetchCredential
+/// routes each to the correct session."
+///
+/// The production `StraitHostService` is constructed with a real
+/// `CredentialStore`, served over a unix domain socket, and two tonic
+/// clients (one per simulated container) independently call
+/// `FetchCredential`. Each must see its own credential.
+#[tokio::test]
+async fn fetch_credential_routes_two_containers_to_two_bearers() {
+    use strait_host::credentials::{CredentialEntryConfig, CredentialStore};
+
+    std::env::set_var("STRAIT_TEST_E2E_GH", "gh_e2e_token");
+    std::env::set_var("STRAIT_TEST_E2E_STRIPE", "sk_e2e_stripe");
+
+    let entries = vec![
+        CredentialEntryConfig {
+            host: Some("api.github.com".into()),
+            host_pattern: None,
+            header: "Authorization".into(),
+            value_prefix: "token ".into(),
+            source: "env".into(),
+            env_var: Some("STRAIT_TEST_E2E_GH".into()),
+            credential_type: "bearer".into(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
+        },
+        CredentialEntryConfig {
+            host: Some("api.stripe.com".into()),
+            host_pattern: None,
+            header: "Authorization".into(),
+            value_prefix: "Bearer ".into(),
+            source: "env".into(),
+            env_var: Some("STRAIT_TEST_E2E_STRIPE".into()),
+            credential_type: "bearer".into(),
+            access_key_id_var: None,
+            secret_access_key_var: None,
+            session_token_var: None,
+        },
+    ];
+    let store = Arc::new(CredentialStore::from_entries(&entries).expect("store"));
+    let service = StraitHostService::with_credentials(store);
+
+    let dir = tempdir().unwrap();
+    let sock = dir.path().join("host.sock");
+    let port = pick_port();
+    let cfg = test_config(sock.clone(), port);
+
+    let shutdown = ShutdownSignal::new();
+    let s = shutdown.clone();
+    let server = tokio::spawn(async move { serve_with_service(&cfg, s, service).await });
+    assert!(wait_for_socket(&sock).await, "socket never appeared");
+
+    // Simulate "container 1" (a Claude Code session reaching GitHub).
+    let mut c1 = connect_unix(sock.clone()).await;
+    let reg1 = c1
+        .register_container(RegisterContainerRequest {
+            container_id: "container-1".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("register c1")
+        .into_inner();
+    assert!(!reg1.session_id.is_empty());
+
+    let cred1 = c1
+        .fetch_credential(FetchCredentialRequest {
+            session_id: reg1.session_id.clone(),
+            host: "api.github.com".into(),
+            action: "http:GET".into(),
+            method: "GET".into(),
+            path: "/user".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("fetch c1")
+        .into_inner();
+    match cred1.kind {
+        Some(CredKind::Header(h)) => {
+            assert_eq!(h.header_name, "Authorization");
+            assert_eq!(h.header_value, "token gh_e2e_token");
+        }
+        other => panic!("container 1 expected header credential, got {other:?}"),
+    }
+
+    // Simulate "container 2" (a separate session hitting Stripe).
+    let mut c2 = connect_unix(sock.clone()).await;
+    let reg2 = c2
+        .register_container(RegisterContainerRequest {
+            container_id: "container-2".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("register c2")
+        .into_inner();
+    assert_ne!(
+        reg1.session_id, reg2.session_id,
+        "sessions must be distinct across containers"
+    );
+
+    let cred2 = c2
+        .fetch_credential(FetchCredentialRequest {
+            session_id: reg2.session_id,
+            host: "api.stripe.com".into(),
+            action: "http:POST".into(),
+            method: "POST".into(),
+            path: "/charges".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("fetch c2")
+        .into_inner();
+    match cred2.kind {
+        Some(CredKind::Header(h)) => {
+            assert_eq!(h.header_name, "Authorization");
+            assert_eq!(h.header_value, "Bearer sk_e2e_stripe");
+        }
+        other => panic!("container 2 expected header credential, got {other:?}"),
+    }
+
+    shutdown.trigger();
+    let _ = timeout(Duration::from_secs(2), server).await;
+
+    std::env::remove_var("STRAIT_TEST_E2E_GH");
+    std::env::remove_var("STRAIT_TEST_E2E_STRIPE");
 }

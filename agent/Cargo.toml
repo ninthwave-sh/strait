@@ -17,12 +17,14 @@ path = "src/lib.rs"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+hex = "0.4"
 http = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 rustls = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 # Path dep on the top-level strait crate so the agent can reuse the Cedar
 # policy engine and the session-local CA. Kept narrow on purpose: the agent
 # must stay small, so we only pull in what's needed for policy eval and

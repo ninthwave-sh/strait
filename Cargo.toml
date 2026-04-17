@@ -35,16 +35,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 toml = "0.8"
 anyhow = "1"
-aws-sigv4 = "1"
-aws-credential-types = "1"
-aws-smithy-runtime-api = "1"
-sha2 = "0.10"
-hex = "0.4"
 arc-swap = "1"
 tempfile = "3"
 terminal_size = "0.4"
 libc = "0.2"
 signal-hook = "0.3"
+strait-host = { path = "host" }
 
 [dev-dependencies]
 tempfile = "3"

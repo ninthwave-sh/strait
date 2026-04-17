@@ -34,11 +34,13 @@ fn pick_port() -> u16 {
 }
 
 fn test_config(sock: PathBuf, port: u16, db: PathBuf) -> HostConfig {
+    let obs = sock.with_extension("observations.jsonl");
     HostConfig {
         unix_socket: sock,
         tcp_listen: format!("127.0.0.1:{port}").parse().unwrap(),
         socket_mode: DEFAULT_SOCKET_MODE,
         rules_db: db,
+        observations_log: obs,
     }
 }
 

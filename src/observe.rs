@@ -162,6 +162,15 @@ pub struct ExceptionDirective {
 }
 
 /// A single observation event with a timestamp and typed payload.
+///
+/// Serializes to a JSON object with the fixed top-level keys below plus any
+/// fields flattened from [`EventKind`]. The host control plane augments
+/// persisted records with two additional top-level keys (`session_id` and
+/// `container_registration_id`) at write time (M-HCP-5). Those keys are
+/// deliberately *not* part of this struct so that the JSONL format remains
+/// additive: older consumers that predate the host pipeline ignore the
+/// extra top-level keys, and `read_observations` reuses this same struct
+/// to parse both pre- and post-M-HCP-5 files.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObservationEvent {
     /// Schema version for forward compatibility.

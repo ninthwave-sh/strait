@@ -216,6 +216,7 @@ async fn spawn_proxy(
         policy_path,
         ca_cert_out,
         host_rpc,
+        Arc::new(strait_agent::observations::NoopSink),
         Some(upstream_addr),
         Some(no_verify_client_config()),
         10 * 1024 * 1024,

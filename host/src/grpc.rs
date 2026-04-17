@@ -15,9 +15,16 @@
 //!     queue until an operator resolves them; if a matching persisted
 //!     rule already exists the call short-circuits with
 //!     `Verdict::AllowPersist` without ever touching the queue.
+//!   * `StreamObservations` and `SubscribeObservations` -- the M-HCP-5
+//!     observation pipeline. Agents push events upstream via the
+//!     client-streaming `StreamObservations`; desktop clients and
+//!     `strait watch`-style CLIs subscribe via server-streaming
+//!     `SubscribeObservations`. The host persists every accepted event to
+//!     the configured JSONL log, augmented with top-level `session_id` and
+//!     `container_registration_id` keys.
 //!
-//! `FetchCredential` and `StreamObservations` still return
-//! `Status::unimplemented` with a pointer to the follow-on work item.
+//! `FetchCredential` still returns `Status::unimplemented` with a
+//! pointer to its follow-on work item.
 //!
 //! Tests that need different behaviour (for example an echoing
 //! `SubmitDecision` stub for latency measurements) can define their own
@@ -25,22 +32,24 @@
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_core::Stream;
+use std::collections::HashMap;
 use strait_proto::v1::strait_host_server::StraitHost;
 use strait_proto::v1::{
     rule_event, FetchCredentialRequest, FetchCredentialResponse, HeartbeatRequest,
     HeartbeatResponse, ObservationEvent, RegisterContainerRequest, RegisterContainerResponse,
     RuleEvent, StreamObservationsAck, StreamRulesRequest, SubmitDecisionRequest,
-    SubmitDecisionResponse, Verdict,
+    SubmitDecisionResponse, SubscribeObservationsRequest, Verdict,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::decisions::{DecisionError, DecisionQueue, HoldInfo, PendingSummary};
+use crate::observations::ObservationHub;
 use crate::rule_store::{Rule, RuleAction, RuleChange, RuleDuration, RuleStore};
 
 /// Production implementation of the `StraitHost` gRPC service.
@@ -54,6 +63,14 @@ pub struct StraitHostService {
     sessions: Arc<AtomicU64>,
     decisions: Arc<DecisionQueue>,
     rules: Arc<RuleStore>,
+    observations: Option<Arc<ObservationHub>>,
+    /// Map of `session_id` -> `container_id` captured at registration time.
+    ///
+    /// The observation pipeline uses this as a fallback when an agent
+    /// omits `container_registration_id` from an outbound event, so every
+    /// JSONL line and every subscriber delivery is tagged with the
+    /// container the registration belongs to.
+    registration_ids: Arc<StdMutex<HashMap<String, String>>>,
 }
 
 impl Default for StraitHostService {
@@ -80,6 +97,8 @@ impl StraitHostService {
             sessions: Arc::new(AtomicU64::new(0)),
             decisions,
             rules,
+            observations: None,
+            registration_ids: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -88,6 +107,16 @@ impl StraitHostService {
     /// pre-existing tests.
     pub fn with_rule_store(rules: Arc<RuleStore>) -> Self {
         Self::with_state(Arc::new(DecisionQueue::default()), rules)
+    }
+
+    /// Attach an observation hub. When set, `StreamObservations` persists
+    /// incoming events to the hub's JSONL log and broadcasts them to every
+    /// attached subscriber. When unset, `StreamObservations` still accepts
+    /// and counts events but drops them (useful for tests that exercise
+    /// the transport without a hub).
+    pub fn with_observation_hub(mut self, hub: Arc<ObservationHub>) -> Self {
+        self.observations = Some(hub);
+        self
     }
 
     /// Number of `RegisterContainer` calls served since the process started.
@@ -106,6 +135,13 @@ impl StraitHostService {
     /// `StreamRules` to connected agents.
     pub fn rule_store(&self) -> &Arc<RuleStore> {
         &self.rules
+    }
+
+    /// Borrow the observation hub the service is wired to, if any. Useful
+    /// for tests that need to assert on the hub's file output or to
+    /// subscribe in-process without going through a gRPC client.
+    pub fn observation_hub(&self) -> Option<&Arc<ObservationHub>> {
+        self.observations.as_ref()
     }
 
     /// Resolve a held `SubmitDecision` request with an operator verdict.
@@ -173,6 +209,11 @@ impl std::error::Error for ResolveError {}
 /// impl and any test double share a single type.
 pub type RuleEventStream = Pin<Box<dyn Stream<Item = Result<RuleEvent, Status>> + Send + 'static>>;
 
+/// Stream type returned by the `SubscribeObservations` RPC. Boxed so the
+/// production impl and test doubles share a single type.
+pub type ObservationEventStream =
+    Pin<Box<dyn Stream<Item = Result<ObservationEvent, Status>> + Send + 'static>>;
+
 #[tonic::async_trait]
 impl StraitHost for StraitHostService {
     async fn register_container(
@@ -186,6 +227,9 @@ impl StraitHost for StraitHostService {
 
         let seq = self.sessions.fetch_add(1, Ordering::Relaxed) + 1;
         let session_id = format!("sess-{seq:08x}");
+        if let Ok(mut map) = self.registration_ids.lock() {
+            map.insert(session_id.clone(), req.container_id.clone());
+        }
         Ok(Response::new(RegisterContainerResponse {
             session_id,
             default_scope: RuleStore::DEFAULT_SCOPE.to_string(),
@@ -357,12 +401,111 @@ impl StraitHost for StraitHostService {
 
     async fn stream_observations(
         &self,
-        _request: Request<Streaming<ObservationEvent>>,
+        request: Request<Streaming<ObservationEvent>>,
     ) -> Result<Response<StreamObservationsAck>, Status> {
-        // Observation forwarding lands in M-HCP-5.
-        Err(Status::unimplemented(
-            "StreamObservations is implemented in M-HCP-5",
-        ))
+        use tokio_stream::StreamExt;
+        let hub = match &self.observations {
+            Some(h) => h.clone(),
+            None => {
+                // No hub configured: still consume the stream so the agent
+                // sees a clean close, but count every event as rejected.
+                let mut stream = request.into_inner();
+                let mut rejected = 0u64;
+                while let Some(next) = stream.next().await {
+                    if next.is_ok() {
+                        rejected += 1;
+                    }
+                }
+                warn!(
+                    target: "strait_host::grpc",
+                    rejected,
+                    "StreamObservations called without an observation hub; all events dropped"
+                );
+                return Ok(Response::new(StreamObservationsAck {
+                    accepted: 0,
+                    rejected,
+                }));
+            }
+        };
+
+        let registration_ids = self.registration_ids.clone();
+        let mut stream = request.into_inner();
+        let mut accepted = 0u64;
+        let mut rejected = 0u64;
+        while let Some(next) = stream.next().await {
+            match next {
+                Ok(mut event) => {
+                    // Fall back to the container_id captured at registration
+                    // if the agent didn't set one on the event. Agents
+                    // shipped after M-HCP-5 always set it, but a fallback
+                    // keeps older agents honest.
+                    if event.container_registration_id.is_empty() && !event.session_id.is_empty() {
+                        if let Some(id) = registration_ids
+                            .lock()
+                            .ok()
+                            .and_then(|map| map.get(&event.session_id).cloned())
+                        {
+                            event.container_registration_id = id;
+                        }
+                    }
+                    match hub.record(event).await {
+                        Ok(()) => accepted += 1,
+                        Err(e) => {
+                            warn!(
+                                target: "strait_host::grpc",
+                                error = %e,
+                                "observation hub rejected event"
+                            );
+                            rejected += 1;
+                        }
+                    }
+                }
+                Err(status) => {
+                    info!(
+                        target: "strait_host::grpc",
+                        code = ?status.code(),
+                        "observation stream ended with status"
+                    );
+                    break;
+                }
+            }
+        }
+        Ok(Response::new(StreamObservationsAck { accepted, rejected }))
+    }
+
+    type SubscribeObservationsStream = ObservationEventStream;
+
+    async fn subscribe_observations(
+        &self,
+        request: Request<SubscribeObservationsRequest>,
+    ) -> Result<Response<Self::SubscribeObservationsStream>, Status> {
+        let hub = self
+            .observations
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("observation hub is not configured on this host"))?
+            .clone();
+        let filter = request.into_inner().session_id;
+        let filter_for_log = filter.clone();
+        let mut rx = hub.subscribe();
+
+        let stream = async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if !filter.is_empty() && event.session_id != filter {
+                            continue;
+                        }
+                        yield Ok(event);
+                    }
+                    Err(RecvError::Lagged(skipped)) => {
+                        ObservationHub::warn_lagged(&filter_for_log, skipped);
+                    }
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        };
+
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn heartbeat(

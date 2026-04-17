@@ -20,6 +20,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use strait_agent::config::AgentConfig;
 use strait_agent::entrypoint;
+use strait_agent::observations::NoopSink;
 use strait_agent::proxy::{self, PromptDenyClient, ProxyConfig};
 
 #[derive(Parser)]
@@ -134,6 +135,14 @@ fn run_proxy(config: &AgentConfig, policy: PathBuf, ca_cert: PathBuf) -> anyhow:
         policy_path: policy,
         ca_cert_out: ca_cert,
         host_rpc: Arc::new(PromptDenyClient),
+        // The observation streaming sink that ships events to the host
+        // control plane lives in `strait_agent::observations` (M-HCP-5).
+        // Wiring it into the CLI requires a running `strait-host` and a
+        // registered session, which is tied up in H-HCP-6; until that
+        // lands, the binary stays silent on observations by default.
+        // Test harnesses and downstream orchestrators can build their
+        // own `ProxyConfig` and inject a live `HostStreamingSink`.
+        observation_sink: Arc::new(NoopSink),
         test_upstream_override: None,
         test_upstream_tls: None,
         max_body_size: 10 * 1024 * 1024,

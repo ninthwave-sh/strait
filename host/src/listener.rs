@@ -27,6 +27,7 @@ use tracing::{info, warn};
 
 use crate::config::HostConfig;
 use crate::grpc::StraitHostService;
+use crate::observations::ObservationHub;
 use crate::rule_store::RuleStore;
 
 /// Shutdown signal shared by the listeners. Drop it to close listeners;
@@ -96,7 +97,21 @@ pub async fn serve(cfg: &HostConfig, shutdown: ShutdownSignal) -> Result<()> {
         path = %cfg.rules_db.display(),
         "rule store ready",
     );
-    let svc = StraitHostService::with_rule_store(Arc::new(rules));
+    let hub = ObservationHub::open(&cfg.observations_log)
+        .await
+        .with_context(|| {
+            format!(
+                "opening observations log {}",
+                cfg.observations_log.display()
+            )
+        })?;
+    info!(
+        target: "strait_host::listener",
+        path = %cfg.observations_log.display(),
+        "observations log ready",
+    );
+    let svc =
+        StraitHostService::with_rule_store(Arc::new(rules)).with_observation_hub(Arc::new(hub));
     serve_with_service(cfg, shutdown, svc).await
 }
 
@@ -315,6 +330,7 @@ mod tests {
             tcp_listen: "127.0.0.1:0".parse().unwrap(),
             socket_mode: 0o600,
             rules_db: dir.join("rules.db"),
+            observations_log: dir.join("observations.jsonl"),
         }
     }
 

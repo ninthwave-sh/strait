@@ -45,6 +45,14 @@ service StraitHost {
   // close with per-observation counts.
   rpc StreamObservations(stream ObservationEvent) returns (StreamObservationsAck);
 
+  // Subscribe to the host's fan-out of observations across all registered
+  // sessions. The desktop app and any `strait watch`-style CLI consumer open
+  // this stream and receive live events tagged by session_id and
+  // container_registration_id. The stream delivers events produced after the
+  // call begins; historical replay is the responsibility of the on-disk
+  // JSONL log (see M-HCP-5).
+  rpc SubscribeObservations(SubscribeObservationsRequest) returns (stream ObservationEvent);
+
   // Lightweight keep-alive. Safe to call with an empty session_id before
   // RegisterContainer completes; if session_id is set, the host refreshes
   // the session's last-seen timestamp.
@@ -215,11 +223,25 @@ message ObservationEvent {
   // JSON-encoded observation payload. Schema matches the on-disk JSONL
   // format the current agent writes in observe.rs.
   string raw_json = 4;
+  // Stable identifier of the container registration this observation came
+  // from. The agent attaches the same container_id it supplied in
+  // RegisterContainer so downstream consumers can distinguish concurrent
+  // sessions originating from the same container image.
+  string container_registration_id = 5;
 }
 
 message StreamObservationsAck {
   uint64 accepted = 1;
   uint64 rejected = 2;
+}
+
+// ---- SubscribeObservations ----
+
+message SubscribeObservationsRequest {
+  // Optional session filter. When non-empty the host only emits events
+  // whose session_id matches. Empty means "subscribe to every session the
+  // host currently serves".
+  string session_id = 1;
 }
 
 // ---- Heartbeat ----
